@@ -5,6 +5,10 @@ edition = "2021"
 authors = ["Caike Machado Batista Costa"]
 description = "Small Language Model para Português do Brasil"
 
+[features]
+default = []
+gpu = ["burn/wgpu"]
+
 [dependencies]
 # Framework de ML
 burn = { version = "0.14", features = ["ndarray", "autodiff", "train"] }
@@ -45,7 +49,3 @@ opt-level = 3
 
 [profile.dev]
 opt-level = 3
-
-
-
-

@@ -63,6 +63,20 @@ enum Commands {
         output: PathBuf,
         #[arg(long, default_value = "mini")]
         model_size: String,
+        #[arg(long)]
+        max_steps: Option<usize>,
+        #[arg(long)]
+        save_every: Option<usize>,
+        #[arg(long)]
+        batch_size: Option<usize>,
+        #[arg(long)]
+        grad_accum: Option<usize>,
+        #[arg(long)]
+        learning_rate: Option<f64>,
+        #[arg(long)]
+        warmup_steps: Option<usize>,
+        #[arg(long)]
+        seq_len: Option<usize>,
     },
     Resume {
         #[arg(short, long)]
@@ -75,12 +89,24 @@ enum Commands {
         additional_steps: usize,
         #[arg(long, default_value = "micro")]
         model_size: String,
+        #[arg(long)]
+        save_every: Option<usize>,
+        #[arg(long)]
+        batch_size: Option<usize>,
+        #[arg(long)]
+        grad_accum: Option<usize>,
+        #[arg(long)]
+        learning_rate: Option<f64>,
+        #[arg(long)]
+        seq_len: Option<usize>,
     },
     TestModel {
         #[arg(short, long)]
         model: PathBuf,
         #[arg(short, long)]
         tokenizer: PathBuf,
+        #[arg(long, default_value = "micro")]
+        model_size: String,
     },
     Generate {
         #[arg(short, long)]
@@ -91,6 +117,10 @@ enum Commands {
         prompt: String,
         #[arg(long, default_value = "100")]
         max_tokens: usize,
+        #[arg(long, default_value = "micro")]
+        model_size: String,
+        #[arg(long, default_value = "0.8")]
+        temperature: f32,
     },
     CleanCorpus {
         #[arg(short, long)]
@@ -115,17 +145,31 @@ fn main() {
         Commands::Tokenize { input, output, tokenizer } => {
             tokenize_corpus(&input, &output, &tokenizer);
         }
-        Commands::Train { data, tokenizer, output, model_size } => {
-            train_model(&data, &tokenizer, &output, &model_size);
+        Commands::Train { 
+            data, tokenizer, output, model_size,
+            max_steps, save_every, batch_size, grad_accum, 
+            learning_rate, warmup_steps, seq_len 
+        } => {
+            train_model(
+                &data, &tokenizer, &output, &model_size,
+                max_steps, save_every, batch_size, grad_accum,
+                learning_rate, warmup_steps, seq_len
+            );
         }
-        Commands::Resume { checkpoint, data, output, additional_steps, model_size } => {
-            resume_training(&checkpoint, &data, &output, additional_steps, &model_size);
+        Commands::Resume { 
+            checkpoint, data, output, additional_steps, model_size,
+            save_every, batch_size, grad_accum, learning_rate, seq_len
+        } => {
+            resume_training(
+                &checkpoint, &data, &output, additional_steps, &model_size,
+                save_every, batch_size, grad_accum, learning_rate, seq_len
+            );
         }
-        Commands::TestModel { model, tokenizer } => {
-            test_model(&model, &tokenizer);
+        Commands::TestModel { model, tokenizer, model_size } => {
+            test_model(&model, &tokenizer, &model_size);
         }
-        Commands::Generate { model, tokenizer, prompt, max_tokens } => {
-            generate(&model, &tokenizer, &prompt, max_tokens);
+        Commands::Generate { model, tokenizer, prompt, max_tokens, model_size, temperature } => {
+            generate(&model, &tokenizer, &prompt, max_tokens, &model_size, temperature);
         }
         Commands::CleanCorpus { input, output, verbose } => {
             clean_corpus(&input, &output, verbose);
@@ -175,7 +219,6 @@ fn train_tokenizer(corpus: &PathBuf, output: &PathBuf, vocab_size: usize) {
     
     let trainer = BPETrainer::new(vocab_size, 2);
     
-    // CORRIGIDO: Aceita arquivo OU diretorio
     let texts: Box<dyn Iterator<Item = String>> = if corpus.is_file() {
         println!("Lendo arquivo {:?}...", corpus);
         let content = std::fs::read_to_string(corpus)
@@ -202,10 +245,8 @@ fn train_tokenizer(corpus: &PathBuf, output: &PathBuf, vocab_size: usize) {
     let vocab = trainer.train(texts);
     let tokenizer = BPETokenizer::from_vocab(vocab);
     
-    // Cria diretorio de saida
     std::fs::create_dir_all(output).expect("Erro criando diretorio de saida");
     
-    // Salva como tokenizer.json dentro do diretorio
     let tokenizer_path = output.join("tokenizer.json");
     tokenizer.save(tokenizer_path.to_str().unwrap()).expect("Erro salvando tokenizer");
     
@@ -223,7 +264,6 @@ fn tokenize_corpus(input: &PathBuf, output: &PathBuf, tokenizer_path: &PathBuf) 
     let mut writer = TokenizedDatasetWriter::new(&output.join("train.bin"))
         .expect("Erro criando arquivo de saida");
     
-    // CORRIGIDO: Aceita arquivo OU diretorio
     if input.is_file() {
         println!("Tokenizando {:?}...", input);
         let content = std::fs::read_to_string(input)
@@ -319,23 +359,39 @@ fn run_training_loop(
     println!("===================================================");
 }
 
-fn train_model(data: &PathBuf, _tokenizer_path: &PathBuf, output: &PathBuf, model_size: &str) {
+fn train_model(
+    data: &PathBuf, 
+    _tokenizer_path: &PathBuf, 
+    output: &PathBuf, 
+    model_size: &str,
+    max_steps: Option<usize>,
+    save_every: Option<usize>,
+    batch_size: Option<usize>,
+    grad_accum: Option<usize>,
+    learning_rate: Option<f64>,
+    warmup_steps: Option<usize>,
+    seq_len: Option<usize>,
+) {
     println!("===================================================");
     println!("  Iniciando treinamento (CPU)");
     println!("===================================================");
     
     let device = NdArrayDevice::Cpu;
     
-    let model_config = match model_size {
+    let mut model_config = match model_size {
         "85m" => RWKVConfig::ptbr_85m(),
         "mini" => RWKVConfig::ptbr_mini(),
         "micro" => RWKVConfig::ptbr_micro(),
         _ => RWKVConfig::ptbr_micro(),
     };
     
+    if let Some(sl) = seq_len {
+        model_config.max_seq_len = sl;
+    }
+    
     println!("  Modelo: {} ({} parametros)", model_size, format_params(model_config.num_parameters()));
     
-    let train_config = TrainingConfig {
+    let mut train_config = TrainingConfig {
         learning_rate: 3e-4,
         batch_size: 2,
         gradient_accumulation_steps: 16,
@@ -346,6 +402,13 @@ fn train_model(data: &PathBuf, _tokenizer_path: &PathBuf, output: &PathBuf, mode
         save_every: 2500,
         eval_every: 500,
     };
+    
+    if let Some(v) = max_steps { train_config.max_steps = v; }
+    if let Some(v) = save_every { train_config.save_every = v; }
+    if let Some(v) = batch_size { train_config.batch_size = v; }
+    if let Some(v) = grad_accum { train_config.gradient_accumulation_steps = v; }
+    if let Some(v) = learning_rate { train_config.learning_rate = v; }
+    if let Some(v) = warmup_steps { train_config.warmup_steps = v; }
     
     std::fs::create_dir_all(output).expect("Erro criando diretorio de checkpoints");
     
@@ -359,6 +422,10 @@ fn train_model(data: &PathBuf, _tokenizer_path: &PathBuf, output: &PathBuf, mode
         train_config.batch_size, 
         train_config.batch_size * train_config.gradient_accumulation_steps);
     println!("  Seq len: {}", model_config.max_seq_len);
+    println!("  Max steps: {}", format_number(train_config.max_steps));
+    println!("  Learning rate: {:.2e}", train_config.learning_rate);
+    println!("  Warmup steps: {}", train_config.warmup_steps);
+    println!("  Save every: {} steps", train_config.save_every);
     println!("===================================================\n");
     
     let mut trainer: Trainer<TrainBackend> = Trainer::new(&model_config, train_config.clone(), device.clone());
@@ -372,6 +439,11 @@ fn resume_training(
     output: &PathBuf, 
     additional_steps: usize,
     model_size: &str,
+    save_every: Option<usize>,
+    batch_size: Option<usize>,
+    grad_accum: Option<usize>,
+    learning_rate: Option<f64>,
+    seq_len: Option<usize>,
 ) {
     println!("===================================================");
     println!("  Retomando treinamento de checkpoint");
@@ -379,17 +451,21 @@ fn resume_training(
     
     let device = NdArrayDevice::Cpu;
     
-    let model_config = match model_size {
+    let mut model_config = match model_size {
         "85m" => RWKVConfig::ptbr_85m(),
         "mini" => RWKVConfig::ptbr_mini(),
         "micro" => RWKVConfig::ptbr_micro(),
         _ => RWKVConfig::ptbr_micro(),
     };
     
+    if let Some(sl) = seq_len {
+        model_config.max_seq_len = sl;
+    }
+    
     println!("  Modelo: {} ({} parametros)", model_size, format_params(model_config.num_parameters()));
     println!("  Checkpoint: {:?}", checkpoint_path);
     
-    let train_config = TrainingConfig {
+    let mut train_config = TrainingConfig {
         learning_rate: 1e-4,
         batch_size: 2,
         gradient_accumulation_steps: 16,
@@ -401,6 +477,11 @@ fn resume_training(
         eval_every: 500,
     };
     
+    if let Some(v) = save_every { train_config.save_every = v; }
+    if let Some(v) = batch_size { train_config.batch_size = v; }
+    if let Some(v) = grad_accum { train_config.gradient_accumulation_steps = v; }
+    if let Some(v) = learning_rate { train_config.learning_rate = v; }
+    
     std::fs::create_dir_all(output).expect("Erro criando diretorio de checkpoints");
     
     let dataset = MmapDataset::from_file(
@@ -410,7 +491,10 @@ fn resume_training(
     
     println!("  Sequencias: {}", format_number(dataset.len()));
     println!("  Steps adicionais: {}", format_number(additional_steps));
-    println!("  Learning rate: {} (reduzido para fine-tuning)", train_config.learning_rate);
+    println!("  Learning rate: {:.2e}", train_config.learning_rate);
+    println!("  Batch size: {} (efetivo: {})", 
+        train_config.batch_size,
+        train_config.batch_size * train_config.gradient_accumulation_steps);
     
     let mut trainer: Trainer<TrainBackend> = Trainer::new(&model_config, train_config.clone(), device.clone());
     
@@ -424,7 +508,7 @@ fn resume_training(
     run_training_loop(&mut trainer, &dataset, &train_config, output);
 }
 
-fn test_model(model_path: &PathBuf, tokenizer_path: &PathBuf) {
+fn test_model(model_path: &PathBuf, tokenizer_path: &PathBuf, model_size: &str) {
     println!("===================================================");
     println!("  Teste de Modelo - Top-5 Predicoes");
     println!("===================================================\n");
@@ -434,7 +518,13 @@ fn test_model(model_path: &PathBuf, tokenizer_path: &PathBuf) {
     let mut tokenizer = BPETokenizer::from_file(tokenizer_path.to_str().unwrap())
         .expect("Erro carregando tokenizer");
     
-    let config = RWKVConfig::ptbr_micro();
+    let config = match model_size {
+        "85m" => RWKVConfig::ptbr_85m(),
+        "mini" => RWKVConfig::ptbr_mini(),
+        "micro" => RWKVConfig::ptbr_micro(),
+        _ => RWKVConfig::ptbr_micro(),
+    };
+    
     let model: RWKV<MyBackend> = RWKV::new(&config, &device);
     
     let recorder = CompactRecorder::new();
@@ -489,7 +579,14 @@ fn test_model(model_path: &PathBuf, tokenizer_path: &PathBuf) {
     }
 }
 
-fn generate(model_path: &PathBuf, tokenizer_path: &PathBuf, prompt: &str, max_tokens: usize) {
+fn generate(
+    model_path: &PathBuf, 
+    tokenizer_path: &PathBuf, 
+    prompt: &str, 
+    max_tokens: usize,
+    model_size: &str,
+    temperature: f32,
+) {
     println!("Gerando texto...");
     
     let device = NdArrayDevice::Cpu;
@@ -497,7 +594,13 @@ fn generate(model_path: &PathBuf, tokenizer_path: &PathBuf, prompt: &str, max_to
     let mut tokenizer = BPETokenizer::from_file(tokenizer_path.to_str().unwrap())
         .expect("Erro carregando tokenizer");
     
-    let config = RWKVConfig::ptbr_micro();
+    let config = match model_size {
+        "85m" => RWKVConfig::ptbr_85m(),
+        "mini" => RWKVConfig::ptbr_mini(),
+        "micro" => RWKVConfig::ptbr_micro(),
+        _ => RWKVConfig::ptbr_micro(),
+    };
+    
     let model: RWKV<MyBackend> = RWKV::new(&config, &device);
     
     let recorder = CompactRecorder::new();
@@ -507,9 +610,9 @@ fn generate(model_path: &PathBuf, tokenizer_path: &PathBuf, prompt: &str, max_to
     let mut tokens = tokenizer.encode(prompt);
     
     println!("Prompt: {}", prompt);
+    println!("Temperatura: {}", temperature);
     print!("Gerado: ");
     
-    let temperature: f32 = 0.8; 
     let mut rng = rand::thread_rng();
 
     for _ in 0..max_tokens {
