@@ -1,0 +1,29 @@
+@"
+# Rust
+/target/
+**/*.rs.bk
+
+# Dados
+/data/
+*.bin
+*.mpk
+*.bz2
+*.zip
+*.sqlite
+corpus.txt
+
+# Checkpoints
+/checkpoints*/
+/models/
+
+# Logs
+/logs/
+*.log
+
+# IDE
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
+"@ | Out-File -Encoding utf8 .gitignore

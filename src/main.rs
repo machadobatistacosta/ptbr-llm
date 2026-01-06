@@ -1,0 +1,696 @@
+// src/main.rs
+
+mod data;
+mod tokenizer;
+mod model;
+
+use clap::{Parser, Subcommand};
+use std::path::PathBuf;
+
+use data::{WikiStreamParser, WikiParserConfig, WikiCleaner, MmapDataset, DataLoader, TokenizedDatasetWriter};
+use tokenizer::{BPETokenizer, BPETrainer};
+use model::{RWKVConfig, TrainingConfig, RWKV, Trainer};
+use rand::prelude::*;
+use rand::distributions::WeightedIndex;
+
+use burn::backend::ndarray::{NdArray, NdArrayDevice};
+use burn::backend::Autodiff;
+use burn::tensor::{Tensor, Int, backend::Backend};
+use burn::module::Module;
+use burn::record::CompactRecorder;
+
+type MyBackend = NdArray;
+type TrainBackend = Autodiff<MyBackend>;
+
+#[derive(Parser)]
+#[command(name = "ptbr-slm")]
+#[command(about = "Small Language Model focado em Portugues do Brasil")]
+struct Cli {
+    #[command(subcommand)]
+    command: Commands,
+}
+
+#[derive(Subcommand)]
+enum Commands {
+    ProcessWiki {
+        #[arg(short, long)]
+        input: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
+    },
+    TrainTokenizer {
+        #[arg(short, long)]
+        corpus: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
+        #[arg(short, long, default_value = "32000")]
+        vocab_size: usize,
+    },
+    Tokenize {
+        #[arg(short, long)]
+        input: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
+        #[arg(short, long)]
+        tokenizer: PathBuf,
+    },
+    Train {
+        #[arg(short, long)]
+        data: PathBuf,
+        #[arg(short, long)]
+        tokenizer: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
+        #[arg(long, default_value = "mini")]
+        model_size: String,
+    },
+    Resume {
+        #[arg(short, long)]
+        checkpoint: PathBuf,
+        #[arg(short, long)]
+        data: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
+        #[arg(long, default_value = "150000")]
+        additional_steps: usize,
+        #[arg(long, default_value = "micro")]
+        model_size: String,
+    },
+    TestModel {
+        #[arg(short, long)]
+        model: PathBuf,
+        #[arg(short, long)]
+        tokenizer: PathBuf,
+    },
+    Generate {
+        #[arg(short, long)]
+        model: PathBuf,
+        #[arg(short, long)]
+        tokenizer: PathBuf,
+        #[arg(short, long)]
+        prompt: String,
+        #[arg(long, default_value = "100")]
+        max_tokens: usize,
+    },
+    CleanCorpus {
+        #[arg(short, long)]
+        input: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
+        #[arg(long, default_value = "false")]
+        verbose: bool,
+    },
+}
+
+fn main() {
+    let cli = Cli::parse();
+    
+    match cli.command {
+        Commands::ProcessWiki { input, output } => {
+            process_wiki(&input, &output);
+        }
+        Commands::TrainTokenizer { corpus, output, vocab_size } => {
+            train_tokenizer(&corpus, &output, vocab_size);
+        }
+        Commands::Tokenize { input, output, tokenizer } => {
+            tokenize_corpus(&input, &output, &tokenizer);
+        }
+        Commands::Train { data, tokenizer, output, model_size } => {
+            train_model(&data, &tokenizer, &output, &model_size);
+        }
+        Commands::Resume { checkpoint, data, output, additional_steps, model_size } => {
+            resume_training(&checkpoint, &data, &output, additional_steps, &model_size);
+        }
+        Commands::TestModel { model, tokenizer } => {
+            test_model(&model, &tokenizer);
+        }
+        Commands::Generate { model, tokenizer, prompt, max_tokens } => {
+            generate(&model, &tokenizer, &prompt, max_tokens);
+        }
+        Commands::CleanCorpus { input, output, verbose } => {
+            clean_corpus(&input, &output, verbose);
+        }
+    }
+}
+
+fn process_wiki(input: &PathBuf, output: &PathBuf) {
+    println!("Processando Wikipedia PT-BR...");
+    
+    let config = WikiParserConfig::default();
+    let parser = WikiStreamParser::new(config);
+    let cleaner = WikiCleaner::new();
+    
+    std::fs::create_dir_all(output).expect("Erro criando diretorio");
+    
+    let mut file_idx = 0;
+    let mut current_file = std::fs::File::create(output.join(format!("wiki_{:03}.txt", file_idx)))
+        .expect("Erro criando arquivo");
+    let mut articles_in_file = 0;
+    let mut total_articles = 0;
+    
+    for article in parser.parse_streaming(input.to_str().unwrap()) {
+        let clean_text = cleaner.clean(&article.text);
+        
+        if clean_text.len() >= 100 {
+            use std::io::Write;
+            writeln!(current_file, "{}", clean_text).expect("Erro escrevendo");
+            articles_in_file += 1;
+            total_articles += 1;
+            
+            if articles_in_file >= 10_000 {
+                file_idx += 1;
+                current_file = std::fs::File::create(output.join(format!("wiki_{:03}.txt", file_idx)))
+                    .expect("Erro criando arquivo");
+                articles_in_file = 0;
+                println!("Arquivo {} completado ({} artigos total)", file_idx, total_articles);
+            }
+        }
+    }
+    
+    println!("Processamento concluido! {} arquivos, {} artigos total.", file_idx + 1, total_articles);
+}
+
+fn train_tokenizer(corpus: &PathBuf, output: &PathBuf, vocab_size: usize) {
+    println!("Treinando tokenizer BPE com {} tokens...", vocab_size);
+    
+    let trainer = BPETrainer::new(vocab_size, 2);
+    
+    // CORRIGIDO: Aceita arquivo OU diretorio
+    let texts: Box<dyn Iterator<Item = String>> = if corpus.is_file() {
+        println!("Lendo arquivo {:?}...", corpus);
+        let content = std::fs::read_to_string(corpus)
+            .expect("Erro lendo arquivo");
+        Box::new(content.lines().map(String::from).collect::<Vec<_>>().into_iter())
+    } else {
+        Box::new(
+            std::fs::read_dir(corpus)
+                .expect("Erro lendo diretorio")
+                .filter_map(|entry| entry.ok())
+                .filter(|entry| entry.path().extension().map(|e| e == "txt").unwrap_or(false))
+                .flat_map(|entry| {
+                    println!("Lendo {:?}...", entry.path());
+                    std::fs::read_to_string(entry.path())
+                        .ok()
+                        .into_iter()
+                        .flat_map(|content| {
+                            content.lines().map(String::from).collect::<Vec<_>>()
+                        })
+                })
+        )
+    };
+    
+    let vocab = trainer.train(texts);
+    let tokenizer = BPETokenizer::from_vocab(vocab);
+    
+    // Cria diretorio de saida
+    std::fs::create_dir_all(output).expect("Erro criando diretorio de saida");
+    
+    // Salva como tokenizer.json dentro do diretorio
+    let tokenizer_path = output.join("tokenizer.json");
+    tokenizer.save(tokenizer_path.to_str().unwrap()).expect("Erro salvando tokenizer");
+    
+    println!("Tokenizer salvo em {:?}", tokenizer_path);
+}
+
+fn tokenize_corpus(input: &PathBuf, output: &PathBuf, tokenizer_path: &PathBuf) {
+    println!("Tokenizando corpus...");
+    
+    let mut tokenizer = BPETokenizer::from_file(tokenizer_path.to_str().unwrap())
+        .expect("Erro carregando tokenizer");
+    
+    std::fs::create_dir_all(output).expect("Erro criando diretorio");
+    
+    let mut writer = TokenizedDatasetWriter::new(&output.join("train.bin"))
+        .expect("Erro criando arquivo de saida");
+    
+    // CORRIGIDO: Aceita arquivo OU diretorio
+    if input.is_file() {
+        println!("Tokenizando {:?}...", input);
+        let content = std::fs::read_to_string(input)
+            .expect("Erro lendo arquivo");
+        let tokens = tokenizer.encode(&content);
+        writer.write_tokens(&tokens).expect("Erro escrevendo tokens");
+        println!("  {} tokens", format_number(tokens.len()));
+    } else {
+        for entry in std::fs::read_dir(input).expect("Erro lendo diretorio") {
+            let entry = entry.expect("Erro lendo entrada");
+            if entry.path().extension().map(|e| e == "txt").unwrap_or(false) {
+                let content = std::fs::read_to_string(entry.path())
+                    .expect("Erro lendo arquivo");
+                
+                let tokens = tokenizer.encode(&content);
+                writer.write_tokens(&tokens).expect("Erro escrevendo tokens");
+                
+                println!("Tokenizado: {:?} ({} tokens)", entry.path(), format_number(tokens.len()));
+            }
+        }
+    }
+    
+    let total = writer.finish().expect("Erro finalizando");
+    println!("Total de tokens: {}", format_number(total));
+}
+
+fn run_training_loop(
+    trainer: &mut Trainer<TrainBackend>,
+    dataset: &MmapDataset,
+    train_config: &TrainingConfig,
+    output: &PathBuf,
+) {
+    let device = NdArrayDevice::Cpu;
+    let data_loader = DataLoader::new(dataset, train_config.batch_size);
+    
+    let start = std::time::Instant::now();
+    let mut last_print = std::time::Instant::now();
+    let mut total_loss = 0.0f32;
+    let mut loss_count = 0;
+    let initial_step = trainer.step();
+    
+    println!("  Iniciando do step {}...\n", initial_step);
+    
+    for (inputs, targets) in data_loader {
+        let input_tensor = create_batch_tensor::<TrainBackend>(&inputs, &device);
+        let target_tensor = create_batch_tensor::<TrainBackend>(&targets, &device);
+        
+        let loss = trainer.train_step(input_tensor, target_tensor);
+        total_loss += loss;
+        loss_count += 1;
+        
+        if last_print.elapsed().as_secs() >= 5 {
+            let step = trainer.step();
+            let steps_done = step - initial_step;
+            let elapsed = start.elapsed().as_secs();
+            let avg_loss = total_loss / loss_count as f32;
+            let steps_per_sec = steps_done as f64 / elapsed.max(1) as f64;
+            let remaining = train_config.max_steps.saturating_sub(steps_done);
+            let eta = (remaining as f64 / steps_per_sec.max(0.01)) as u64;
+            
+            println!("Step {:6} | Loss: {:.4} | {:.2} steps/s | ETA: {}h{}m",
+                step, avg_loss, steps_per_sec, eta / 3600, (eta % 3600) / 60);
+            
+            total_loss = 0.0;
+            loss_count = 0;
+            last_print = std::time::Instant::now();
+        }
+        
+        let steps_done = trainer.step() - initial_step;
+        if steps_done % train_config.save_every == 0 && steps_done > 0 {
+            let checkpoint_path = output.join(format!("checkpoint_{}.bin", trainer.step()));
+            match trainer.save_checkpoint(checkpoint_path.to_str().unwrap()) {
+                Ok(_) => println!("  Checkpoint salvo: {:?}", checkpoint_path),
+                Err(e) => println!("  Erro salvando checkpoint: {}", e),
+            }
+        }
+        
+        if steps_done >= train_config.max_steps {
+            break;
+        }
+    }
+    
+    let final_path = output.join(format!("model_step_{}.bin", trainer.step()));
+    trainer.save_checkpoint(final_path.to_str().unwrap())
+        .expect("Erro salvando modelo final");
+    
+    let elapsed = start.elapsed();
+    println!("\n===================================================");
+    println!("  Treinamento concluido!");
+    println!("  Steps totais: {}", trainer.step());
+    println!("  Tempo: {}h{}m", elapsed.as_secs() / 3600, (elapsed.as_secs() % 3600) / 60);
+    println!("  Modelo salvo em: {:?}", final_path);
+    println!("===================================================");
+}
+
+fn train_model(data: &PathBuf, _tokenizer_path: &PathBuf, output: &PathBuf, model_size: &str) {
+    println!("===================================================");
+    println!("  Iniciando treinamento (CPU)");
+    println!("===================================================");
+    
+    let device = NdArrayDevice::Cpu;
+    
+    let model_config = match model_size {
+        "85m" => RWKVConfig::ptbr_85m(),
+        "mini" => RWKVConfig::ptbr_mini(),
+        "micro" => RWKVConfig::ptbr_micro(),
+        _ => RWKVConfig::ptbr_micro(),
+    };
+    
+    println!("  Modelo: {} ({} parametros)", model_size, format_params(model_config.num_parameters()));
+    
+    let train_config = TrainingConfig {
+        learning_rate: 3e-4,
+        batch_size: 2,
+        gradient_accumulation_steps: 16,
+        warmup_steps: 500,
+        max_steps: 50_000,
+        weight_decay: 0.01,
+        gradient_clip: 1.0,
+        save_every: 2500,
+        eval_every: 500,
+    };
+    
+    std::fs::create_dir_all(output).expect("Erro criando diretorio de checkpoints");
+    
+    let dataset = MmapDataset::from_file(
+        &data.join("train.bin"),
+        model_config.max_seq_len,
+    ).expect("Erro carregando dataset");
+    
+    println!("  Sequencias: {}", format_number(dataset.len()));
+    println!("  Batch size: {} (efetivo: {})", 
+        train_config.batch_size, 
+        train_config.batch_size * train_config.gradient_accumulation_steps);
+    println!("  Seq len: {}", model_config.max_seq_len);
+    println!("===================================================\n");
+    
+    let mut trainer: Trainer<TrainBackend> = Trainer::new(&model_config, train_config.clone(), device.clone());
+    
+    run_training_loop(&mut trainer, &dataset, &train_config, output);
+}
+
+fn resume_training(
+    checkpoint_path: &PathBuf, 
+    data: &PathBuf, 
+    output: &PathBuf, 
+    additional_steps: usize,
+    model_size: &str,
+) {
+    println!("===================================================");
+    println!("  Retomando treinamento de checkpoint");
+    println!("===================================================");
+    
+    let device = NdArrayDevice::Cpu;
+    
+    let model_config = match model_size {
+        "85m" => RWKVConfig::ptbr_85m(),
+        "mini" => RWKVConfig::ptbr_mini(),
+        "micro" => RWKVConfig::ptbr_micro(),
+        _ => RWKVConfig::ptbr_micro(),
+    };
+    
+    println!("  Modelo: {} ({} parametros)", model_size, format_params(model_config.num_parameters()));
+    println!("  Checkpoint: {:?}", checkpoint_path);
+    
+    let train_config = TrainingConfig {
+        learning_rate: 1e-4,
+        batch_size: 2,
+        gradient_accumulation_steps: 16,
+        warmup_steps: 100,
+        max_steps: additional_steps,
+        weight_decay: 0.01,
+        gradient_clip: 1.0,
+        save_every: 5000,
+        eval_every: 500,
+    };
+    
+    std::fs::create_dir_all(output).expect("Erro criando diretorio de checkpoints");
+    
+    let dataset = MmapDataset::from_file(
+        &data.join("train.bin"),
+        model_config.max_seq_len,
+    ).expect("Erro carregando dataset");
+    
+    println!("  Sequencias: {}", format_number(dataset.len()));
+    println!("  Steps adicionais: {}", format_number(additional_steps));
+    println!("  Learning rate: {} (reduzido para fine-tuning)", train_config.learning_rate);
+    
+    let mut trainer: Trainer<TrainBackend> = Trainer::new(&model_config, train_config.clone(), device.clone());
+    
+    println!("\n  Carregando pesos do checkpoint...");
+    trainer.load_checkpoint(checkpoint_path.to_str().unwrap())
+        .expect("Erro ao carregar checkpoint");
+    println!("  Checkpoint carregado com sucesso!");
+    
+    println!("===================================================\n");
+    
+    run_training_loop(&mut trainer, &dataset, &train_config, output);
+}
+
+fn test_model(model_path: &PathBuf, tokenizer_path: &PathBuf) {
+    println!("===================================================");
+    println!("  Teste de Modelo - Top-5 Predicoes");
+    println!("===================================================\n");
+    
+    let device = NdArrayDevice::Cpu;
+    
+    let mut tokenizer = BPETokenizer::from_file(tokenizer_path.to_str().unwrap())
+        .expect("Erro carregando tokenizer");
+    
+    let config = RWKVConfig::ptbr_micro();
+    let model: RWKV<MyBackend> = RWKV::new(&config, &device);
+    
+    let recorder = CompactRecorder::new();
+    let model = model.load_file(model_path.to_str().unwrap(), &recorder, &device)
+        .expect("Erro carregando modelo");
+    
+    let test_prompts = vec![
+        "O Brasil",
+        "A cidade de Sao Paulo",
+        "Em 1500",
+        "O presidente",
+        "A lingua portuguesa",
+    ];
+    
+    for prompt in test_prompts {
+        let tokens = tokenizer.encode(prompt);
+        let input_vec: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        let seq_len = input_vec.len();
+        
+        let input: Tensor<MyBackend, 1, Int> = Tensor::from_ints(input_vec.as_slice(), &device);
+        let input = input.reshape([1, seq_len]);
+        
+        let logits = model.forward_inference(input);
+        
+        let dims = logits.dims();
+        let vocab_size = dims[dims.len() - 1];
+        let seq_len_out = dims[dims.len() - 2];
+        
+        let last_token_logits = if dims.len() == 3 {
+            logits.slice([0..1, seq_len_out-1..seq_len_out, 0..vocab_size])
+        } else {
+            logits.slice([seq_len_out-1..seq_len_out, 0..vocab_size])
+        };
+        
+        let logits_vec: Vec<f32> = last_token_logits.into_data().iter::<f32>().collect();
+        
+        let max_logit = logits_vec.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let exp_logits: Vec<f32> = logits_vec.iter().map(|x| (x - max_logit).exp()).collect();
+        let sum_exp: f32 = exp_logits.iter().sum();
+        let probs: Vec<f32> = exp_logits.iter().map(|x| x / sum_exp).collect();
+        
+        let mut indexed: Vec<(usize, f32)> = probs.iter().cloned().enumerate().collect();
+        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        
+        println!("Prompt: \"{}\"", prompt);
+        println!("Top-5 proximos tokens:");
+        for (i, (token_id, prob)) in indexed.iter().take(5).enumerate() {
+            let token_text = tokenizer.decode(&[*token_id as u16]);
+            println!("  {}. {:15} {:>6.2}%", i+1, format!("\"{}\"", token_text.trim()), prob * 100.0);
+        }
+        println!();
+    }
+}
+
+fn generate(model_path: &PathBuf, tokenizer_path: &PathBuf, prompt: &str, max_tokens: usize) {
+    println!("Gerando texto...");
+    
+    let device = NdArrayDevice::Cpu;
+    
+    let mut tokenizer = BPETokenizer::from_file(tokenizer_path.to_str().unwrap())
+        .expect("Erro carregando tokenizer");
+    
+    let config = RWKVConfig::ptbr_micro();
+    let model: RWKV<MyBackend> = RWKV::new(&config, &device);
+    
+    let recorder = CompactRecorder::new();
+    let model = model.load_file(model_path.to_str().unwrap(), &recorder, &device)
+        .expect("Erro carregando modelo");
+    
+    let mut tokens = tokenizer.encode(prompt);
+    
+    println!("Prompt: {}", prompt);
+    print!("Gerado: ");
+    
+    let temperature: f32 = 0.8; 
+    let mut rng = rand::thread_rng();
+
+    for _ in 0..max_tokens {
+        let input_vec: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        let seq_len = input_vec.len();
+        
+        let input: Tensor<MyBackend, 1, Int> = Tensor::from_ints(input_vec.as_slice(), &device);
+        let input = input.reshape([1, seq_len]);
+        
+        let logits = model.forward_inference(input);
+        
+        let dims = logits.dims();
+        let vocab_size = dims[dims.len() - 1];
+        let seq_len_out = dims[dims.len() - 2];
+        
+        let last_token_logits = if dims.len() == 3 {
+             logits.slice([0..1, seq_len_out-1..seq_len_out, 0..vocab_size])
+        } else {
+             logits.slice([seq_len_out-1..seq_len_out, 0..vocab_size])
+        };
+        
+        let logits_vec: Vec<f32> = last_token_logits.into_data().iter::<f32>().collect();
+        let temp_logits: Vec<f32> = logits_vec.iter().map(|x| x / temperature).collect();
+        let max_logit = temp_logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let exp_logits: Vec<f32> = temp_logits.iter().map(|x| (x - max_logit).exp()).collect();
+        let sum_exp: f32 = exp_logits.iter().sum();
+        let probs: Vec<f32> = exp_logits.iter().map(|x| x / sum_exp).collect();
+
+        let dist = WeightedIndex::new(&probs).unwrap();
+        let next_token = dist.sample(&mut rng) as u16;
+
+        if next_token == tokenizer.eos_id() {
+            break;
+        }
+        
+        tokens.push(next_token);
+        
+        let decoded = tokenizer.decode(&[next_token]);
+        print!("{}", decoded);
+        use std::io::Write;
+        std::io::stdout().flush().unwrap();
+    }
+    
+    println!();
+}
+
+fn create_batch_tensor<B: Backend>(
+    data: &[Vec<u16>],
+    device: &B::Device,
+) -> Tensor<B, 2, Int> {
+    let batch_size = data.len();
+    let seq_len = data[0].len();
+    
+    let flat: Vec<i32> = data.iter()
+        .flatten()
+        .map(|&x| x as i32)
+        .collect();
+    
+    let tensor: Tensor<B, 1, Int> = Tensor::from_ints(flat.as_slice(), device);
+    tensor.reshape([batch_size, seq_len])
+}
+
+fn format_params(n: usize) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}K", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+fn format_number(n: usize) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}K", n as f64 / 1_000.0)
+    } else {
+        n.to_string()
+    }
+}
+
+fn format_bytes(n: usize) -> String {
+    if n >= 1_000_000_000 {
+        format!("{:.1}GB", n as f64 / 1_000_000_000.0)
+    } else if n >= 1_000_000 {
+        format!("{:.1}MB", n as f64 / 1_000_000.0)
+    } else if n >= 1_000 {
+        format!("{:.1}KB", n as f64 / 1_000.0)
+    } else {
+        format!("{}B", n)
+    }
+}
+
+fn clean_corpus(input: &PathBuf, output: &PathBuf, verbose: bool) {
+    println!("===================================================");
+    println!("  Limpando corpus");
+    println!("===================================================\n");
+    
+    std::fs::create_dir_all(output).expect("Erro criando diretorio");
+    
+    let cleaner = WikiCleaner::new();
+    
+    let mut total_chars_before = 0usize;
+    let mut total_chars_after = 0usize;
+    let mut file_count = 0usize;
+    
+    let mut entries: Vec<_> = std::fs::read_dir(input)
+        .expect("Erro lendo diretorio")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.path().extension().map(|x| x == "txt").unwrap_or(false))
+        .collect();
+    
+    entries.sort_by_key(|e| e.path());
+    println!("  Encontrados {} arquivos\n", entries.len());
+    
+    for entry in entries {
+        let content = match std::fs::read_to_string(entry.path()) {
+            Ok(c) => c,
+            Err(_) => {
+                match std::fs::read(entry.path()) {
+                    Ok(bytes) => String::from_utf8_lossy(&bytes).to_string(),
+                    Err(e) => {
+                        println!("  Erro lendo {:?}: {}", entry.file_name(), e);
+                        continue;
+                    }
+                }
+            }
+        };
+        
+        total_chars_before += content.len();
+        
+        let mut cleaned_blocks = Vec::new();
+        
+        for block in content.split("\n\n") {
+            if block.trim().is_empty() {
+                continue;
+            }
+            
+            let clean_block = cleaner.clean(block);
+            
+            if clean_block.len() > 100 && 
+               clean_block.lines().any(|l| l.len() > 50) &&
+               !has_garbage(&clean_block) {
+                cleaned_blocks.push(clean_block);
+            }
+        }
+        
+        let clean_content = cleaned_blocks.join("\n\n");
+        total_chars_after += clean_content.len();
+        
+        if !clean_content.is_empty() {
+            let output_path = output.join(entry.file_name());
+            std::fs::write(&output_path, &clean_content)
+                .expect("Erro escrevendo arquivo");
+            file_count += 1;
+            
+            if verbose {
+                println!("  {:?}: {}KB -> {}KB", 
+                    entry.file_name(),
+                    content.len() / 1024,
+                    clean_content.len() / 1024);
+            }
+        }
+    }
+    
+    let pct = if total_chars_before > 0 {
+        100.0 * (1.0 - total_chars_after as f64 / total_chars_before as f64)
+    } else { 0.0 };
+    
+    println!("\n===================================================");
+    println!("  Arquivos salvos: {}", file_count);
+    println!("  Tamanho: {} -> {} ({:.1}% removido)", 
+        format_bytes(total_chars_before), 
+        format_bytes(total_chars_after), pct);
+    println!("===================================================");
+}
+
+fn has_garbage(text: &str) -> bool {
+    let garbage = ["|", "{|", "|-", "align=", "width=", "colspan=", 
+                   "latM=", "lonM=", "{{", "}}", "[[Categoria:", 
+                   "Ficheiro:", "<ref", "<!--"];
+    garbage.iter().any(|g| text.contains(g))
+}

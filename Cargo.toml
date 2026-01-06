@@ -1,0 +1,51 @@
+[package]
+name = "ptbr-slm"
+version = "0.1.0"
+edition = "2021"
+authors = ["Caike Machado Batista Costa"]
+description = "Small Language Model para Português do Brasil"
+
+[dependencies]
+# Framework de ML
+burn = { version = "0.14", features = ["ndarray", "autodiff", "train"] }
+
+bincode = { version = "=2.0.0-rc.3", features = ["serde"] }
+
+# Parsing e IO
+quick-xml = "0.31"
+bzip2 = "0.4"
+memmap2 = "0.9"
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+
+# Texto
+regex = "1.10"
+once_cell = "1.19"
+unicode-normalization = "0.1"
+
+# Concorrência
+crossbeam-channel = "0.5"
+rayon = "1.10"
+
+# Randomização
+rand = "0.8"
+rand_chacha = "0.3"
+
+# CLI
+clap = { version = "4.5", features = ["derive"] }
+
+# Logging
+tracing = "0.1"
+tracing-subscriber = "0.3"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+
+[profile.dev]
+opt-level = 3
+
+
+
+
