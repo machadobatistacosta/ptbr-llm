@@ -278,7 +278,6 @@ version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "6e2c2f79896737381315dd03c97b1cec2bbf91542468e3e906941e4b76ba7154"
 dependencies = [
- "burn-fusion",
  "burn-jit",
  "burn-tensor",
  "bytemuck",
@@ -321,28 +320,12 @@ dependencies = [
 ]
 
 [[package]]
-name = "burn-fusion"
-version = "0.14.0"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "e8d20cbfe201cac8bd1794170adf35d27dc7b3cce102eb910b37a88a64428bbe"
-dependencies = [
- "burn-common",
- "burn-tensor",
- "derive-new",
- "hashbrown 0.14.5",
- "log",
- "serde",
- "spin",
-]
-
-[[package]]
 name = "burn-jit"
 version = "0.14.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "9f47a352e61f5b0e0385116d9e00bc92995376d3365b7d90e9038dab988ecf66"
 dependencies = [
  "burn-common",
- "burn-fusion",
  "burn-tensor",
  "bytemuck",
  "cubecl",
@@ -1509,6 +1492,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "matchers"
+version = "0.2.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "d1525a2a28c7f4fa0fc98bb91ae755d1e2d1505079e05539e35bc876b5d65ae9"
+dependencies = [
+ "regex-automata",
+]
+
+[[package]]
 name = "matrixmultiply"
 version = "0.3.10"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1832,11 +1824,10 @@ checksum = "3eb8486b569e12e2c32ad3e204dbaba5e4b5b216e9367044f25f1dba42341773"
 
 [[package]]
 name = "ptbr-slm"
-version = "0.1.0"
+version = "1.0.0"
 dependencies = [
  "bincode",
  "burn",
- "burn-cuda",
  "bzip2",
  "clap",
  "crossbeam-channel",
@@ -2588,10 +2579,14 @@ version = "0.3.22"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "2f30143827ddab0d256fd843b7a66d164e9f271cfa0dde49142c5ca0ca291f1e"
 dependencies = [
+ "matchers",
  "nu-ansi-term",
+ "once_cell",
+ "regex-automata",
  "sharded-slab",
  "smallvec",
  "thread_local",
+ "tracing",
  "tracing-core",
  "tracing-log",
 ]

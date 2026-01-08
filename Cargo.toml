@@ -1,28 +1,29 @@
 [package]
 name = "ptbr-slm"
-version = "0.1.0"
+version = "1.0.0"
 edition = "2021"
 authors = ["Caike Machado Batista Costa"]
-description = "Small Language Model para Português do Brasil"
+description = "RWKV Language Model para Português Brasileiro"
 
 [features]
 default = ["cpu"]
 cpu = ["burn/ndarray"]
-gpu = ["dep:burn-cuda"]
+gpu = ["burn/wgpu"]
+cuda = ["burn/cuda-jit"]
 
 [dependencies]
-# Framework de ML
+# Burn ML Framework
 burn = { version = "0.14", default-features = false, features = ["autodiff", "train"] }
-burn-cuda = { version = "0.14", optional = true }
 
-bincode = { version = "=2.0.0-rc.3", features = ["serde"] }
-
-# Parsing e IO
-quick-xml = "0.31"
-bzip2 = "0.4"
-memmap2 = "0.9"
+# Serialização
+bincode = { version = "2.0.0-rc.3", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+
+# IO e Memória
+memmap2 = "0.9"
+quick-xml = "0.31"
+bzip2 = "0.4"
 
 # Texto
 regex = "1.10"
@@ -37,17 +38,16 @@ rayon = "1.10"
 rand = "0.8"
 rand_chacha = "0.3"
 
-# CLI
+# CLI e Logging
 clap = { version = "4.5", features = ["derive"] }
-
-# Logging
 tracing = "0.1"
-tracing-subscriber = "0.3"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
 [profile.release]
 lto = true
 codegen-units = 1
 opt-level = 3
+strip = true
 
 [profile.dev]
-opt-level = 3
+opt-level = 1

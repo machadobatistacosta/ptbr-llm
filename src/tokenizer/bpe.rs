@@ -1,19 +1,17 @@
-// src/tokenizer/bpe.rs
-
-use std::collections::HashMap;
+#![allow(dead_code)]
+use std::collections::{HashMap, VecDeque};
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
 use serde::{Serialize, Deserialize};
 use rayon::prelude::*;
 
-/// Estrutura serializável para JSON
+const MAX_CACHE_SIZE: usize = 50_000;
+
+/// Vocabulário BPE serializado
 #[derive(Serialize, Deserialize, Clone)]
 pub struct BPEVocab {
-    /// Lista de tokens (índice = id)
     pub id_to_token: Vec<Vec<u8>>,
-    /// Merges na ordem em que foram feitos
     pub merges: Vec<(u16, u16)>,
-    /// Special tokens
     pub special_tokens: HashMap<String, u16>,
 }
 
@@ -26,7 +24,6 @@ impl BPEVocab {
         }
     }
     
-    /// Reconstrói token_to_id a partir de id_to_token
     pub fn build_token_to_id(&self) -> HashMap<Vec<u8>, u16> {
         self.id_to_token
             .iter()
@@ -37,17 +34,19 @@ impl BPEVocab {
 }
 
 impl Default for BPEVocab {
-    fn default() -> Self {
-        Self::new()
-    }
+    fn default() -> Self { Self::new() }
 }
 
+/// Tokenizer BPE com cache LRU
 pub struct BPETokenizer {
     id_to_token: Vec<Vec<u8>>,
     token_to_id: HashMap<Vec<u8>, u16>,
     merges: Vec<(u16, u16)>,
     special_tokens: HashMap<String, u16>,
+    
+    // LRU Cache
     cache: HashMap<String, Vec<u16>>,
+    cache_order: VecDeque<String>,
 }
 
 impl BPETokenizer {
@@ -56,26 +55,12 @@ impl BPETokenizer {
     pub const BOS_TOKEN: &'static str = "[BOS]";
     pub const EOS_TOKEN: &'static str = "[EOS]";
     pub const SEP_TOKEN: &'static str = "[SEP]";
-    #[allow(dead_code)]
-    pub fn pad_id(&self) -> u16 {
-        *self.special_tokens.get(Self::PAD_TOKEN).unwrap_or(&0)
-    }
-    
-    pub fn unk_id(&self) -> u16 {
-        *self.special_tokens.get(Self::UNK_TOKEN).unwrap_or(&1)
-    }
-    
-    pub fn bos_id(&self) -> u16 {
-        *self.special_tokens.get("[BOS]").expect("Tokenizer sem [BOS]")
-    }
-    
-    pub fn eos_id(&self) -> u16 {
-        *self.special_tokens.get("[EOS]").expect("Tokenizer sem [EOS]")
-    }
 
-    pub fn vocab_size(&self) -> usize {
-        self.id_to_token.len()
-    }
+    pub fn pad_id(&self) -> u16 { *self.special_tokens.get(Self::PAD_TOKEN).unwrap_or(&0) }
+    pub fn unk_id(&self) -> u16 { *self.special_tokens.get(Self::UNK_TOKEN).unwrap_or(&1) }
+    pub fn bos_id(&self) -> u16 { *self.special_tokens.get(Self::BOS_TOKEN).expect("Tokenizer sem [BOS]") }
+    pub fn eos_id(&self) -> u16 { *self.special_tokens.get(Self::EOS_TOKEN).expect("Tokenizer sem [EOS]") }
+    pub fn vocab_size(&self) -> usize { self.id_to_token.len() }
 
     pub fn from_vocab(vocab: BPEVocab) -> Self {
         let token_to_id = vocab.build_token_to_id();
@@ -84,7 +69,8 @@ impl BPETokenizer {
             token_to_id,
             merges: vocab.merges,
             special_tokens: vocab.special_tokens,
-            cache: HashMap::with_capacity(10_000),
+            cache: HashMap::with_capacity(MAX_CACHE_SIZE),
+            cache_order: VecDeque::with_capacity(MAX_CACHE_SIZE),
         }
     }
 
@@ -93,7 +79,6 @@ impl BPETokenizer {
         let reader = BufReader::new(file);
         let vocab: BPEVocab = serde_json::from_reader(reader)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::InvalidData, e))?;
-        
         Ok(Self::from_vocab(vocab))
     }
 
@@ -103,10 +88,9 @@ impl BPETokenizer {
             merges: self.merges.clone(),
             special_tokens: self.special_tokens.clone(),
         };
-        
         let file = File::create(path)?;
         let writer = BufWriter::new(file);
-        serde_json::to_writer(writer, &vocab)
+        serde_json::to_writer_pretty(writer, &vocab)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
     }
 
@@ -114,6 +98,7 @@ impl BPETokenizer {
         let mut result = Vec::new();
         
         for word in self.pre_tokenize(text) {
+            // Check cache
             if let Some(cached) = self.cache.get(&word) {
                 result.extend(cached.clone());
                 continue;
@@ -121,9 +106,14 @@ impl BPETokenizer {
             
             let tokens = self.encode_word(&word);
             
-            if word.len() < 20 {
-                self.cache.insert(word.clone(), tokens.clone());
+            // LRU Cache insert
+            if self.cache.len() >= MAX_CACHE_SIZE {
+                if let Some(oldest) = self.cache_order.pop_front() {
+                    self.cache.remove(&oldest);
+                }
             }
+            self.cache.insert(word.clone(), tokens.clone());
+            self.cache_order.push_back(word);
             
             result.extend(tokens);
         }
@@ -162,7 +152,7 @@ impl BPETokenizer {
                         }
                     }
                 }
-                '.' | ',' | '!' | '?' | ':' | ';' | '(' | ')' | '"' | '\'' => {
+                '.' | ',' | '!' | '?' | ':' | ';' | '(' | ')' | '"' | '\'' | '-' => {
                     if !current.is_empty() {
                         tokens.push(current.clone());
                         current.clear();
@@ -184,32 +174,21 @@ impl BPETokenizer {
 
     fn encode_word(&self, word: &str) -> Vec<u16> {
         let bytes: Vec<u8> = word.bytes().collect();
-        
-        if bytes.is_empty() {
-            return Vec::new();
-        }
+        if bytes.is_empty() { return Vec::new(); }
 
         let mut tokens: Vec<u16> = bytes
             .iter()
-            .map(|&b| {
-                self.token_to_id
-                    .get(&vec![b])
-                    .copied()
-                    .unwrap_or(self.unk_id())
-            })
+            .map(|&b| self.token_to_id.get(&vec![b]).copied().unwrap_or(self.unk_id()))
             .collect();
 
         loop {
-            if tokens.len() < 2 {
-                break;
-            }
+            if tokens.len() < 2 { break; }
 
             let mut best_merge: Option<(usize, usize)> = None;
             let mut best_priority = usize::MAX;
 
             for i in 0..tokens.len() - 1 {
                 let pair = (tokens[i], tokens[i + 1]);
-                
                 if let Some(pos) = self.merges.iter().position(|m| *m == pair) {
                     if pos < best_priority {
                         best_priority = pos;
@@ -221,15 +200,11 @@ impl BPETokenizer {
             match best_merge {
                 Some((idx, merge_idx)) => {
                     let (a, b) = self.merges[merge_idx];
-                    let mut merged_bytes = Vec::new();
-                    if let Some(bytes_a) = self.id_to_token.get(a as usize) {
-                        merged_bytes.extend(bytes_a);
-                    }
-                    if let Some(bytes_b) = self.id_to_token.get(b as usize) {
-                        merged_bytes.extend(bytes_b);
-                    }
+                    let mut merged = Vec::new();
+                    if let Some(ba) = self.id_to_token.get(a as usize) { merged.extend(ba); }
+                    if let Some(bb) = self.id_to_token.get(b as usize) { merged.extend(bb); }
                     
-                    if let Some(&new_id) = self.token_to_id.get(&merged_bytes) {
+                    if let Some(&new_id) = self.token_to_id.get(&merged) {
                         tokens[idx] = new_id;
                         tokens.remove(idx + 1);
                     } else {
@@ -244,7 +219,7 @@ impl BPETokenizer {
     }
 }
 
-/// Trainer BPE OTIMIZADO com paralelismo
+/// Trainer BPE paralelo
 pub struct BPETrainer {
     vocab_size: usize,
     min_frequency: usize,
@@ -254,7 +229,7 @@ impl BPETrainer {
     pub fn new(vocab_size: usize, min_frequency: usize) -> Self {
         Self {
             vocab_size,
-            min_frequency: min_frequency.max(5),
+            min_frequency: min_frequency.max(2),
         }
     }
 
@@ -262,73 +237,56 @@ impl BPETrainer {
     where
         I: Iterator<Item = String>,
     {
-        let start_total = std::time::Instant::now();
+        let start = std::time::Instant::now();
         
-        // ============ FASE 1: Contar palavras ============
-        println!("═══════════════════════════════════════════════════════════");
-        println!("  FASE 1/3: Contando palavras");
-        println!("═══════════════════════════════════════════════════════════");
+        // ===== FASE 1: Contar palavras =====
+        println!("  📊 Fase 1: Contando palavras...");
         
         let mut word_freqs: HashMap<String, usize> = HashMap::new();
         let mut total_words = 0usize;
-        let mut last_print = std::time::Instant::now();
         
         for text in texts {
             for word in text.split_whitespace() {
-                if word.len() <= 50 {
+                if word.len() <= 100 { // Limita palavras muito longas
                     *word_freqs.entry(word.to_string()).or_insert(0) += 1;
                     total_words += 1;
                 }
-                
-                if last_print.elapsed().as_secs() >= 5 {
-                    println!("  {} milhões de palavras...", total_words / 1_000_000);
-                    last_print = std::time::Instant::now();
-                }
             }
         }
-
-        println!("  ✓ Total: {} palavras", format_number(total_words));
-        println!("  ✓ Únicas: {}", format_number(word_freqs.len()));
         
-        // ============ FASE 2: Filtrar por frequência ============
-        println!("\n═══════════════════════════════════════════════════════════");
-        println!("  FASE 2/3: Filtrando palavras (freq >= {})", self.min_frequency);
-        println!("═══════════════════════════════════════════════════════════");
+        println!("    Total palavras: {}", format_number(total_words));
+        println!("    Palavras únicas: {}", format_number(word_freqs.len()));
+        
+        // ===== FASE 2: Filtrar por frequência =====
+        println!("  🔍 Fase 2: Filtrando (min_freq={})...", self.min_frequency);
         
         let filtered: HashMap<Vec<u8>, usize> = word_freqs
             .into_iter()
             .filter(|(_, freq)| *freq >= self.min_frequency)
             .map(|(word, freq)| {
-                let mut bytes = vec![0xC4, 0xA0];  // 'Ġ'
+                let mut bytes = vec![0xC4, 0xA0]; // Ġ prefix
                 bytes.extend(word.bytes());
                 (bytes, freq)
             })
             .collect();
         
-        let total_freq: usize = filtered.values().sum();
-        println!("  ✓ Palavras após filtro: {}", format_number(filtered.len()));
-        println!("  ✓ Cobertura: {:.2}% do corpus", 
-            (total_freq as f64 / total_words as f64) * 100.0);
+        println!("    Após filtro: {} palavras", format_number(filtered.len()));
         
-        // ============ FASE 3: BPE Merges ============
-        println!("\n═══════════════════════════════════════════════════════════");
-        println!("  FASE 3/3: Treinando BPE ({} tokens)", self.vocab_size);
-        println!("═══════════════════════════════════════════════════════════");
+        // ===== FASE 3: BPE Merges =====
+        println!("  🔧 Fase 3: Treinando BPE...");
         
         let vocab = self.train_bpe(filtered);
         
-        let elapsed = start_total.elapsed();
-        println!("\n═══════════════════════════════════════════════════════════");
-        println!("  ✓ CONCLUÍDO em {}m {}s", elapsed.as_secs() / 60, elapsed.as_secs() % 60);
-        println!("  ✓ Vocabulário final: {} tokens", vocab.id_to_token.len());
-        println!("  ✓ Merges realizados: {}", vocab.merges.len());
-        println!("═══════════════════════════════════════════════════════════");
+        let elapsed = start.elapsed();
+        println!("  ✅ Concluído em {:.1}s", elapsed.as_secs_f64());
+        println!("    Vocab final: {} tokens", vocab.id_to_token.len());
+        println!("    Merges: {}", vocab.merges.len());
         
         vocab
     }
 
     fn train_bpe(&self, word_freqs: HashMap<Vec<u8>, usize>) -> BPEVocab {
-        // Inicializa vocabulário com bytes (0-255)
+        // Inicializa com bytes base (0-255)
         let mut id_to_token: Vec<Vec<u8>> = (0u8..=255).map(|b| vec![b]).collect();
         let mut token_to_id: HashMap<Vec<u8>, u16> = id_to_token
             .iter()
@@ -336,17 +294,17 @@ impl BPETrainer {
             .map(|(i, t)| (t.clone(), i as u16))
             .collect();
 
-        // Special tokens
-        let special_tokens_list = [
+        // Adiciona special tokens
+        let special = [
             BPETokenizer::PAD_TOKEN,
             BPETokenizer::UNK_TOKEN,
             BPETokenizer::BOS_TOKEN,
             BPETokenizer::EOS_TOKEN,
             BPETokenizer::SEP_TOKEN,
         ];
-
+        
         let mut special_map = HashMap::new();
-        for token in special_tokens_list {
+        for token in special {
             let id = id_to_token.len() as u16;
             id_to_token.push(token.as_bytes().to_vec());
             token_to_id.insert(token.as_bytes().to_vec(), id);
@@ -366,34 +324,41 @@ impl BPETrainer {
             .collect();
 
         let mut merges: Vec<(u16, u16)> = Vec::new();
-        let start = std::time::Instant::now();
-        let base_vocab_size = id_to_token.len();
-        let target_merges = self.vocab_size - base_vocab_size;
-        
-        println!("  Base vocab: {} | Target: {} | Merges needed: {}", 
-            base_vocab_size, self.vocab_size, target_merges);
-        println!();
-
+        let target = self.vocab_size;
         let mut last_print = std::time::Instant::now();
-        
-        while id_to_token.len() < self.vocab_size {
+
+        while id_to_token.len() < target {
             // Conta pares em paralelo
-            let pair_counts = self.count_pairs_parallel(&word_splits);
-            
+            let pair_counts: HashMap<(u16, u16), usize> = word_splits
+                .par_chunks(5000)
+                .map(|chunk| {
+                    let mut counts = HashMap::new();
+                    for (splits, freq) in chunk {
+                        for w in splits.windows(2) {
+                            *counts.entry((w[0], w[1])).or_insert(0) += freq;
+                        }
+                    }
+                    counts
+                })
+                .reduce(HashMap::new, |mut a, b| {
+                    for (k, v) in b { *a.entry(k).or_insert(0) += v; }
+                    a
+                });
+
             if pair_counts.is_empty() {
-                println!("\n  ⚠ Sem mais pares válidos. Parando.");
+                println!("    ⚠️ Sem mais pares para merge");
                 break;
             }
 
-            // Encontra melhor par
+            // Melhor par
             let (best_pair, best_count) = pair_counts
                 .iter()
-                .max_by_key(|(_, &count)| count)
-                .map(|(&pair, &count)| (pair, count))
+                .max_by_key(|(_, &c)| c)
+                .map(|(&p, &c)| (p, c))
                 .unwrap();
 
             if best_count < self.min_frequency {
-                println!("\n  ⚠ Melhor par abaixo da frequência mínima. Parando.");
+                println!("    ⚠️ Frequência abaixo do mínimo");
                 break;
             }
 
@@ -403,13 +368,13 @@ impl BPETrainer {
             let mut new_token = Vec::new();
             new_token.extend(&id_to_token[a as usize]);
             new_token.extend(&id_to_token[b as usize]);
-            
+
             let new_id = id_to_token.len() as u16;
             token_to_id.insert(new_token.clone(), new_id);
             id_to_token.push(new_token);
             merges.push(best_pair);
 
-            // Atualiza splits em paralelo
+            // Aplica merge
             word_splits.par_iter_mut().for_each(|(splits, _)| {
                 let mut i = 0;
                 while i < splits.len().saturating_sub(1) {
@@ -422,39 +387,18 @@ impl BPETrainer {
                 }
             });
 
-            // Progress a cada 2 segundos
-            let current_merges = merges.len();
-            if last_print.elapsed().as_secs() >= 2 {
-                let elapsed = start.elapsed().as_secs();
-                let rate = current_merges as f64 / elapsed.max(1) as f64;
-                let remaining = target_merges.saturating_sub(current_merges);
-                let eta_secs = (remaining as f64 / rate.max(0.1)) as u64;
-                
-                // Preview seguro para UTF-8
-                let token_bytes = &id_to_token[new_id as usize];
-                let token_preview = String::from_utf8_lossy(token_bytes);
-                let preview: String = token_preview
-                    .chars()
-                    .take(12)
-                    .collect::<String>()
-                    .replace('\n', "\\n");
-                
-                print!("\r  Vocab: {}/{} | Freq: {} | Token: {:15} | {:.1}/s | ETA: {}m{}s    ",
+            // Progress
+            if last_print.elapsed().as_secs() >= 3 {
+                println!(
+                    "    Vocab: {}/{} | Freq: {} | Merges: {}",
                     id_to_token.len(),
-                    self.vocab_size,
+                    target,
                     format_number(best_count),
-                    format!("\"{}\"", preview),
-                    rate,
-                    eta_secs / 60,
-                    eta_secs % 60
+                    merges.len()
                 );
-                std::io::Write::flush(&mut std::io::stdout()).ok();
-                
                 last_print = std::time::Instant::now();
             }
         }
-
-        println!(); // Nova linha após progress
 
         BPEVocab {
             id_to_token,
@@ -462,39 +406,10 @@ impl BPETrainer {
             special_tokens: special_map,
         }
     }
-
-    fn count_pairs_parallel(&self, word_splits: &[(Vec<u16>, usize)]) -> HashMap<(u16, u16), usize> {
-        let chunk_counts: Vec<HashMap<(u16, u16), usize>> = word_splits
-            .par_chunks(10_000)
-            .map(|chunk| {
-                let mut counts = HashMap::new();
-                for (splits, freq) in chunk {
-                    for window in splits.windows(2) {
-                        let pair = (window[0], window[1]);
-                        *counts.entry(pair).or_insert(0) += freq;
-                    }
-                }
-                counts
-            })
-            .collect();
-
-        let mut total_counts = HashMap::new();
-        for chunk_count in chunk_counts {
-            for (pair, count) in chunk_count {
-                *total_counts.entry(pair).or_insert(0) += count;
-            }
-        }
-
-        total_counts
-    }
 }
 
 fn format_number(n: usize) -> String {
-    if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1_000_000.0)
-    } else if n >= 1_000 {
-        format!("{:.1}K", n as f64 / 1_000.0)
-    } else {
-        n.to_string()
-    }
+    if n >= 1_000_000 { format!("{:.1}M", n as f64 / 1e6) }
+    else if n >= 1_000 { format!("{:.1}K", n as f64 / 1e3) }
+    else { n.to_string() }
 }
