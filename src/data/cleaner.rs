@@ -28,6 +28,7 @@ pub struct WikiCleaner {
     // Formatação
     bold_italic: Regex,
     headers: Regex,
+    #[allow(dead_code)]
     lists: Regex,
     
     // Números grudados
@@ -213,6 +214,7 @@ impl WikiCleaner {
     }
     
     /// Verifica se um artigo inteiro é válido
+    #[allow(dead_code)]
     pub fn is_valid_article(&self, text: &str) -> bool {
         let clean = self.clean(text);
         

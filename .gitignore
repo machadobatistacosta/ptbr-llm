@@ -1,29 +1,35 @@
-@"
 # Rust
 /target/
-**/*.rs.bk
+*.rs.bk
 
-# Dados
+# dados locais / uploads
 /data/
+kaggle_upload/
+build_v16.py
+
+# artefatos grandes
 *.bin
 *.mpk
+*.meta
 *.bz2
 *.zip
 *.sqlite
-corpus.txt
 
-# Checkpoints
-/checkpoints*/
-/models/
-
-# Logs
+# logs
 /logs/
 *.log
 
-# IDE
+# checkpoints/models locais
+/checkpoints*/
+/models/
+
+# Python
+__pycache__/
+*.pyc
+
+# IDE/OS
 .idea/
 .vscode/
 *.swp
 .DS_Store
-Thumbs.db
-"@ | Out-File -Encoding utf8 .gitignore
+Thumbs.db/corpus.txt

@@ -56,7 +56,7 @@ impl BPETokenizer {
     pub const BOS_TOKEN: &'static str = "[BOS]";
     pub const EOS_TOKEN: &'static str = "[EOS]";
     pub const SEP_TOKEN: &'static str = "[SEP]";
-    
+    #[allow(dead_code)]
     pub fn pad_id(&self) -> u16 {
         *self.special_tokens.get(Self::PAD_TOKEN).unwrap_or(&0)
     }
@@ -66,11 +66,11 @@ impl BPETokenizer {
     }
     
     pub fn bos_id(&self) -> u16 {
-        *self.special_tokens.get(Self::BOS_TOKEN).unwrap_or(&2)
+        *self.special_tokens.get("[BOS]").expect("Tokenizer sem [BOS]")
     }
     
     pub fn eos_id(&self) -> u16 {
-        *self.special_tokens.get(Self::EOS_TOKEN).unwrap_or(&3)
+        *self.special_tokens.get("[EOS]").expect("Tokenizer sem [EOS]")
     }
 
     pub fn vocab_size(&self) -> usize {

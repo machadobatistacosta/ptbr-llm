@@ -1,5 +1,5 @@
 // src/model/adapters.rs
-
+#![allow(dead_code)]
 use burn::{
     module::Module,
     nn::{Linear, LinearConfig},

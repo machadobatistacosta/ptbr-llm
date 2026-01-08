@@ -87,7 +87,7 @@ impl<'a> DataLoader<'a> {
             current_idx: 0,
         }
     }
-
+    #[allow(dead_code)]
     pub fn reset(&mut self) {
         self.current_idx = 0;
     }

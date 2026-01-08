@@ -2,7 +2,7 @@
 
 use burn::{
     module::Module,
-    optim::{AdamW, AdamWConfig, GradientsParams, Optimizer, SimpleOptimizer, adaptor::OptimizerAdaptor},  // ← ADICIONA SimpleOptimizer e OptimizerAdaptor
+    optim::{AdamW, AdamWConfig, GradientsParams, Optimizer, adaptor::OptimizerAdaptor},  // ← ADICIONA SimpleOptimizer e OptimizerAdaptor
     tensor::{backend::AutodiffBackend, Tensor, Int, ElementConversion, activation},
     record::CompactRecorder,
 };
@@ -88,17 +88,17 @@ impl<B: AutodiffBackend> Trainer<B> {
     }
 
     fn get_learning_rate(&self) -> f64 {
-        let warmup = self.config.warmup_steps as f64;
+        let warmup = self.config.warmup_steps.max(1) as f64;
         let step = self.step as f64;
-        
+
         if step < warmup {
-            self.config.learning_rate * (step / warmup)
+            self.config.learning_rate * ((step + 1.0) / warmup)
         } else {
-            let decay_steps = (self.config.max_steps - self.config.warmup_steps) as f64;
+            let decay_steps = (self.config.max_steps.saturating_sub(self.config.warmup_steps)).max(1) as f64;
             let decay_progress = (step - warmup) / decay_steps;
-            self.config.learning_rate * (1.0 - 0.9 * decay_progress).max(0.1)
+            (self.config.learning_rate * (1.0 - 0.9 * decay_progress)).max(self.config.learning_rate * 0.1)
         }
-    }
+}
 
     pub fn save_checkpoint(&self, path: &str) -> std::io::Result<()> {
         let path = path.trim_end_matches(".bin").trim_end_matches(".mpk");
@@ -123,6 +123,10 @@ impl<B: AutodiffBackend> Trainer<B> {
 
     pub fn step(&self) -> usize {
         self.step
+    }
+
+    pub fn current_lr(&self) -> f64 {
+        self.get_learning_rate()
     }
 
     pub fn config(&self) -> &TrainingConfig {

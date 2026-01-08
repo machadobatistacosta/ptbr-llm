@@ -27,6 +27,7 @@ impl Default for WikiParserConfig {
 /// Artigo parseado da Wikipedia
 #[derive(Debug, Clone)]
 pub struct WikiArticle {
+    #[allow(dead_code)]
     pub title: String,
     pub text: String,
 }
@@ -42,10 +43,9 @@ impl WikiStreamParser {
     }
 
     pub fn parse_streaming(&self, path: &str) -> WikiArticleIterator {
-        let file = File::open(path).expect("Não foi possível abrir o arquivo");
-        let decompressor = BzDecoder::new(BufReader::with_capacity(64 * 1024, file));
-        let reader = BufReader::with_capacity(64 * 1024, decompressor);
-        
+        let file = File::open(path).expect("Erro ao abrir arquivo");
+        let decompressor = BzDecoder::new(BufReader::with_capacity(self.config.chunk_size, file));
+        let reader = BufReader::with_capacity(self.config.chunk_size, decompressor);
         WikiArticleIterator::new(reader, self.config.clone())
     }
 }
