@@ -1,6 +1,6 @@
+use once_cell::sync::Lazy;
 use regex::Regex;
 use std::collections::HashSet;
-use once_cell::sync::Lazy;
 
 /// Regex patterns compilados uma vez
 static PATTERNS: Lazy<CleanerPatterns> = Lazy::new(CleanerPatterns::new);
@@ -9,17 +9,17 @@ struct CleanerPatterns {
     // Tabelas
     table_block: Regex,
     table_row: Regex,
-    
+
     // Templates (níveis de aninhamento)
     template_simple: Regex,
     template_nested: Regex,
-    
+
     // HTML
     html_tag: Regex,
     html_entity: Regex,
     html_comment: Regex,
     ref_tag: Regex,
-    
+
     // Links
     category_link: Regex,
     file_link: Regex,
@@ -27,19 +27,19 @@ struct CleanerPatterns {
     wiki_link_simple: Regex,
     external_link_labeled: Regex,
     external_link_simple: Regex,
-    
+
     // Infobox params
     infobox_params: Regex,
     coordinates: Regex,
-    
+
     // Formatação
     bold_italic: Regex,
     headers: Regex,
     list_items: Regex,
-    
+
     // Anos grudados
     year_stuck: Regex,
-    
+
     // Cleanup
     multi_space: Regex,
     multi_newline: Regex,
@@ -101,82 +101,135 @@ pub struct WikiCleaner {
 impl WikiCleaner {
     pub fn new() -> Self {
         let garbage_markers: HashSet<&'static str> = [
-            "align=", "width=", "style=", "colspan=", "rowspan=",
-            "latM=", "lonM=", "latS=", "lonS=", "latG=", "lonG=",
-            "class=", "bgcolor=", "valign=", "border=",
-            "{{Infobox", "{{Caixa", "{{Info/", "{{Taxobox",
-            "{{Se-", "{{Ref", "{{Ver ", "{{Main",
-            "!--", "-->", "{|", "|-", "|}", "||",
-        ].iter().cloned().collect();
-        
+            "align=",
+            "width=",
+            "style=",
+            "colspan=",
+            "rowspan=",
+            "latM=",
+            "lonM=",
+            "latS=",
+            "lonS=",
+            "latG=",
+            "lonG=",
+            "class=",
+            "bgcolor=",
+            "valign=",
+            "border=",
+            "{{Infobox",
+            "{{Caixa",
+            "{{Info/",
+            "{{Taxobox",
+            "{{Se-",
+            "{{Ref",
+            "{{Ver ",
+            "{{Main",
+            "!--",
+            "-->",
+            "{|",
+            "|-",
+            "|}",
+            "||",
+        ]
+        .iter()
+        .cloned()
+        .collect();
+
         Self { garbage_markers }
     }
 
     /// Limpa texto de marcação Wikipedia
     pub fn clean(&self, text: &str) -> String {
         let mut result = text.to_string();
-        
+
         // 1. Remove comentários HTML
         result = PATTERNS.html_comment.replace_all(&result, "").to_string();
-        
+
         // 2. Remove refs
         result = PATTERNS.ref_tag.replace_all(&result, "").to_string();
-        
+
         // 3. Remove tabelas
         result = PATTERNS.table_block.replace_all(&result, " ").to_string();
         result = PATTERNS.table_row.replace_all(&result, " ").to_string();
-        
+
         // 4. Remove templates (múltiplas passadas para aninhados)
         for _ in 0..5 {
             let prev = result.clone();
-            result = PATTERNS.template_simple.replace_all(&result, "").to_string();
-            result = PATTERNS.template_nested.replace_all(&result, "").to_string();
-            if result == prev { break; }
+            result = PATTERNS
+                .template_simple
+                .replace_all(&result, "")
+                .to_string();
+            result = PATTERNS
+                .template_nested
+                .replace_all(&result, "")
+                .to_string();
+            if result == prev {
+                break;
+            }
         }
-        
+
         // 5. Remove links especiais
         result = PATTERNS.category_link.replace_all(&result, "").to_string();
         result = PATTERNS.file_link.replace_all(&result, "").to_string();
-        
+
         // 6. Converte links para texto
-        result = PATTERNS.wiki_link_labeled.replace_all(&result, "$1").to_string();
-        result = PATTERNS.wiki_link_simple.replace_all(&result, "$1").to_string();
-        result = PATTERNS.external_link_labeled.replace_all(&result, "$1").to_string();
-        result = PATTERNS.external_link_simple.replace_all(&result, "").to_string();
-        
+        result = PATTERNS
+            .wiki_link_labeled
+            .replace_all(&result, "$1")
+            .to_string();
+        result = PATTERNS
+            .wiki_link_simple
+            .replace_all(&result, "$1")
+            .to_string();
+        result = PATTERNS
+            .external_link_labeled
+            .replace_all(&result, "$1")
+            .to_string();
+        result = PATTERNS
+            .external_link_simple
+            .replace_all(&result, "")
+            .to_string();
+
         // 7. Remove HTML
         result = PATTERNS.html_tag.replace_all(&result, "").to_string();
         result = PATTERNS.html_entity.replace_all(&result, " ").to_string();
-        
+
         // 8. Remove parâmetros de infobox
         result = PATTERNS.infobox_params.replace_all(&result, "").to_string();
         result = PATTERNS.coordinates.replace_all(&result, "").to_string();
-        
+
         // 9. Remove formatação wiki
         result = PATTERNS.bold_italic.replace_all(&result, "").to_string();
-        
+
         // 10. Converte headers para texto
         result = PATTERNS.headers.replace_all(&result, "$1\n").to_string();
-        
+
         // 11. Remove marcadores de lista
-        let result = result.lines()
+        let result = result
+            .lines()
             .map(|line| PATTERNS.list_items.replace(line, "").to_string())
             .collect::<Vec<_>>()
             .join("\n");
-        
+
         // 12. Limpa pipes residuais
         let mut result = PATTERNS.pipe_cleanup.replace_all(&result, " ").to_string();
-        
+
         // 13. Corrige anos grudados
-        result = PATTERNS.year_stuck.replace_all(&result, "$1 $2$3").to_string();
-        
+        result = PATTERNS
+            .year_stuck
+            .replace_all(&result, "$1 $2$3")
+            .to_string();
+
         // 14. Normaliza espaços
         result = PATTERNS.multi_space.replace_all(&result, " ").to_string();
-        result = PATTERNS.multi_newline.replace_all(&result, "\n\n").to_string();
-        
+        result = PATTERNS
+            .multi_newline
+            .replace_all(&result, "\n\n")
+            .to_string();
+
         // 15. Filtra linhas
         result = self.filter_lines(&result);
-        
+
         result.trim().to_string()
     }
 
@@ -190,45 +243,59 @@ impl WikiCleaner {
 
     fn is_valid_line(&self, line: &str) -> bool {
         let line = line.trim();
-        
+
         // Muito curta
-        if line.len() < 30 { return false; }
-        
+        if line.len() < 30 {
+            return false;
+        }
+
         // Contém marcadores de lixo
         for marker in &self.garbage_markers {
-            if line.contains(marker) { return false; }
+            if line.contains(marker) {
+                return false;
+            }
         }
-        
+
         // Muitos caracteres especiais
         let special_count = line.chars().filter(|c| "{}[]|<>=".contains(*c)).count();
-        if special_count > 3 { return false; }
-        
+        if special_count > 3 {
+            return false;
+        }
+
         // Proporção de letras muito baixa
         let alpha = line.chars().filter(|c| c.is_alphabetic()).count();
         let total = line.chars().filter(|c| !c.is_whitespace()).count();
-        if total > 0 && (alpha as f64 / total as f64) < 0.7 { return false; }
-        
+        if total > 0 && (alpha as f64 / total as f64) < 0.7 {
+            return false;
+        }
+
         // Poucas palavras
         let words = line.split_whitespace().count();
-        if words < 5 { return false; }
-        
+        if words < 5 {
+            return false;
+        }
+
         // Começa com caractere problemático
         if let Some(first) = line.chars().next() {
-            if "{}[]|<>=*#!:;".contains(first) { return false; }
+            if "{}[]|<>=*#!:;".contains(first) {
+                return false;
+            }
         }
-        
+
         true
     }
 }
 
 impl Default for WikiCleaner {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    
+
     #[test]
     fn test_clean_template() {
         let cleaner = WikiCleaner::new();
@@ -237,7 +304,7 @@ mod tests {
         assert!(!output.contains("{{"));
         assert!(!output.contains("}}"));
     }
-    
+
     #[test]
     fn test_clean_link() {
         let cleaner = WikiCleaner::new();
@@ -246,7 +313,7 @@ mod tests {
         assert!(output.contains("país"));
         assert!(!output.contains("[["));
     }
-    
+
     #[test]
     fn test_clean_table() {
         let cleaner = WikiCleaner::new();

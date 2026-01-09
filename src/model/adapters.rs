@@ -7,7 +7,7 @@ use burn::{
     nn::{Linear, LinearConfig},
     tensor::{backend::Backend, Tensor},
 };
-use serde::{Serialize, Deserialize};
+use serde::{Deserialize, Serialize};
 
 /// Domínios suportados para fine-tuning
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -22,7 +22,9 @@ pub enum Domain {
 }
 
 impl Default for Domain {
-    fn default() -> Self { Domain::General }
+    fn default() -> Self {
+        Domain::General
+    }
 }
 
 impl Domain {
@@ -37,7 +39,7 @@ impl Domain {
             Domain::News => DomainFineTuneConfig::news(),
         }
     }
-    
+
     pub fn name(&self) -> &'static str {
         match self {
             Domain::General => "general",
@@ -56,7 +58,7 @@ impl Domain {
 pub struct LoRAAdapter<B: Backend> {
     down: Linear<B>,
     up: Linear<B>,
-    
+
     #[module(skip)]
     scale: f32,
     #[module(skip)]
@@ -67,10 +69,20 @@ pub struct LoRAAdapter<B: Backend> {
 
 impl<B: Backend> LoRAAdapter<B> {
     pub fn new(d_model: usize, rank: usize, scale: f32, device: &B::Device) -> Self {
-        let down = LinearConfig::new(d_model, rank).with_bias(false).init(device);
-        let up = LinearConfig::new(rank, d_model).with_bias(false).init(device);
-        
-        Self { down, up, scale, rank, d_model }
+        let down = LinearConfig::new(d_model, rank)
+            .with_bias(false)
+            .init(device);
+        let up = LinearConfig::new(rank, d_model)
+            .with_bias(false)
+            .init(device);
+
+        Self {
+            down,
+            up,
+            scale,
+            rank,
+            d_model,
+        }
     }
 
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
@@ -83,9 +95,15 @@ impl<B: Backend> LoRAAdapter<B> {
         base_output + self.forward(x)
     }
 
-    pub fn scale(&self) -> f32 { self.scale }
-    pub fn rank(&self) -> usize { self.rank }
-    pub fn d_model(&self) -> usize { self.d_model }
+    pub fn scale(&self) -> f32 {
+        self.scale
+    }
+    pub fn rank(&self) -> usize {
+        self.rank
+    }
+    pub fn d_model(&self) -> usize {
+        self.d_model
+    }
 
     pub fn num_parameters(&self) -> usize {
         2 * self.d_model * self.rank
@@ -97,7 +115,7 @@ impl<B: Backend> LoRAAdapter<B> {
 #[derive(Module, Debug)]
 pub struct DomainAdapterBank<B: Backend> {
     adapters: Vec<LoRAAdapter<B>>,
-    
+
     #[module(skip)]
     active_idx: Option<usize>,
     #[module(skip)]
@@ -136,9 +154,7 @@ impl<B: Backend> DomainAdapterBank<B> {
     /// Forward com adapter ativo (se houver)
     pub fn forward(&self, x: Tensor<B, 3>, base_output: Tensor<B, 3>) -> Tensor<B, 3> {
         match self.active_idx {
-            Some(idx) if idx < self.adapters.len() => {
-                base_output + self.adapters[idx].forward(x)
-            }
+            Some(idx) if idx < self.adapters.len() => base_output + self.adapters[idx].forward(x),
             _ => base_output,
         }
     }
@@ -148,16 +164,22 @@ impl<B: Backend> DomainAdapterBank<B> {
         self.active_idx
     }
 
-    pub fn len(&self) -> usize { self.adapters.len() }
-    pub fn is_empty(&self) -> bool { self.adapters.is_empty() }
-    
+    pub fn len(&self) -> usize {
+        self.adapters.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.adapters.is_empty()
+    }
+
     pub fn total_parameters(&self) -> usize {
         self.adapters.iter().map(|a| a.num_parameters()).sum()
     }
 }
 
 impl<B: Backend> Default for DomainAdapterBank<B> {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 /// Gerenciador de domínios (separado do Module para evitar bugs do Burn)
@@ -168,23 +190,25 @@ pub struct DomainRegistry {
 
 impl DomainRegistry {
     pub fn new() -> Self {
-        Self { domains: Vec::new() }
+        Self {
+            domains: Vec::new(),
+        }
     }
-    
+
     pub fn register(&mut self, domain: Domain) -> usize {
         let idx = self.domains.len();
         self.domains.push(domain);
         idx
     }
-    
+
     pub fn get(&self, idx: usize) -> Option<Domain> {
         self.domains.get(idx).copied()
     }
-    
+
     pub fn find(&self, domain: Domain) -> Option<usize> {
         self.domains.iter().position(|&d| d == domain)
     }
-    
+
     pub fn all(&self) -> &[Domain] {
         &self.domains
     }
@@ -334,23 +358,31 @@ pub struct LoRABuilder {
 
 impl LoRABuilder {
     pub fn new(d_model: usize) -> Self {
-        Self { d_model, rank: 8, scale: 1.0 }
+        Self {
+            d_model,
+            rank: 8,
+            scale: 1.0,
+        }
     }
-    
+
     pub fn rank(mut self, rank: usize) -> Self {
         self.rank = rank;
         self
     }
-    
+
     pub fn scale(mut self, scale: f32) -> Self {
         self.scale = scale;
         self
     }
-    
+
     pub fn from_config(d_model: usize, config: &DomainFineTuneConfig) -> Self {
-        Self { d_model, rank: config.lora_rank, scale: config.lora_scale }
+        Self {
+            d_model,
+            rank: config.lora_rank,
+            scale: config.lora_scale,
+        }
     }
-    
+
     pub fn build<B: Backend>(self, device: &B::Device) -> LoRAAdapter<B> {
         LoRAAdapter::new(self.d_model, self.rank, self.scale, device)
     }

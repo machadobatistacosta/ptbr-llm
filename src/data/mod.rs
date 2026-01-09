@@ -1,10 +1,10 @@
-mod wiki_parser;
 mod cleaner;
 mod dataset;
+mod wiki_parser;
 
-pub use wiki_parser::WikiStreamParser;
 pub use cleaner::WikiCleaner;
-pub use dataset::{MmapDataset, DataLoader, TokenizedDatasetWriter};
+pub use dataset::{DataLoader, MmapDataset, TokenizedDatasetWriter};
+pub use wiki_parser::WikiStreamParser;
 
 // Export opcional
 #[allow(unused_imports)]

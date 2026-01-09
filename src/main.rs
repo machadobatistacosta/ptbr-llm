@@ -1,24 +1,26 @@
 mod data;
-mod tokenizer;
 mod model;
+mod tokenizer;
 
 use clap::{Parser, Subcommand};
-use std::path::PathBuf;
 use std::io::Write;
+use std::path::PathBuf;
 use std::time::Instant;
+use std::collections::HashSet;
+use rayon::prelude::*;
 
 use burn::backend::Autodiff;
-use burn::tensor::{Tensor, Int, backend::Backend};
 use burn::module::Module;
 use burn::record::CompactRecorder;
+use burn::tensor::{backend::Backend, Int, Tensor};
 
 // ============ BACKEND SELECTOR ============
+#[cfg(feature = "cuda")]
+use burn::backend::cuda_jit::{CudaDevice, CudaRuntime};
 #[cfg(feature = "cpu")]
 use burn::backend::ndarray::{NdArray, NdArrayDevice};
 #[cfg(feature = "gpu")]
-use burn::backend::wgpu::{Wgpu, WgpuDevice, AutoGraphicsApi};
-#[cfg(feature = "cuda")]
-use burn::backend::cuda_jit::{CudaDevice, CudaRuntime};
+use burn::backend::wgpu::{AutoGraphicsApi, Wgpu, WgpuDevice};
 
 #[cfg(feature = "cpu")]
 type MyBackend = NdArray;
@@ -31,20 +33,26 @@ type TrainBackend = Autodiff<MyBackend>;
 
 fn get_device() -> <MyBackend as Backend>::Device {
     #[cfg(feature = "cpu")]
-    { NdArrayDevice::Cpu }
+    {
+        NdArrayDevice::Cpu
+    }
     #[cfg(feature = "gpu")]
-    { WgpuDevice::BestAvailable }
+    {
+        WgpuDevice::BestAvailable
+    }
     #[cfg(feature = "cuda")]
-    { CudaDevice::new(0) }
+    {
+        CudaDevice::new(0)
+    }
 }
 
 // ============ IMPORTS ============
-use data::{WikiStreamParser, WikiCleaner, MmapDataset, DataLoader, TokenizedDatasetWriter};
+use data::{DataLoader, MmapDataset, TokenizedDatasetWriter, WikiCleaner, WikiStreamParser};
+use model::{RWKVConfig, Trainer, TrainingConfig, RWKV};
 use tokenizer::{BPETokenizer, BPETrainer, PTBRNormalizer};
-use model::{RWKVConfig, TrainingConfig, RWKV, Trainer};
 
-use rand::prelude::*;
 use rand::distributions::WeightedIndex;
+use rand::prelude::*;
 
 // ============ CLI ============
 #[derive(Parser)]
@@ -68,7 +76,7 @@ enum Commands {
         #[arg(long, default_value = "200")]
         min_chars: usize,
     },
-    
+
     /// Treina tokenizer BPE
     TrainTokenizer {
         #[arg(short, long)]
@@ -78,7 +86,7 @@ enum Commands {
         #[arg(short, long, default_value = "32000")]
         vocab_size: usize,
     },
-    
+
     /// Tokeniza corpus para binário
     Tokenize {
         #[arg(short, long)]
@@ -88,7 +96,7 @@ enum Commands {
         #[arg(short, long)]
         tokenizer: PathBuf,
     },
-    
+
     /// Treina modelo RWKV
     Train {
         #[arg(short, long)]
@@ -114,7 +122,7 @@ enum Commands {
         #[arg(long, default_value = "1024")]
         seq_len: usize,
     },
-    
+
     /// Retoma treino de checkpoint
     Resume {
         #[arg(short, long)]
@@ -138,7 +146,7 @@ enum Commands {
         #[arg(long, default_value = "1024")]
         seq_len: usize,
     },
-    
+
     /// Testa modelo com prompts
     TestModel {
         #[arg(short, long)]
@@ -148,7 +156,7 @@ enum Commands {
         #[arg(long, default_value = "85m")]
         model_size: String,
     },
-    
+
     /// Gera texto a partir de prompt
     Generate {
         #[arg(short, long)]
@@ -166,7 +174,7 @@ enum Commands {
         #[arg(long, default_value = "40")]
         top_k: usize,
     },
-    
+
     /// Limpa corpus de texto
     CleanCorpus {
         #[arg(short, long)]
@@ -176,11 +184,48 @@ enum Commands {
         #[arg(long)]
         verbose: bool,
     },
-    
+    AuditCorpus {
+    #[arg(short, long)]
+    input: PathBuf,
+    #[arg(short, long)]
+    output: PathBuf,
+    },
+
     /// Mostra informações do modelo
     Info {
         #[arg(long, default_value = "85m")]
         model_size: String,
+    },
+    BuildDataset {
+        /// Caminho do tokenizer.json
+        #[arg(long)]
+        tokenizer: PathBuf,
+
+        /// Saída do arquivo train.bin
+        #[arg(long)]
+        output: PathBuf,
+
+        /// Fonte(s) no formato PATH:WEIGHT (WEIGHT default=1)
+        /// Ex: --source data/sovereign/corpus_v15_base.txt:1
+        /// Ex: --source data/planalto_clean:3
+        #[arg(long, required = true)]
+        source: Vec<String>,
+
+        /// Tamanho mínimo de um documento em caracteres (antes de tokenizar)
+        #[arg(long, default_value = "100")]
+        min_chars: usize,
+
+        /// Força modo "blocks" (doc separado por linha em branco)
+        #[arg(long, default_value = "true")]
+        blocks: bool,
+
+        /// Aplica WikiCleaner (bom para wiki/markup; pode reduzir dados em corpora já limpos)
+        #[arg(long, default_value = "false")]
+        clean: bool,
+
+        /// Seed para ordem determinística (só afeta ordem quando a fonte é diretório)
+        #[arg(long, default_value = "42")]
+        seed: u64,
     },
 }
 
@@ -189,41 +234,117 @@ fn main() {
     tracing_subscriber::fmt()
         .with_env_filter(
             tracing_subscriber::EnvFilter::from_default_env()
-                .add_directive(tracing::Level::INFO.into())
+                .add_directive(tracing::Level::INFO.into()),
         )
         .init();
-    
+
     let cli = Cli::parse();
-    
+
     match cli.command {
-        Commands::ProcessWiki { input, output, min_chars } => 
-            process_wiki(&input, &output, min_chars),
-        Commands::TrainTokenizer { corpus, output, vocab_size } => 
-            train_tokenizer(&corpus, &output, vocab_size),
-        Commands::Tokenize { input, output, tokenizer } => 
-            tokenize_corpus(&input, &output, &tokenizer),
-        Commands::Train { 
-            data, tokenizer, output, model_size, max_steps, save_every,
-            batch_size, grad_accum, learning_rate, warmup_steps, seq_len 
+        Commands::ProcessWiki {
+            input,
+            output,
+            min_chars,
+        } => process_wiki(&input, &output, min_chars),
+        Commands::TrainTokenizer {
+            corpus,
+            output,
+            vocab_size,
+        } => train_tokenizer(&corpus, &output, vocab_size),
+        Commands::Tokenize {
+            input,
+            output,
+            tokenizer,
+        } => tokenize_corpus(&input, &output, &tokenizer),
+        Commands::Train {
+            data,
+            tokenizer,
+            output,
+            model_size,
+            max_steps,
+            save_every,
+            batch_size,
+            grad_accum,
+            learning_rate,
+            warmup_steps,
+            seq_len,
         } => train_model(
-            &data, &tokenizer, &output, &model_size, max_steps, save_every,
-            batch_size, grad_accum, learning_rate, warmup_steps, seq_len
+            &data,
+            &tokenizer,
+            &output,
+            &model_size,
+            max_steps,
+            save_every,
+            batch_size,
+            grad_accum,
+            learning_rate,
+            warmup_steps,
+            seq_len,
         ),
         Commands::Resume {
-            checkpoint, data, output, model_size, additional_steps,
-            save_every, batch_size, grad_accum, learning_rate, seq_len
+            checkpoint,
+            data,
+            output,
+            model_size,
+            additional_steps,
+            save_every,
+            batch_size,
+            grad_accum,
+            learning_rate,
+            seq_len,
         } => resume_training(
-            &checkpoint, &data, &output, &model_size, additional_steps,
-            save_every, batch_size, grad_accum, learning_rate, seq_len
+            &checkpoint,
+            &data,
+            &output,
+            &model_size,
+            additional_steps,
+            save_every,
+            batch_size,
+            grad_accum,
+            learning_rate,
+            seq_len,
         ),
-        Commands::TestModel { model, tokenizer, model_size } => 
-            test_model(&model, &tokenizer, &model_size),
-        Commands::Generate { model, tokenizer, prompt, max_tokens, model_size, temperature, top_k } => 
-            generate(&model, &tokenizer, &prompt, max_tokens, &model_size, temperature, top_k),
-        Commands::CleanCorpus { input, output, verbose } => 
-            clean_corpus(&input, &output, verbose),
-        Commands::Info { model_size } => 
-            show_info(&model_size),
+        Commands::TestModel {
+            model,
+            tokenizer,
+            model_size,
+        } => test_model(&model, &tokenizer, &model_size),
+        Commands::Generate {
+            model,
+            tokenizer,
+            prompt,
+            max_tokens,
+            model_size,
+            temperature,
+            top_k,
+        } => generate(
+            &model,
+            &tokenizer,
+            &prompt,
+            max_tokens,
+            &model_size,
+            temperature,
+            top_k,
+        ),
+        Commands::AuditCorpus { input, output } => audit_corpus_cmd(&input, &output),
+        Commands::CleanCorpus {
+            input,
+            output,
+            verbose,
+        } => clean_corpus(&input, &output, verbose),
+        Commands::Info { model_size } => show_info(&model_size),
+        Commands::BuildDataset {
+            tokenizer,
+            output,
+            source,
+            min_chars,
+            blocks,
+            clean,
+            seed,
+        } => {
+            build_dataset(&tokenizer, &output, &source, min_chars, blocks, clean, seed);
+        }
+        
     }
 }
 
@@ -260,7 +381,7 @@ fn process_wiki(input: &PathBuf, output: &PathBuf, min_chars: usize) {
             use std::io::Write;
             writeln!(current_file, "{}", clean_text).expect("Erro escrevendo");
             writeln!(current_file).expect("Erro escrevendo newline"); // Separador de docs
-            
+
             articles_in_file += 1;
             total_articles += 1;
             total_chars += clean_text.len();
@@ -269,7 +390,10 @@ fn process_wiki(input: &PathBuf, output: &PathBuf, min_chars: usize) {
                 file_idx += 1;
                 current_file = create_output_file(output, file_idx);
                 articles_in_file = 0;
-                println!("  ✓ Arquivo {} completado ({} artigos)", file_idx, total_articles);
+                println!(
+                    "  ✓ Arquivo {} completado ({} artigos)",
+                    file_idx, total_articles
+                );
             }
         }
     }
@@ -315,7 +439,7 @@ fn train_tokenizer(corpus: &PathBuf, output: &PathBuf, vocab_size: usize) {
             .filter(|e| e.path().extension().map(|x| x == "txt").unwrap_or(false))
             .collect();
         entries.sort_by_key(|e| e.path());
-        
+
         for entry in entries {
             println!("    Lendo {:?}...", entry.file_name());
             if let Ok(content) = std::fs::read_to_string(entry.path()) {
@@ -333,7 +457,9 @@ fn train_tokenizer(corpus: &PathBuf, output: &PathBuf, vocab_size: usize) {
 
     std::fs::create_dir_all(output).expect("Erro criando diretório");
     let tokenizer_path = output.join("tokenizer.json");
-    tokenizer.save(tokenizer_path.to_str().unwrap()).expect("Erro salvando");
+    tokenizer
+        .save(tokenizer_path.to_str().unwrap())
+        .expect("Erro salvando");
 
     println!();
     println!("═══════════════════════════════════════════════════════════");
@@ -362,18 +488,21 @@ fn tokenize_corpus(input: &PathBuf, output: &PathBuf, tokenizer_path: &PathBuf) 
     let normalizer = PTBRNormalizer::new();
     std::fs::create_dir_all(output).expect("Erro criando diretório");
 
-    let mut writer = TokenizedDatasetWriter::new(&output.join("train.bin"))
-        .expect("Erro criando arquivo");
+    let mut writer =
+        TokenizedDatasetWriter::new(&output.join("train.bin")).expect("Erro criando arquivo");
 
     let mut total_tokens = 0usize;
     let mut total_docs = 0usize;
 
     // Processa arquivos
     let files = collect_text_files(input);
-    
+
     for path in &files {
-        println!("  Processando {:?}...", path.file_name().unwrap_or_default());
-        
+        println!(
+            "  Processando {:?}...",
+            path.file_name().unwrap_or_default()
+        );
+
         let content = match std::fs::read_to_string(path) {
             Ok(c) => c,
             Err(_) => {
@@ -385,7 +514,9 @@ fn tokenize_corpus(input: &PathBuf, output: &PathBuf, tokenizer_path: &PathBuf) 
         // Split por parágrafo duplo (documentos)
         for doc in content.split("\n\n") {
             let doc = doc.trim();
-            if doc.len() < 100 { continue; }
+            if doc.len() < 100 {
+                continue;
+            }
 
             let normalized = normalizer.normalize(doc);
             let mut tokens = vec![bos];
@@ -399,7 +530,7 @@ fn tokenize_corpus(input: &PathBuf, output: &PathBuf, tokenizer_path: &PathBuf) 
     }
 
     let _final_count = writer.finish().expect("Erro finalizando");
-    
+
     println!();
     println!("═══════════════════════════════════════════════════════════");
     println!("  ✅ Tokenização concluída!");
@@ -413,7 +544,7 @@ fn collect_text_files(path: &PathBuf) -> Vec<PathBuf> {
     if path.is_file() {
         return vec![path.clone()];
     }
-    
+
     let mut files: Vec<PathBuf> = std::fs::read_dir(path)
         .expect("Erro lendo diretório")
         .filter_map(|e| e.ok())
@@ -443,7 +574,7 @@ fn train_model(
     println!("═══════════════════════════════════════════════════════════");
 
     let device = get_device();
-    
+
     // Carrega config do modelo
     let mut model_config = get_model_config(model_size);
     model_config.max_seq_len = seq_len;
@@ -452,17 +583,27 @@ fn train_model(
     // Valida vocab size com tokenizer
     let tokenizer = BPETokenizer::from_file(tokenizer_path.to_str().unwrap())
         .expect("Erro carregando tokenizer");
-    
+
     if tokenizer.vocab_size() != model_config.vocab_size {
-        println!("  ⚠️ Ajustando vocab_size: {} -> {}", 
-            model_config.vocab_size, tokenizer.vocab_size());
+        println!(
+            "  ⚠️ Ajustando vocab_size: {} -> {}",
+            model_config.vocab_size,
+            tokenizer.vocab_size()
+        );
         model_config.vocab_size = tokenizer.vocab_size();
     }
 
     let effective_batch = batch_size * grad_accum;
-    
-    println!("  Modelo: {} ({} params)", model_size, format_params(model_config.num_parameters()));
-    println!("  Batch size: {} x {} = {} efetivo", batch_size, grad_accum, effective_batch);
+
+    println!(
+        "  Modelo: {} ({} params)",
+        model_size,
+        format_params(model_config.num_parameters())
+    );
+    println!(
+        "  Batch size: {} x {} = {} efetivo",
+        batch_size, grad_accum, effective_batch
+    );
     println!("  Seq len: {}", seq_len);
     println!("  Learning rate: {:.2e}", learning_rate);
     println!("  Warmup: {} steps", warmup_steps);
@@ -471,11 +612,14 @@ fn train_model(
     println!();
 
     // Carrega dataset
-    let mut dataset = MmapDataset::from_file(&data.join("train.bin"), seq_len)
-        .expect("Erro carregando dataset");
-    
+    let mut dataset =
+        MmapDataset::from_file(&data.join("train.bin"), seq_len).expect("Erro carregando dataset");
+
     if dataset.is_empty() {
-        panic!("❌ Dataset vazio! Verifique seq_len ({}) e o arquivo train.bin", seq_len);
+        panic!(
+            "❌ Dataset vazio! Verifique seq_len ({}) e o arquivo train.bin",
+            seq_len
+        );
     }
 
     dataset.shuffle(42);
@@ -504,7 +648,14 @@ fn train_model(
     println!("═══════════════════════════════════════════════════════════");
     println!();
 
-    run_training_loop(&mut trainer, &mut dataset, max_steps, save_every, batch_size, output);
+    run_training_loop(
+        &mut trainer,
+        &mut dataset,
+        max_steps,
+        save_every,
+        batch_size,
+        output,
+    );
 }
 
 // ============ RESUME TRAINING ============
@@ -526,7 +677,7 @@ fn resume_training(
     println!("  Checkpoint: {:?}", checkpoint);
 
     let device = get_device();
-    
+
     let mut model_config = get_model_config(model_size);
     model_config.max_seq_len = seq_len;
     model_config.dropout = 0.05;
@@ -544,11 +695,12 @@ fn resume_training(
     };
 
     let mut trainer: Trainer<TrainBackend> = Trainer::new(&model_config, train_config, device);
-    trainer.load_checkpoint(checkpoint.to_str().unwrap())
+    trainer
+        .load_checkpoint(checkpoint.to_str().unwrap())
         .expect("Erro carregando checkpoint");
 
-    let mut dataset = MmapDataset::from_file(&data.join("train.bin"), seq_len)
-        .expect("Erro carregando dataset");
+    let mut dataset =
+        MmapDataset::from_file(&data.join("train.bin"), seq_len).expect("Erro carregando dataset");
     dataset.shuffle(42 + trainer.step() as u64);
 
     std::fs::create_dir_all(output).expect("Erro criando diretório");
@@ -556,7 +708,14 @@ fn resume_training(
     println!("  Continuando do step {}...", trainer.step());
     println!();
 
-    run_training_loop(&mut trainer, &mut dataset, additional_steps, save_every, batch_size, output);
+    run_training_loop(
+        &mut trainer,
+        &mut dataset,
+        additional_steps,
+        save_every,
+        batch_size,
+        output,
+    );
 }
 
 // ============ TRAINING LOOP ============
@@ -571,7 +730,7 @@ fn run_training_loop(
     let device = get_device();
     let start = Instant::now();
     let initial_step = trainer.step();
-    
+
     let mut last_log = Instant::now();
     let mut epoch = 0;
 
@@ -627,7 +786,8 @@ fn run_training_loop(
 
     // Salva modelo final
     let final_path = output.join(format!("model_final_step_{}", trainer.step()));
-    trainer.save_checkpoint(final_path.to_str().unwrap())
+    trainer
+        .save_checkpoint(final_path.to_str().unwrap())
         .expect("Erro salvando modelo final");
 
     let elapsed = start.elapsed();
@@ -655,7 +815,12 @@ fn test_model(model_path: &PathBuf, tokenizer_path: &PathBuf, model_size: &str) 
     config.dropout = 0.0; // CRÍTICO: Dropout OFF
 
     let model: RWKV<MyBackend> = RWKV::new(&config, &device);
-    let model = model.load_file(model_path.to_str().unwrap(), &CompactRecorder::new(), &device)
+    let model = model
+        .load_file(
+            model_path.to_str().unwrap(),
+            &CompactRecorder::new(),
+            &device,
+        )
         .expect("Erro carregando modelo");
 
     let test_prompts = vec![
@@ -674,9 +839,7 @@ fn test_model(model_path: &PathBuf, tokenizer_path: &PathBuf, model_size: &str) 
         let seq_len = input_vec.len();
 
         // CORREÇÃO: Especificar tipo explicitamente
-        let input: Tensor<MyBackend, 1, Int> = Tensor::from_ints(
-            input_vec.as_slice(), &device
-        );
+        let input: Tensor<MyBackend, 1, Int> = Tensor::from_ints(input_vec.as_slice(), &device);
         let input = input.reshape([1, seq_len]);
 
         let logits = model.forward_inference(input);
@@ -691,8 +854,9 @@ fn test_model(model_path: &PathBuf, tokenizer_path: &PathBuf, model_size: &str) 
         println!("  Top-5:");
         for (i, (token_id, prob)) in indexed.iter().take(5).enumerate() {
             let token_text = tokenizer.decode(&[*token_id as u16]);
-            println!("    {}. {:15} {:>6.2}%", 
-                i + 1, 
+            println!(
+                "    {}. {:15} {:>6.2}%",
+                i + 1,
                 format!("\"{}\"", token_text.trim()),
                 prob * 100.0
             );
@@ -728,7 +892,12 @@ fn generate(
     config.dropout = 0.0; // CRÍTICO
 
     let model: RWKV<MyBackend> = RWKV::new(&config, &device);
-    let model = model.load_file(model_path.to_str().unwrap(), &CompactRecorder::new(), &device)
+    let model = model
+        .load_file(
+            model_path.to_str().unwrap(),
+            &CompactRecorder::new(),
+            &device,
+        )
         .expect("Erro carregando modelo");
 
     let mut tokens = tokenizer.encode(prompt);
@@ -742,9 +911,7 @@ fn generate(
         let seq_len = input_vec.len();
 
         // CORREÇÃO: Especificar tipo explicitamente
-        let input: Tensor<MyBackend, 1, Int> = Tensor::from_ints(
-            input_vec.as_slice(), &device
-        );
+        let input: Tensor<MyBackend, 1, Int> = Tensor::from_ints(input_vec.as_slice(), &device);
         let input = input.reshape([1, seq_len]);
 
         let logits = model.forward_inference(input);
@@ -752,16 +919,22 @@ fn generate(
 
         // Apply temperature
         let scaled: Vec<f32> = logits_vec.iter().map(|x| x / temperature).collect();
-        
+
         // Top-K filtering
         let mut indexed: Vec<(usize, f32)> = scaled.iter().cloned().enumerate().collect();
         indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
         indexed.truncate(top_k);
-        
+
         // Softmax over top-k
-        let max_logit = indexed.iter().map(|(_, v)| *v).fold(f32::NEG_INFINITY, f32::max);
+        let max_logit = indexed
+            .iter()
+            .map(|(_, v)| *v)
+            .fold(f32::NEG_INFINITY, f32::max);
         let exp_sum: f32 = indexed.iter().map(|(_, v)| (v - max_logit).exp()).sum();
-        let probs: Vec<f32> = indexed.iter().map(|(_, v)| (v - max_logit).exp() / exp_sum).collect();
+        let probs: Vec<f32> = indexed
+            .iter()
+            .map(|(_, v)| (v - max_logit).exp() / exp_sum)
+            .collect();
         let indices: Vec<usize> = indexed.iter().map(|(i, _)| *i).collect();
 
         // Sample
@@ -811,7 +984,8 @@ fn clean_corpus(input: &PathBuf, output: &PathBuf, verbose: bool) {
         std::fs::write(&out_path, &cleaned).expect("Erro escrevendo");
 
         if verbose {
-            println!("  {:?}: {} -> {}", 
+            println!(
+                "  {:?}: {} -> {}",
                 path.file_name().unwrap(),
                 format_bytes(content.len()),
                 format_bytes(cleaned.len())
@@ -821,7 +995,9 @@ fn clean_corpus(input: &PathBuf, output: &PathBuf, verbose: bool) {
 
     let reduction = if total_before > 0 {
         100.0 * (1.0 - total_after as f64 / total_before as f64)
-    } else { 0.0 };
+    } else {
+        0.0
+    };
 
     println!();
     println!("═══════════════════════════════════════════════════════════");
@@ -836,7 +1012,7 @@ fn clean_corpus(input: &PathBuf, output: &PathBuf, verbose: bool) {
 // ============ INFO ============
 fn show_info(model_size: &str) {
     let config = get_model_config(model_size);
-    
+
     println!("═══════════════════════════════════════════════════════════");
     println!("  📊 Informações do Modelo: {}", model_size);
     println!("═══════════════════════════════════════════════════════════");
@@ -847,14 +1023,14 @@ fn show_info(model_size: &str) {
     println!("  d_ffn: {}", config.d_ffn);
     println!("  max_seq_len: {}", config.max_seq_len);
     println!();
-    
+
     // Estimativa de memória
     let params = config.num_parameters();
     let mem_fp32 = params * 4;
     let mem_fp16 = params * 2;
     let mem_train_fp32 = mem_fp32 * 4; // pesos + grads + adam states
     let mem_train_fp16 = mem_fp16 + mem_fp32 * 3; // mixed precision
-    
+
     println!("  Memória (Inferência):");
     println!("    FP32: {}", format_bytes(mem_fp32));
     println!("    FP16: {}", format_bytes(mem_fp16));
@@ -880,17 +1056,273 @@ fn get_model_config(model_size: &str) -> RWKVConfig {
     }
 }
 
-fn create_batch_tensor<B: Backend>(
-    data: &[Vec<u16>],
-    device: &B::Device,
-) -> Tensor<B, 2, Int> {
+fn file_has_double_newline(path: &PathBuf) -> bool {
+    use std::io::Read;
+    let mut f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let mut buf = vec![0u8; 1024 * 1024]; // 1MB
+    let n = match f.read(&mut buf) {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    buf.truncate(n);
+    buf.windows(2).any(|w| w == b"\n\n")
+}
+
+fn build_dataset(
+    tokenizer_path: &PathBuf,
+    output_bin: &PathBuf,
+    sources: &[String],
+    min_chars: usize,
+    blocks: bool,
+    clean: bool,
+    seed: u64,
+) {
+    // <-- ADD THIS BRACE
+    use std::io::{BufRead, BufReader};
+
+    println!("═══════════════════════════════════════════════════════════");
+    println!("  🧱 Build Dataset (streaming) -> train.bin");
+    println!("═══════════════════════════════════════════════════════════");
+    println!("  Tokenizer: {:?}", tokenizer_path);
+    println!("  Output: {:?}", output_bin);
+    println!("  min_chars: {}", min_chars);
+    println!(
+        "  mode: {}",
+        if blocks { "blocks(\\n\\n)" } else { "lines" }
+    );
+    println!("  clean: {}", clean);
+    println!("  seed: {}", seed);
+    println!();
+
+    // Carrega tokenizer
+    let mut tokenizer = BPETokenizer::from_file(tokenizer_path.to_str().unwrap())
+        .expect("Erro carregando tokenizer");
+    let bos = tokenizer.bos_id();
+    let eos = tokenizer.eos_id();
+
+    println!("  BOS: {}", bos);
+    println!("  EOS: {}", eos);
+    println!("  vocab_size: {}", tokenizer.vocab_size());
+    println!();
+
+    let normalizer = PTBRNormalizer::new();
+    let cleaner = WikiCleaner::new();
+
+    // Writer direto no binário final
+    if let Some(parent) = output_bin.parent() {
+        std::fs::create_dir_all(parent).expect("Erro criando diretório de saída");
+    }
+    let mut writer =
+        TokenizedDatasetWriter::new(output_bin.as_path()).expect("Erro criando train.bin");
+
+    // Parse sources
+    let mut parsed: Vec<(PathBuf, usize)> = Vec::new();
+    for s in sources {
+        let (path, weight) = parse_source_spec(s);
+        parsed.push((path, weight));
+    }
+
+    // Ordem determinística
+    let mut total_docs = 0usize;
+    let mut total_tokens = 0usize;
+
+    for (path, weight) in parsed {
+        if !path.exists() {
+            println!("  ⚠ Fonte não existe: {:?}", path);
+            continue;
+        }
+
+        let files = collect_txt_files_sorted(&path);
+
+        println!(
+            "  Fonte: {:?} | weight={}x | files={}",
+            path,
+            weight,
+            files.len()
+        );
+
+        for w in 0..weight {
+            if weight > 1 {
+                println!("    Pass {}/{}", w + 1, weight);
+            }
+
+            for f in &files {
+                let file = std::fs::File::open(f).expect("Erro abrindo arquivo fonte");
+                let mut reader = BufReader::with_capacity(1024 * 1024, file);
+
+                let use_blocks = if blocks {
+                    file_has_double_newline(f)
+                } else {
+                    false
+                };
+
+                if use_blocks {
+                    let mut doc = String::new();
+                    let mut line = String::new();
+
+                    loop {
+                        line.clear();
+                        let n = reader.read_line(&mut line).expect("Erro lendo linha");
+                        if n == 0 {
+                            flush_doc(
+                                &mut doc,
+                                min_chars,
+                                clean,
+                                &normalizer,
+                                &cleaner,
+                                &mut tokenizer,
+                                &mut writer,
+                                bos,
+                                eos,
+                                &mut total_docs,
+                                &mut total_tokens,
+                            );
+                            break;
+                        }
+
+                        let trimmed = line.trim_end_matches(&['\r', '\n'][..]);
+                        if trimmed.trim().is_empty() {
+                            flush_doc(
+                                &mut doc,
+                                min_chars,
+                                clean,
+                                &normalizer,
+                                &cleaner,
+                                &mut tokenizer,
+                                &mut writer,
+                                bos,
+                                eos,
+                                &mut total_docs,
+                                &mut total_tokens,
+                            );
+                            doc.clear();
+                        } else {
+                            doc.push_str(trimmed);
+                            doc.push('\n');
+                        }
+                    }
+                } else {
+                    let mut line = String::new();
+                    loop {
+                        line.clear();
+                        let n = reader.read_line(&mut line).expect("Erro lendo linha");
+                        if n == 0 {
+                            break;
+                        }
+                        let d = line.trim();
+                        if d.len() < min_chars {
+                            continue;
+                        }
+
+                        let mut text = normalizer.normalize(d);
+                        if clean {
+                            text = cleaner.clean(&text);
+                        }
+                        if text.len() < min_chars {
+                            continue;
+                        }
+
+                        let mut toks = Vec::new();
+                        toks.push(bos);
+                        toks.extend(tokenizer.encode(&text));
+                        toks.push(eos);
+
+                        writer.write_tokens(&toks).expect("Erro escrevendo tokens");
+                        total_docs += 1;
+                        total_tokens += toks.len();
+                    }
+                }
+            }
+        } // <-- ADDED: closes `for w in 0..weight`
+    }
+
+    let written = writer.finish().expect("Erro finalizando writer");
+
+    println!();
+    println!("═══════════════════════════════════════════════════════════");
+    println!("  ✅ Dataset pronto!");
+    println!("  Docs: {}", format_number(total_docs));
+    println!("  Tokens (contado): {}", format_number(total_tokens));
+    println!("  Tokens (writer): {}", format_number(written));
+    println!("  Arquivo: {:?}", output_bin);
+    println!("═══════════════════════════════════════════════════════════");
+}
+
+fn parse_source_spec(s: &str) -> (PathBuf, usize) {
+    // formato: PATH:WEIGHT
+    // se não tiver :WEIGHT => weight=1
+    if let Some((a, b)) = s.rsplit_once(':') {
+        // tenta parse weight
+        if let Ok(w) = b.parse::<usize>() {
+            return (PathBuf::from(a), w.max(1));
+        }
+    }
+    (PathBuf::from(s), 1)
+}
+
+fn collect_txt_files_sorted(path: &PathBuf) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    if path.is_file() {
+        files.push(path.clone());
+        return files;
+    }
+
+    if let Ok(rd) = std::fs::read_dir(path) {
+        for e in rd.flatten() {
+            let p = e.path();
+            if p.extension().map(|x| x == "txt").unwrap_or(false) {
+                files.push(p);
+            }
+        }
+    }
+    files.sort();
+    files
+}
+
+fn flush_doc(
+    doc: &mut String,
+    min_chars: usize,
+    clean: bool,
+    normalizer: &PTBRNormalizer,
+    cleaner: &WikiCleaner,
+    tokenizer: &mut BPETokenizer,
+    writer: &mut TokenizedDatasetWriter,
+    bos: u16,
+    eos: u16,
+    total_docs: &mut usize,
+    total_tokens: &mut usize,
+) {
+    let d = doc.trim();
+    if d.len() < min_chars {
+        return;
+    }
+
+    let mut text = normalizer.normalize(d);
+    if clean {
+        text = cleaner.clean(&text);
+    }
+    if text.len() < min_chars {
+        return;
+    }
+
+    let mut toks = Vec::new();
+    toks.push(bos);
+    toks.extend(tokenizer.encode(&text));
+    toks.push(eos);
+
+    writer.write_tokens(&toks).expect("Erro escrevendo tokens");
+    *total_docs += 1;
+    *total_tokens += toks.len();
+}
+
+fn create_batch_tensor<B: Backend>(data: &[Vec<u16>], device: &B::Device) -> Tensor<B, 2, Int> {
     let batch_size = data.len();
     let seq_len = data[0].len();
 
-    let flat: Vec<i32> = data.iter()
-        .flatten()
-        .map(|&x| x as i32)
-        .collect();
+    let flat: Vec<i32> = data.iter().flatten().map(|&x| x as i32).collect();
 
     // CORREÇÃO: Criar tensor 1D primeiro, depois reshape
     let tensor: Tensor<B, 1, Int> = Tensor::from_ints(flat.as_slice(), device);
@@ -905,30 +1337,226 @@ fn softmax(logits: &[f32]) -> Vec<f32> {
 }
 
 fn format_params(n: usize) -> String {
-    if n >= 1_000_000_000 { format!("{:.2}B", n as f64 / 1e9) }
-    else if n >= 1_000_000 { format!("{:.1}M", n as f64 / 1e6) }
-    else if n >= 1_000 { format!("{:.1}K", n as f64 / 1e3) }
-    else { n.to_string() }
+    if n >= 1_000_000_000 {
+        format!("{:.2}B", n as f64 / 1e9)
+    } else if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1e6)
+    } else if n >= 1_000 {
+        format!("{:.1}K", n as f64 / 1e3)
+    } else {
+        n.to_string()
+    }
 }
 
 fn format_number(n: usize) -> String {
-    if n >= 1_000_000 { format!("{:.1}M", n as f64 / 1e6) }
-    else if n >= 1_000 { format!("{:.1}K", n as f64 / 1e3) }
-    else { n.to_string() }
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1e6)
+    } else if n >= 1_000 {
+        format!("{:.1}K", n as f64 / 1e3)
+    } else {
+        n.to_string()
+    }
 }
 
 fn format_bytes(n: usize) -> String {
-    if n >= 1_000_000_000 { format!("{:.2}GB", n as f64 / 1e9) }
-    else if n >= 1_000_000 { format!("{:.1}MB", n as f64 / 1e6) }
-    else if n >= 1_000 { format!("{:.1}KB", n as f64 / 1e3) }
-    else { format!("{}B", n) }
+    if n >= 1_000_000_000 {
+        format!("{:.2}GB", n as f64 / 1e9)
+    } else if n >= 1_000_000 {
+        format!("{:.1}MB", n as f64 / 1e6)
+    } else if n >= 1_000 {
+        format!("{:.1}KB", n as f64 / 1e3)
+    } else {
+        format!("{}B", n)
+    }
 }
 
 fn format_duration(secs: u64) -> String {
     let h = secs / 3600;
     let m = (secs % 3600) / 60;
     let s = secs % 60;
-    if h > 0 { format!("{}h{}m{}s", h, m, s) }
-    else if m > 0 { format!("{}m{}s", m, s) }
-    else { format!("{}s", s) }
+    if h > 0 {
+        format!("{}h{}m{}s", h, m, s)
+    } else if m > 0 {
+        format!("{}m{}s", m, s)
+    } else {
+        format!("{}s", s)
+    }
+}
+// ============ AUDIT CORPUS (FISCAL DE QUALIDADE) ============
+
+struct FileAudit {
+    path: PathBuf,
+    score: f32,
+    issues: Vec<String>,
+    #[allow(dead_code)]
+    bytes: u64,
+}
+
+fn audit_corpus_cmd(input: &PathBuf, output: &PathBuf) {
+    println!("═══════════════════════════════════════════════════════════");
+    println!("  🕵️  Auditoria Profunda de Corpus (Quality Score)");
+    println!("═══════════════════════════════════════════════════════════");
+
+    // Coleta arquivos
+    let files = collect_all_txt_files(input);
+    println!("  Arquivos encontrados: {}", files.len());
+    println!("  Analisando paralelamente (Fiscal Elite)...");
+
+    // Processamento Paralelo
+    let mut results: Vec<FileAudit> = files.par_iter()
+        .map(|path| analyze_file_quality(path))
+        .collect();
+
+    // Ordena por score (piores primeiro) para facilitar visualização
+    results.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap());
+
+    // Relatório
+    let mut approved = 0;
+    let mut rejected = 0;
+    let mut report_file = std::fs::File::create(output).expect("Erro criando report");
+    
+    writeln!(report_file, "SCORE\tPATH\tISSUES").unwrap();
+    
+    for r in &results {
+        if r.score >= 50.0 {
+            approved += 1;
+        } else {
+            rejected += 1;
+            println!("❌ REJEITADO ({:.1}): {:?} -> {:?}", r.score, r.path.file_name().unwrap(), r.issues);
+        }
+        writeln!(report_file, "{:.1}\t{:?}\t{:?}", r.score, r.path, r.issues).unwrap();
+    }
+
+    println!("═══════════════════════════════════════════════════════════");
+    println!("  ✅ Auditoria Finalizada");
+    println!("  Aprovados: {} (Score >= 50)", approved);
+    println!("  Rejeitados: {} (Lixo/Ruído)", rejected);
+    println!("  Relatório salvo em: {:?}", output);
+    println!("═══════════════════════════════════════════════════════════");
+}
+
+fn collect_all_txt_files(path: &PathBuf) -> Vec<PathBuf> {
+    let mut files = Vec::new();
+    if path.is_file() {
+        files.push(path.clone());
+    } else if path.is_dir() {
+        if let Ok(entries) = std::fs::read_dir(path) {
+            for entry in entries.flatten() {
+                let p = entry.path();
+                if p.is_dir() {
+                    files.extend(collect_all_txt_files(&p));
+                } else if p.extension().map_or(false, |e| e == "txt") {
+                    files.push(p);
+                }
+            }
+        }
+    }
+    files
+}
+
+fn analyze_file_quality(path: &PathBuf) -> FileAudit {
+    let mut issues = Vec::new();
+    let mut score: f32 = 100.0;
+    
+    let content = match std::fs::read_to_string(path) {
+        Ok(c) => c,
+        Err(_) => return FileAudit { path: path.clone(), score: 0.0, issues: vec!["Erro leitura".into()], bytes: 0 },
+    };
+
+    let len = content.len();
+    if len < 500 {
+        return FileAudit { path: path.clone(), score: 0.0, issues: vec!["Muito curto".into()], bytes: len as u64 };
+    }
+
+    // 1. Encoding (Mojibake)
+    if content.contains("Ã£") || content.contains("Ã©") || content.contains("Ã³") {
+        return FileAudit { path: path.clone(), score: 0.0, issues: vec!["Encoding quebrado".into()], bytes: len as u64 };
+    }
+
+    let lower = content.to_lowercase();
+    let words: Vec<&str> = lower.split_whitespace().collect();
+    let word_count = words.len();
+
+    if word_count < 50 {
+        score -= 20.0;
+        issues.push("Poucas palavras".into());
+    }
+
+    // 2. Stopwords Ratio
+    let stopwords = [" o ", " a ", " de ", " que ", " e ", " do ", " da ", " em ", " um ", " para "];
+    let mut stop_count = 0;
+    for s in stopwords {
+        stop_count += lower.matches(s).count();
+    }
+    let stop_ratio = stop_count as f32 / word_count.max(1) as f32;
+
+    if stop_ratio < 0.05 { 
+        score -= 40.0;
+        issues.push("Texto não-natural (sem conectivos)".into());
+    } else if stop_ratio > 0.6 { 
+        score -= 30.0;
+        issues.push("Repetitivo demais".into());
+    }
+
+    // 3. Riqueza Lexical
+    let unique_words: HashSet<&str> = words.iter().cloned().collect();
+    let ttr = unique_words.len() as f32 / word_count.max(1) as f32;
+
+    if ttr < 0.05 {
+        score -= 30.0;
+        issues.push("Vocabulário pobre".into());
+    }
+
+    // 4. Frases
+    let sentences: Vec<&str> = content.split(|c| c == '.' || c == '!' || c == '?').collect();
+    let avg_sentence_len = word_count as f32 / sentences.len().max(1) as f32;
+
+    if avg_sentence_len < 4.0 {
+        score -= 20.0;
+        issues.push("Frases fragmentadas".into());
+    } else if avg_sentence_len > 150.0 {
+        score -= 20.0;
+        issues.push("Frases longas demais".into());
+    }
+
+    // 5. Markup
+    let symbols = content.chars().filter(|c| "{[]}<>@#$%=|\\".contains(*c)).count();
+    let symbol_ratio = symbols as f32 / len as f32;
+    if symbol_ratio > 0.05 { 
+        score -= 30.0;
+        issues.push("Markup/Código".into());
+    }
+
+    // 6. Línguas Estrangeiras
+    let en_markers = [" the ", " and ", " is ", " with ", " for "];
+    let mut en_count = 0;
+    for m in en_markers { en_count += lower.matches(m).count(); }
+    
+    let es_markers = [" y ", " el ", " los ", " las ", " una "];
+    let mut es_count = 0;
+    for m in es_markers { es_count += lower.matches(m).count(); }
+
+    let fr_markers = [" le ", " la ", " et ", " du ", " dans "];
+    let mut fr_count = 0;
+    for m in fr_markers { fr_count += lower.matches(m).count(); }
+
+    if en_count > stop_count { 
+        score = 0.0;
+        issues.push("Inglês".into());
+    }
+    if es_count > stop_count / 2 {
+        score -= 60.0;
+        issues.push("Espanhol".into());
+    }
+    if fr_count > stop_count / 2 {
+        score -= 60.0;
+        issues.push("Francês".into());
+    }
+
+    FileAudit {
+        path: path.clone(),
+        score: score.max(0.0),
+        issues,
+        bytes: len as u64,
+    }
 }

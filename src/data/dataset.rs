@@ -1,11 +1,11 @@
 #![allow(dead_code)]
 use memmap2::Mmap;
-use std::fs::File;
-use std::io::{Write, BufWriter};
-use std::path::Path;
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
+use std::fs::File;
+use std::io::{BufWriter, Write};
+use std::path::Path;
 
 pub struct MmapDataset {
     data: Mmap,
@@ -18,31 +18,46 @@ impl MmapDataset {
     pub fn from_file(path: &Path, seq_len: usize) -> std::io::Result<Self> {
         let file = File::open(path)?;
         let data = unsafe { Mmap::map(&file)? };
-        
+
         let num_tokens = data.len() / 2;
         let num_sequences = num_tokens.saturating_sub(seq_len + 1) / seq_len;
-        
-        let indices: Vec<usize> = (0..num_sequences)
-            .map(|i| i * seq_len * 2)
-            .collect();
-        
-        println!("  Dataset: {} tokens, {} sequências (seq_len={})", 
-            num_tokens, num_sequences, seq_len);
-        
-        Ok(Self { data, indices, seq_len, epoch: 0 })
+
+        let indices: Vec<usize> = (0..num_sequences).map(|i| i * seq_len * 2).collect();
+
+        println!(
+            "  Dataset: {} tokens, {} sequências (seq_len={})",
+            num_tokens, num_sequences, seq_len
+        );
+
+        Ok(Self {
+            data,
+            indices,
+            seq_len,
+            epoch: 0,
+        })
     }
 
-    pub fn len(&self) -> usize { self.indices.len() }
-    pub fn is_empty(&self) -> bool { self.indices.is_empty() }
-    pub fn epoch(&self) -> usize { self.epoch }
+    pub fn len(&self) -> usize {
+        self.indices.len()
+    }
+    pub fn is_empty(&self) -> bool {
+        self.indices.is_empty()
+    }
+    pub fn epoch(&self) -> usize {
+        self.epoch
+    }
 
     pub fn get(&self, idx: usize) -> Option<(Vec<u16>, Vec<u16>)> {
-        if idx >= self.indices.len() { return None; }
+        if idx >= self.indices.len() {
+            return None;
+        }
 
         let start = self.indices[idx];
         let end = start + (self.seq_len + 1) * 2;
-        
-        if end > self.data.len() { return None; }
+
+        if end > self.data.len() {
+            return None;
+        }
 
         let bytes = &self.data[start..end];
         let tokens: Vec<u16> = bytes
@@ -77,7 +92,11 @@ pub struct DataLoader<'a> {
 
 impl<'a> DataLoader<'a> {
     pub fn new(dataset: &'a MmapDataset, batch_size: usize) -> Self {
-        Self { dataset, batch_size, current_idx: 0 }
+        Self {
+            dataset,
+            batch_size,
+            current_idx: 0,
+        }
     }
 
     pub fn reset(&mut self) {
@@ -98,7 +117,7 @@ impl<'a> Iterator for DataLoader<'a> {
         }
 
         let end_idx = (self.current_idx + self.batch_size).min(self.dataset.len());
-        
+
         let mut inputs = Vec::with_capacity(self.batch_size);
         let mut targets = Vec::with_capacity(self.batch_size);
 
@@ -111,7 +130,11 @@ impl<'a> Iterator for DataLoader<'a> {
 
         self.current_idx = end_idx;
 
-        if inputs.is_empty() { None } else { Some((inputs, targets)) }
+        if inputs.is_empty() {
+            None
+        } else {
+            Some((inputs, targets))
+        }
     }
 }
 
@@ -124,7 +147,10 @@ impl TokenizedDatasetWriter {
     pub fn new(path: &Path) -> std::io::Result<Self> {
         let file = File::create(path)?;
         let writer = BufWriter::with_capacity(4 * 1024 * 1024, file);
-        Ok(Self { writer, tokens_written: 0 })
+        Ok(Self {
+            writer,
+            tokens_written: 0,
+        })
     }
 
     pub fn write_tokens(&mut self, tokens: &[u16]) -> std::io::Result<()> {

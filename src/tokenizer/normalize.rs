@@ -76,27 +76,27 @@ impl PTBRNormalizer {
             // Aspas curvas para retas
             .replace('\u{201C}', "\"") // "
             .replace('\u{201D}', "\"") // "
-            .replace('\u{2018}', "'")  // '
-            .replace('\u{2019}', "'")  // '
+            .replace('\u{2018}', "'") // '
+            .replace('\u{2019}', "'") // '
             .replace('\u{00AB}', "\"") // «
             .replace('\u{00BB}', "\"") // »
             // Travessões
-            .replace('\u{2013}', "-")  // –
-            .replace('\u{2014}', "-")  // —
+            .replace('\u{2013}', "-") // –
+            .replace('\u{2014}', "-") // —
             // Espaços especiais
-            .replace('\u{00A0}', " ")  // Non-breaking space
-            .replace('\u{2002}', " ")  // En space
-            .replace('\u{2003}', " ")  // Em space
-            .replace('\u{2009}', " ")  // Thin space
-            .replace('\u{200B}', "")   // Zero-width space
+            .replace('\u{00A0}', " ") // Non-breaking space
+            .replace('\u{2002}', " ") // En space
+            .replace('\u{2003}', " ") // Em space
+            .replace('\u{2009}', " ") // Thin space
+            .replace('\u{200B}', "") // Zero-width space
             // Reticências
             .replace('\u{2026}', "...") // …
             // Windows-1252 control chars que às vezes aparecem
-            .replace('\u{0092}', "'")   // Windows apostrophe
-            .replace('\u{0093}', "\"")  // Windows open quote
-            .replace('\u{0094}', "\"")  // Windows close quote
-            .replace('\u{0096}', "-")   // Windows dash
-            .replace('\u{0097}', "-")   // Windows em dash
+            .replace('\u{0092}', "'") // Windows apostrophe
+            .replace('\u{0093}', "\"") // Windows open quote
+            .replace('\u{0094}', "\"") // Windows close quote
+            .replace('\u{0096}', "-") // Windows dash
+            .replace('\u{0097}', "-") // Windows em dash
     }
 
     /// Normaliza espaços em branco
@@ -137,7 +137,9 @@ impl PTBRNormalizer {
 }
 
 impl Default for PTBRNormalizer {
-    fn default() -> Self { Self::new() }
+    fn default() -> Self {
+        Self::new()
+    }
 }
 
 #[cfg(test)]
@@ -159,7 +161,7 @@ mod tests {
         // Aspas curvas
         let input = "\u{201C}test\u{201D}";
         assert_eq!(norm.normalize(input), "\"test\"");
-        
+
         // Travessão
         let input2 = "a\u{2014}b";
         assert_eq!(norm.normalize(input2), "a-b");

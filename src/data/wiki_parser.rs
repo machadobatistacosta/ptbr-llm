@@ -1,9 +1,9 @@
 #![allow(dead_code)]
-use std::fs::File;
-use std::io::{BufReader, BufRead};
 use bzip2::read::BzDecoder;
 use quick_xml::events::Event;
 use quick_xml::Reader;
+use std::fs::File;
+use std::io::{BufRead, BufReader};
 
 /// Artigo parseado da Wikipedia
 #[derive(Debug, Clone)]
@@ -28,7 +28,7 @@ impl WikiStreamParser {
         let reader = BufReader::with_capacity(8 * 1024 * 1024, file);
         let decompressor = BzDecoder::new(reader);
         let buf_reader = BufReader::with_capacity(4 * 1024 * 1024, decompressor);
-        
+
         Box::new(WikiArticleIterator::new(buf_reader, self.min_chars))
     }
 }
@@ -49,7 +49,7 @@ impl<R: BufRead> WikiArticleIterator<R> {
     fn new(reader: R, min_chars: usize) -> Self {
         let mut xml_reader = Reader::from_reader(reader);
         xml_reader.trim_text(false);
-        
+
         Self {
             reader: xml_reader,
             min_chars,
@@ -62,11 +62,10 @@ impl<R: BufRead> WikiArticleIterator<R> {
             in_ns: false,
         }
     }
-    
+
     fn is_redirect(&self, text: &str) -> bool {
         let lower = text.to_lowercase();
-        lower.starts_with("#redirect") 
-            || lower.starts_with("#redirecionamento")
+        lower.starts_with("#redirect") || lower.starts_with("#redirecionamento")
     }
 }
 
@@ -76,30 +75,28 @@ impl<R: BufRead> Iterator for WikiArticleIterator<R> {
     fn next(&mut self) -> Option<Self::Item> {
         loop {
             self.buf.clear();
-            
+
             match self.reader.read_event_into(&mut self.buf) {
-                Ok(Event::Start(ref e)) => {
-                    match e.name().as_ref() {
-                        b"title" => {
-                            self.in_title = true;
-                            self.current_title.clear();
-                        }
-                        b"text" => {
-                            self.in_text = true;
-                            self.current_text.clear();
-                        }
-                        b"ns" => {
-                            self.in_ns = true;
-                        }
-                        b"page" => {
-                            self.current_title.clear();
-                            self.current_text.clear();
-                            self.current_ns = -1;
-                        }
-                        _ => {}
+                Ok(Event::Start(ref e)) => match e.name().as_ref() {
+                    b"title" => {
+                        self.in_title = true;
+                        self.current_title.clear();
                     }
-                }
-                
+                    b"text" => {
+                        self.in_text = true;
+                        self.current_text.clear();
+                    }
+                    b"ns" => {
+                        self.in_ns = true;
+                    }
+                    b"page" => {
+                        self.current_title.clear();
+                        self.current_text.clear();
+                        self.current_ns = -1;
+                    }
+                    _ => {}
+                },
+
                 Ok(Event::Text(ref e)) => {
                     if self.in_title {
                         if let Ok(text) = e.unescape() {
@@ -115,28 +112,26 @@ impl<R: BufRead> Iterator for WikiArticleIterator<R> {
                         }
                     }
                 }
-                
-                Ok(Event::End(ref e)) => {
-                    match e.name().as_ref() {
-                        b"title" => self.in_title = false,
-                        b"text" => self.in_text = false,
-                        b"ns" => self.in_ns = false,
-                        b"page" => {
-                            if self.current_ns == 0
-                                && self.current_text.len() >= self.min_chars
-                                && !self.current_title.is_empty()
-                                && !self.is_redirect(&self.current_text)
-                            {
-                                return Some(WikiArticle {
-                                    title: std::mem::take(&mut self.current_title),
-                                    text: std::mem::take(&mut self.current_text),
-                                });
-                            }
+
+                Ok(Event::End(ref e)) => match e.name().as_ref() {
+                    b"title" => self.in_title = false,
+                    b"text" => self.in_text = false,
+                    b"ns" => self.in_ns = false,
+                    b"page" => {
+                        if self.current_ns == 0
+                            && self.current_text.len() >= self.min_chars
+                            && !self.current_title.is_empty()
+                            && !self.is_redirect(&self.current_text)
+                        {
+                            return Some(WikiArticle {
+                                title: std::mem::take(&mut self.current_title),
+                                text: std::mem::take(&mut self.current_text),
+                            });
                         }
-                        _ => {}
                     }
-                }
-                
+                    _ => {}
+                },
+
                 Ok(Event::CData(ref e)) => {
                     if self.in_text {
                         if let Ok(text) = std::str::from_utf8(e.as_ref()) {
@@ -144,7 +139,7 @@ impl<R: BufRead> Iterator for WikiArticleIterator<R> {
                         }
                     }
                 }
-                
+
                 Ok(Event::Eof) => return None,
                 Err(_) => continue,
                 _ => {}

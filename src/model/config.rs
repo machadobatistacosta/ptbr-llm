@@ -1,6 +1,6 @@
 use burn::config::Config;
 
-#[derive(Config, Debug)]  // Config já implementa Clone
+#[derive(Config, Debug)] // Config já implementa Clone
 pub struct RWKVConfig {
     #[config(default = "32000")]
     pub vocab_size: usize,
@@ -86,8 +86,7 @@ impl RWKVConfig {
 
     pub fn num_parameters(&self) -> usize {
         let embed = self.vocab_size * self.d_model;
-        let per_layer = 
-            4 * self.d_model + // LayerNorms
+        let per_layer = 4 * self.d_model + // LayerNorms
             5 * self.d_model * self.d_model + // TimeMix
             2 * self.d_model * self.d_ffn + self.d_model * self.d_model; // ChannelMix
         let head = self.d_model * self.vocab_size;
@@ -95,7 +94,7 @@ impl RWKVConfig {
     }
 }
 
-#[derive(Config, Debug)]  // Config já implementa Clone
+#[derive(Config, Debug)] // Config já implementa Clone
 pub struct TrainingConfig {
     #[config(default = "3e-4")]
     pub learning_rate: f64,
