@@ -10,10 +10,16 @@ use burn::{
     tensor::{activation, backend::Backend, Int, Tensor},
 };
 
+/// Epsilon para estabilidade numérica
+const NUMERIC_EPS: f32 = 1e-7;
+
+/// Tamanho do chunk para WKV
+const WKV_CHUNK_SIZE: usize = 32;
+
 /// Estado do RWKV para inferência incremental
 #[derive(Clone, Debug)]
 pub struct RWKVState<B: Backend> {
-    pub time_state: Vec<(Tensor<B, 2>, Tensor<B, 2>, Tensor<B, 2>)>, // (aa, bb, pp)
+    pub time_state: Vec<(Tensor<B, 2>, Tensor<B, 2>, Tensor<B, 2>)>,
     pub channel_state: Vec<Tensor<B, 2>>,
 }
 
@@ -55,6 +61,7 @@ pub struct RWKV<B: Backend> {
 impl<B: Backend> RWKV<B> {
     pub fn new(config: &RWKVConfig, device: &B::Device) -> Self {
         let embedding = EmbeddingConfig::new(config.vocab_size, config.d_model).init(device);
+
         let ln_pre = LayerNormConfig::new(config.d_model)
             .with_epsilon(config.layer_norm_eps)
             .init(device);
@@ -66,6 +73,7 @@ impl<B: Backend> RWKV<B> {
         let ln_out = LayerNormConfig::new(config.d_model)
             .with_epsilon(config.layer_norm_eps)
             .init(device);
+
         let head = LinearConfig::new(config.d_model, config.vocab_size)
             .with_bias(false)
             .init(device);
@@ -94,21 +102,16 @@ impl<B: Backend> RWKV<B> {
         self.head.forward(x)
     }
 
+    /// Forward para inferência - retorna logits do último token
     pub fn forward_inference(&self, input_ids: Tensor<B, 2, Int>) -> Tensor<B, 2> {
         let logits = self.forward(input_ids);
         let [b, s, v] = logits.dims();
         logits.slice([0..b, s - 1..s, 0..v]).reshape([b, v])
     }
 
-    pub fn vocab_size(&self) -> usize {
-        self.vocab_size
-    }
-    pub fn d_model(&self) -> usize {
-        self.d_model
-    }
-    pub fn n_layers(&self) -> usize {
-        self.n_layers
-    }
+    pub fn vocab_size(&self) -> usize { self.vocab_size }
+    pub fn d_model(&self) -> usize { self.d_model }
+    pub fn n_layers(&self) -> usize { self.n_layers }
 }
 
 #[derive(Module, Debug)]
@@ -142,6 +145,7 @@ impl<B: Backend> RWKVBlock<B> {
     }
 
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+        // Pre-norm architecture com residual
         let tm = self.time_mixing.forward(self.ln1.forward(x.clone()));
         let x = x + self.dropout.forward(tm);
 
@@ -149,9 +153,6 @@ impl<B: Backend> RWKVBlock<B> {
         x + self.dropout.forward(cm)
     }
 }
-
-/// Tamanho do chunk para processamento batched
-const WKV_CHUNK_SIZE: usize = 32;
 
 #[derive(Module, Debug)]
 pub struct TimeMixing<B: Backend> {
@@ -174,24 +175,28 @@ impl<B: Backend> TimeMixing<B> {
     pub fn new(d_model: usize, layer_id: usize, n_layers: usize, device: &B::Device) -> Self {
         let linear = LinearConfig::new(d_model, d_model).with_bias(false);
 
+        // Inicialização RWKV-style
         let ratio_0_to_1 = layer_id as f64 / (n_layers.max(1) - 1).max(1) as f64;
         let ratio_1_to_almost_0 = 1.0 - ratio_0_to_1;
 
+        // Time decay: camadas mais profundas têm decay mais lento
         let decay_values: Vec<f32> = (0..d_model)
             .map(|i| {
                 let channel_ratio = i as f64 / (d_model.max(1) - 1).max(1) as f64;
-                let decay = -5.0 + 2.0 * (channel_ratio * (1.0 - ratio_0_to_1));
+                let decay = -5.0 - 2.0 * ratio_0_to_1 + 0.5 * channel_ratio;
                 decay as f32
             })
             .collect();
 
+        // Time first: bonus para primeiro token
         let first_values: Vec<f32> = (0..d_model)
             .map(|i| {
                 let channel_ratio = i as f64 / (d_model.max(1) - 1).max(1) as f64;
-                ((1.0 - channel_ratio) * 1.0 + channel_ratio * 0.5) as f32
+                ((1.0 - channel_ratio) * 0.8 + channel_ratio * 0.4) as f32
             })
             .collect();
 
+        // Time mix: interpolação entre atual e anterior
         let mix_values: Vec<f32> = (0..d_model)
             .map(|i| {
                 let channel_ratio = i as f64 / (d_model.max(1) - 1).max(1) as f64;
@@ -219,19 +224,23 @@ impl<B: Backend> TimeMixing<B> {
         let [b, t, c] = x.dims();
         let device = x.device();
 
+        // Token shift
         let x_prev = self.token_shift(x.clone(), b, t, c);
 
+        // Mix
         let xk = self.mix(x.clone(), x_prev.clone(), self.time_mix_k.val(), c);
         let xv = self.mix(x.clone(), x_prev.clone(), self.time_mix_v.val(), c);
         let xr = self.mix(x.clone(), x_prev, self.time_mix_r.val(), c);
 
+        // Projections
         let r = activation::sigmoid(self.receptance.forward(xr));
         let k = self.key.forward(xk);
         let v = self.value.forward(xv);
 
-        // WKV BATCHED - Processa em chunks para melhor paralelização
-        let wkv = self.wkv_batched(k, v, b, t, c, &device);
+        // WKV
+        let wkv = self.wkv_stable(k, v, b, t, c, &device);
 
+        // Output
         self.output.forward(r * wkv)
     }
 
@@ -244,21 +253,15 @@ impl<B: Backend> TimeMixing<B> {
         Tensor::cat(vec![zeros, shifted], 1)
     }
 
-    fn mix(
-        &self,
-        x: Tensor<B, 3>,
-        x_prev: Tensor<B, 3>,
-        mix: Tensor<B, 1>,
-        c: usize,
-    ) -> Tensor<B, 3> {
+    fn mix(&self, x: Tensor<B, 3>, x_prev: Tensor<B, 3>, mix: Tensor<B, 1>, c: usize) -> Tensor<B, 3> {
         let m = mix.reshape([1, 1, c]);
         let device = x.device();
-        x.clone() * m.clone() + x_prev * (Tensor::ones([1, 1, c], &device) - m)
+        let one_minus_m = Tensor::ones([1, 1, c], &device) - m.clone();
+        x * m + x_prev * one_minus_m
     }
 
-    /// WKV Batched - Processa em chunks de WKV_CHUNK_SIZE tokens
-    /// ~2-3x mais rápido que loop sequencial puro
-    fn wkv_batched(
+    /// WKV com estabilidade numérica melhorada
+    fn wkv_stable(
         &self,
         k: Tensor<B, 3>,
         v: Tensor<B, 3>,
@@ -270,7 +273,7 @@ impl<B: Backend> TimeMixing<B> {
         let w = self.time_decay.val().exp().neg(); // [C]
         let u = self.time_first.val(); // [C]
 
-        // Estado inicial
+        // Estado inicial (log-space para estabilidade)
         let mut aa = Tensor::<B, 2>::zeros([b, c], device);
         let mut bb = Tensor::<B, 2>::zeros([b, c], device);
         let mut pp = Tensor::<B, 2>::zeros([b, c], device) - 1e30;
@@ -285,73 +288,40 @@ impl<B: Backend> TimeMixing<B> {
             let end = (start + WKV_CHUNK_SIZE).min(t);
             let chunk_size = end - start;
 
-            // Extrai chunk de k e v
             let k_chunk = k.clone().slice([0..b, start..end, 0..c]);
             let v_chunk = v.clone().slice([0..b, start..end, 0..c]);
 
-            // Processa chunk com estado acumulado
-            let (chunk_output, new_aa, new_bb, new_pp) = self.wkv_chunk(
-                k_chunk, v_chunk, aa, bb, pp, &w, &u, b, chunk_size, c, device,
-            );
+            for i in 0..chunk_size {
+                let kt = k_chunk.clone().slice([0..b, i..i + 1, 0..c]).reshape([b, c]);
+                let vt = v_chunk.clone().slice([0..b, i..i + 1, 0..c]).reshape([b, c]);
 
-            all_outputs.push(chunk_output);
-            aa = new_aa;
-            bb = new_bb;
-            pp = new_pp;
+                // ww = u + k_t
+                let ww = u.clone().reshape([1, c]) + kt.clone();
+
+                // Log-sum-exp trick para estabilidade
+                let p = pp.clone().max_pair(ww.clone());
+                let e1 = (pp.clone() - p.clone()).exp();
+                let e2 = (ww - p.clone()).exp();
+
+                // WKV output com epsilon aumentado
+                let denom = e1.clone() * bb.clone() + e2.clone() + NUMERIC_EPS;
+                let wkv = (e1.clone() * aa.clone() + e2.clone() * vt.clone()) / denom;
+
+                all_outputs.push(wkv.reshape([b, 1, c]));
+
+                // Atualiza estado
+                let ww2 = w.clone().reshape([1, c]) + pp.clone();
+                let p2 = ww2.clone().max_pair(kt.clone());
+                let e1_2 = (ww2 - p2.clone()).exp();
+                let e2_2 = (kt - p2.clone()).exp();
+
+                aa = e1_2.clone() * aa + e2_2.clone() * vt;
+                bb = e1_2 * bb + e2_2;
+                pp = p2;
+            }
         }
 
-        // Concatena todos os chunks
         Tensor::cat(all_outputs, 1)
-    }
-
-    /// Processa um chunk de tokens mantendo estado
-    fn wkv_chunk(
-        &self,
-        k: Tensor<B, 3>,      // [B, chunk_size, C]
-        v: Tensor<B, 3>,      // [B, chunk_size, C]
-        mut aa: Tensor<B, 2>, // [B, C]
-        mut bb: Tensor<B, 2>, // [B, C]
-        mut pp: Tensor<B, 2>, // [B, C]
-        w: &Tensor<B, 1>,     // [C]
-        u: &Tensor<B, 1>,     // [C]
-        b: usize,
-        chunk_size: usize,
-        c: usize,
-        _device: &B::Device,
-    ) -> (Tensor<B, 3>, Tensor<B, 2>, Tensor<B, 2>, Tensor<B, 2>) {
-        let mut outputs = Vec::with_capacity(chunk_size);
-
-        // Loop sequencial dentro do chunk (necessário para manter dependência causal)
-        for i in 0..chunk_size {
-            let kt = k.clone().slice([0..b, i..i + 1, 0..c]).reshape([b, c]);
-            let vt = v.clone().slice([0..b, i..i + 1, 0..c]).reshape([b, c]);
-
-            // ww = u + k_t
-            let ww = u.clone().reshape([1, c]) + kt.clone();
-
-            // Estabilização numérica
-            let p = pp.clone().max_pair(ww.clone());
-            let e1 = (pp.clone() - p.clone()).exp();
-            let e2 = (ww - p.clone()).exp();
-
-            // wkv = (e1 * aa + e2 * vt) / (e1 * bb + e2 + eps)
-            let wkv = (e1.clone() * aa.clone() + e2.clone() * vt.clone())
-                / (e1.clone() * bb.clone() + e2.clone() + 1e-9);
-
-            outputs.push(wkv.reshape([b, 1, c]));
-
-            // Atualiza estado
-            let ww2 = w.clone().reshape([1, c]) + pp.clone();
-            let p2 = ww2.clone().max_pair(kt.clone());
-            let e1_2 = (ww2 - p2.clone()).exp();
-            let e2_2 = (kt - p2.clone()).exp();
-
-            aa = e1_2.clone() * aa + e2_2.clone() * vt;
-            bb = e1_2 * bb + e2_2;
-            pp = p2;
-        }
-
-        (Tensor::cat(outputs, 1), aa, bb, pp)
     }
 }
 
@@ -410,7 +380,9 @@ impl<B: Backend> ChannelMixing<B> {
 
         let r = activation::sigmoid(self.receptance.forward(xr));
         let k = activation::relu(self.key.forward(xk));
-        let k_sq = k.clone() * k; // Squared ReLU
+
+        // Squared ReLU
+        let k_sq = k.clone() * k;
 
         r * self.value.forward(k_sq)
     }
@@ -424,15 +396,10 @@ impl<B: Backend> ChannelMixing<B> {
         Tensor::cat(vec![zeros, shifted], 1)
     }
 
-    fn mix(
-        &self,
-        x: Tensor<B, 3>,
-        x_prev: Tensor<B, 3>,
-        mix: Tensor<B, 1>,
-        c: usize,
-    ) -> Tensor<B, 3> {
+    fn mix(&self, x: Tensor<B, 3>, x_prev: Tensor<B, 3>, mix: Tensor<B, 1>, c: usize) -> Tensor<B, 3> {
         let m = mix.reshape([1, 1, c]);
         let device = x.device();
-        x.clone() * m.clone() + x_prev * (Tensor::ones([1, 1, c], &device) - m)
+        let one_minus_m = Tensor::ones([1, 1, c], &device) - m.clone();
+        x * m + x_prev * one_minus_m
     }
 }

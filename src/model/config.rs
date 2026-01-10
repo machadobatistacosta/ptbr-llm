@@ -1,6 +1,6 @@
 use burn::config::Config;
 
-#[derive(Config, Debug)] // Config já implementa Clone
+#[derive(Config, Debug)]  // ← Removido Clone
 pub struct RWKVConfig {
     #[config(default = "32000")]
     pub vocab_size: usize,
@@ -45,14 +45,14 @@ impl RWKVConfig {
         }
     }
 
-    /// 800M - Sweet Spot para T4
+    /// 800M - Para T4 com seq_len reduzido
     pub fn ptbr_800m() -> Self {
         Self {
             vocab_size: 32_000,
             d_model: 1536,
             n_layers: 24,
             d_ffn: 6144,
-            max_seq_len: 1024,
+            max_seq_len: 512,
             dropout: 0.0,
             layer_norm_eps: 1e-5,
         }
@@ -71,7 +71,7 @@ impl RWKVConfig {
         }
     }
 
-    /// 1.5B - Limite T4 (requer gradient checkpointing)
+    /// 1.5B - Limite T4
     pub fn ptbr_1_5b() -> Self {
         Self {
             vocab_size: 32_000,
@@ -86,15 +86,25 @@ impl RWKVConfig {
 
     pub fn num_parameters(&self) -> usize {
         let embed = self.vocab_size * self.d_model;
-        let per_layer = 4 * self.d_model + // LayerNorms
-            5 * self.d_model * self.d_model + // TimeMix
-            2 * self.d_model * self.d_ffn + self.d_model * self.d_model; // ChannelMix
+        let per_layer = 4 * self.d_model + 
+            5 * self.d_model * self.d_model + 
+            2 * self.d_model * self.d_ffn + self.d_model * self.d_model;
         let head = self.d_model * self.vocab_size;
         embed + self.n_layers * per_layer + head
     }
+    
+    /// Estima VRAM necessária (em bytes)
+    pub fn estimated_vram(&self, batch_size: usize, seq_len: usize) -> usize {
+        let params = self.num_parameters();
+        let params_mem = params * 4;
+        let act_mem = 4 * batch_size * seq_len * self.d_model * self.n_layers * 4;
+        let grad_mem = params * 4;
+        let opt_mem = params * 8;
+        params_mem + act_mem + grad_mem + opt_mem
+    }
 }
 
-#[derive(Config, Debug)] // Config já implementa Clone
+#[derive(Config, Debug)]  // ← Removido Clone
 pub struct TrainingConfig {
     #[config(default = "3e-4")]
     pub learning_rate: f64,
@@ -114,6 +124,8 @@ pub struct TrainingConfig {
     pub save_every: usize,
     #[config(default = "10")]
     pub log_every: usize,
+    #[config(default = "0.1")]
+    pub min_lr_ratio: f64,
 }
 
 impl Default for TrainingConfig {
@@ -128,6 +140,7 @@ impl Default for TrainingConfig {
             gradient_clip: 1.0,
             save_every: 1000,
             log_every: 10,
+            min_lr_ratio: 0.1,
         }
     }
 }

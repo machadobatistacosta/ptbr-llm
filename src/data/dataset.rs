@@ -7,26 +7,87 @@ use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
 
+/// Erros do dataset
+#[derive(Debug)]
+pub enum DatasetError {
+    IoError(std::io::Error),
+    InvalidFormat(String),
+    TooSmall { tokens: usize, required: usize },
+}
+
+impl From<std::io::Error> for DatasetError {
+    fn from(e: std::io::Error) -> Self {
+        DatasetError::IoError(e)
+    }
+}
+
+impl std::fmt::Display for DatasetError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            DatasetError::IoError(e) => write!(f, "IO Error: {}", e),
+            DatasetError::InvalidFormat(s) => write!(f, "Invalid format: {}", s),
+            DatasetError::TooSmall { tokens, required } => {
+                write!(f, "Dataset too small: {} tokens, need at least {}", tokens, required)
+            }
+        }
+    }
+}
+
+impl std::error::Error for DatasetError {}
+
 pub struct MmapDataset {
     data: Mmap,
     indices: Vec<usize>,
     seq_len: usize,
     epoch: usize,
+    num_tokens: usize,
 }
 
 impl MmapDataset {
-    pub fn from_file(path: &Path, seq_len: usize) -> std::io::Result<Self> {
+    pub fn from_file(path: &Path, seq_len: usize) -> Result<Self, DatasetError> {
         let file = File::open(path)?;
+        let metadata = file.metadata()?;
+        let file_size = metadata.len() as usize;
+
+        // Validações
+        if file_size % 2 != 0 {
+            return Err(DatasetError::InvalidFormat(
+                "File size not multiple of 2 (expected u16 tokens)".into(),
+            ));
+        }
+
+        if file_size == 0 {
+            return Err(DatasetError::InvalidFormat("Empty file".into()));
+        }
+
         let data = unsafe { Mmap::map(&file)? };
 
-        let num_tokens = data.len() / 2;
-        let num_sequences = num_tokens.saturating_sub(seq_len + 1) / seq_len;
+        let num_tokens = file_size / 2;
+        let required_tokens = seq_len + 2;
+
+        if num_tokens < required_tokens {
+            return Err(DatasetError::TooSmall {
+                tokens: num_tokens,
+                required: required_tokens,
+            });
+        }
+
+        let num_sequences = (num_tokens - seq_len - 1) / seq_len;
+
+        if num_sequences == 0 {
+            return Err(DatasetError::TooSmall {
+                tokens: num_tokens,
+                required: seq_len * 2 + 1,
+            });
+        }
 
         let indices: Vec<usize> = (0..num_sequences).map(|i| i * seq_len * 2).collect();
 
         println!(
-            "  Dataset: {} tokens, {} sequências (seq_len={})",
-            num_tokens, num_sequences, seq_len
+            "  ✓ Dataset: {} tokens, {} sequências (seq_len={})",
+            format_number(num_tokens),
+            format_number(num_sequences),
+            seq_len
         );
 
         Ok(Self {
@@ -34,18 +95,15 @@ impl MmapDataset {
             indices,
             seq_len,
             epoch: 0,
+            num_tokens,
         })
     }
 
-    pub fn len(&self) -> usize {
-        self.indices.len()
-    }
-    pub fn is_empty(&self) -> bool {
-        self.indices.is_empty()
-    }
-    pub fn epoch(&self) -> usize {
-        self.epoch
-    }
+    pub fn len(&self) -> usize { self.indices.len() }
+    pub fn is_empty(&self) -> bool { self.indices.is_empty() }
+    pub fn epoch(&self) -> usize { self.epoch }
+    pub fn num_tokens(&self) -> usize { self.num_tokens }
+    pub fn seq_len(&self) -> usize { self.seq_len }
 
     pub fn get(&self, idx: usize) -> Option<(Vec<u16>, Vec<u16>)> {
         if idx >= self.indices.len() {
@@ -71,14 +129,12 @@ impl MmapDataset {
         Some((input, target))
     }
 
-    /// Shuffle com seed diferente por epoch
     pub fn shuffle(&mut self, base_seed: u64) {
-        let seed = base_seed + self.epoch as u64;
+        let seed = base_seed.wrapping_add(self.epoch as u64);
         let mut rng = ChaCha8Rng::seed_from_u64(seed);
         self.indices.shuffle(&mut rng);
     }
 
-    /// Avança para próxima epoch
     pub fn next_epoch(&mut self) {
         self.epoch += 1;
     }
@@ -99,12 +155,14 @@ impl<'a> DataLoader<'a> {
         }
     }
 
-    pub fn reset(&mut self) {
-        self.current_idx = 0;
-    }
+    pub fn reset(&mut self) { self.current_idx = 0; }
 
     pub fn remaining(&self) -> usize {
         self.dataset.len().saturating_sub(self.current_idx)
+    }
+
+    pub fn total_batches(&self) -> usize {
+        (self.dataset.len() + self.batch_size - 1) / self.batch_size
     }
 }
 
@@ -130,11 +188,7 @@ impl<'a> Iterator for DataLoader<'a> {
 
         self.current_idx = end_idx;
 
-        if inputs.is_empty() {
-            None
-        } else {
-            Some((inputs, targets))
-        }
+        if inputs.is_empty() { None } else { Some((inputs, targets)) }
     }
 }
 
@@ -164,5 +218,17 @@ impl TokenizedDatasetWriter {
     pub fn finish(mut self) -> std::io::Result<usize> {
         self.writer.flush()?;
         Ok(self.tokens_written)
+    }
+
+    pub fn tokens_written(&self) -> usize { self.tokens_written }
+}
+
+fn format_number(n: usize) -> String {
+    if n >= 1_000_000 {
+        format!("{:.1}M", n as f64 / 1e6)
+    } else if n >= 1_000 {
+        format!("{:.1}K", n as f64 / 1e3)
+    } else {
+        n.to_string()
     }
 }

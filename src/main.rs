@@ -1,6 +1,11 @@
+#![allow(dead_code)]
+#![allow(unused_imports)]
+
 mod data;
 mod model;
 mod tokenizer;
+mod logger;
+mod utils;
 
 use clap::{Parser, Subcommand};
 use std::io::Write;
@@ -12,41 +17,61 @@ use rayon::prelude::*;
 use burn::backend::Autodiff;
 use burn::module::Module;
 use burn::record::CompactRecorder;
-use burn::tensor::{backend::Backend, Int, Tensor};
+use burn::tensor::{backend::Backend, ElementConversion, Int, Tensor};
+
+// Utils
+use utils::{format_bytes, format_duration, format_number, format_params};
+use tokenizer::BPEVocab;
 
 // ============ BACKEND SELECTOR ============
-#[cfg(feature = "cuda")]
-use burn::backend::cuda_jit::{CudaDevice, CudaRuntime};
-#[cfg(feature = "cpu")]
-use burn::backend::ndarray::{NdArray, NdArrayDevice};
-#[cfg(feature = "gpu")]
-use burn::backend::wgpu::{AutoGraphicsApi, Wgpu, WgpuDevice};
-
-#[cfg(feature = "cpu")]
-type MyBackend = NdArray;
-#[cfg(feature = "gpu")]
-type MyBackend = Wgpu<AutoGraphicsApi, f32, i32>;
-#[cfg(feature = "cuda")]
-type MyBackend = burn::backend::cuda_jit::Cuda;
-
-type TrainBackend = Autodiff<MyBackend>;
-
-fn get_device() -> <MyBackend as Backend>::Device {
-    #[cfg(feature = "cpu")]
-    {
-        NdArrayDevice::Cpu
-    }
-    #[cfg(feature = "gpu")]
-    {
-        WgpuDevice::BestAvailable
-    }
-    #[cfg(feature = "cuda")]
-    {
+#[cfg(all(feature = "cuda", not(feature = "cpu"), not(feature = "gpu")))]
+mod backend_impl {
+    pub use burn::backend::cuda_jit::{Cuda, CudaDevice};
+    pub type MyBackend = Cuda;
+    
+    pub fn get_device() -> CudaDevice {
         CudaDevice::new(0)
     }
 }
 
-// ============ IMPORTS ============
+#[cfg(all(feature = "gpu", not(feature = "cuda"), not(feature = "cpu")))]
+mod backend_impl {
+    pub use burn::backend::wgpu::{AutoGraphicsApi, Wgpu, WgpuDevice};
+    pub type MyBackend = Wgpu<AutoGraphicsApi, f32, i32>;
+    
+    pub fn get_device() -> WgpuDevice {
+        WgpuDevice::BestAvailable
+    }
+}
+
+#[cfg(all(feature = "cpu", not(feature = "cuda"), not(feature = "gpu")))]
+mod backend_impl {
+    pub use burn::backend::ndarray::{NdArray, NdArrayDevice};
+    pub type MyBackend = NdArray;
+    
+    pub fn get_device() -> NdArrayDevice {
+        NdArrayDevice::Cpu
+    }
+}
+
+#[cfg(not(any(
+    all(feature = "cuda", not(feature = "cpu"), not(feature = "gpu")),
+    all(feature = "gpu", not(feature = "cuda"), not(feature = "cpu")),
+    all(feature = "cpu", not(feature = "cuda"), not(feature = "gpu"))
+)))]
+mod backend_impl {
+    pub use burn::backend::ndarray::{NdArray, NdArrayDevice};
+    pub type MyBackend = NdArray;
+    
+    pub fn get_device() -> NdArrayDevice {
+        NdArrayDevice::Cpu
+    }
+}
+
+use backend_impl::{MyBackend, get_device};
+type TrainBackend = Autodiff<MyBackend>;
+
+// ============ IMPORTS DO PROJETO ============
 use data::{DataLoader, MmapDataset, TokenizedDatasetWriter, WikiCleaner, WikiStreamParser};
 use model::{RWKVConfig, Trainer, TrainingConfig, RWKV};
 use tokenizer::{BPETokenizer, BPETrainer, PTBRNormalizer};
@@ -58,7 +83,7 @@ use rand::prelude::*;
 #[derive(Parser)]
 #[command(name = "ptbr-slm")]
 #[command(author = "Caike Costa")]
-#[command(version = "1.0.0")]
+#[command(version = "1.1.0")]
 #[command(about = "RWKV Language Model para Português Brasileiro")]
 struct Cli {
     #[command(subcommand)]
@@ -121,6 +146,10 @@ enum Commands {
         warmup_steps: usize,
         #[arg(long, default_value = "1024")]
         seq_len: usize,
+        #[arg(long, default_value = "500")]
+        eval_every: usize,
+        #[arg(long, default_value = "100")]
+        eval_samples: usize,
     },
 
     /// Retoma treino de checkpoint
@@ -184,11 +213,13 @@ enum Commands {
         #[arg(long)]
         verbose: bool,
     },
+
+    /// Audita qualidade do corpus
     AuditCorpus {
-    #[arg(short, long)]
-    input: PathBuf,
-    #[arg(short, long)]
-    output: PathBuf,
+        #[arg(short, long)]
+        input: PathBuf,
+        #[arg(short, long)]
+        output: PathBuf,
     },
 
     /// Mostra informações do modelo
@@ -196,39 +227,57 @@ enum Commands {
         #[arg(long, default_value = "85m")]
         model_size: String,
     },
+
+    /// Constrói dataset tokenizado
     BuildDataset {
-        /// Caminho do tokenizer.json
         #[arg(long)]
         tokenizer: PathBuf,
-
-        /// Saída do arquivo train.bin
         #[arg(long)]
         output: PathBuf,
-
-        /// Fonte(s) no formato PATH:WEIGHT (WEIGHT default=1)
-        /// Ex: --source data/sovereign/corpus_v15_base.txt:1
-        /// Ex: --source data/planalto_clean:3
         #[arg(long, required = true)]
         source: Vec<String>,
-
-        /// Tamanho mínimo de um documento em caracteres (antes de tokenizar)
         #[arg(long, default_value = "100")]
         min_chars: usize,
-
-        /// Força modo "blocks" (doc separado por linha em branco)
         #[arg(long, default_value = "true")]
         blocks: bool,
-
-        /// Aplica WikiCleaner (bom para wiki/markup; pode reduzir dados em corpora já limpos)
         #[arg(long, default_value = "false")]
         clean: bool,
-
-        /// Seed para ordem determinística (só afeta ordem quando a fonte é diretório)
         #[arg(long, default_value = "42")]
         seed: u64,
     },
+
+    /// Testa se GPU suporta o modelo
+    TestGpu {
+        #[arg(long, default_value = "400m")]
+        model_size: String,
+        #[arg(long, default_value = "512")]
+        seq_len: usize,
+    },
+
+    /// Encontra learning rate ótimo
+    FindLr {
+        #[arg(short, long)]
+        data: PathBuf,
+        #[arg(short, long)]
+        tokenizer: PathBuf,
+        #[arg(long, default_value = "85m")]
+        model_size: String,
+        #[arg(long, default_value = "100")]
+        num_steps: usize,
+    },
+
+    /// Benchmark de performance
+    Benchmark {
+        #[arg(long, default_value = "85m")]
+        model_size: String,
+        #[arg(long, default_value = "512")]
+        seq_len: usize,
+        #[arg(long, default_value = "10")]
+        num_iterations: usize,
+    },
 }
 
+// ============ MAIN ============
 fn main() {
     // Inicializa logging
     tracing_subscriber::fmt()
@@ -246,16 +295,19 @@ fn main() {
             output,
             min_chars,
         } => process_wiki(&input, &output, min_chars),
+
         Commands::TrainTokenizer {
             corpus,
             output,
             vocab_size,
         } => train_tokenizer(&corpus, &output, vocab_size),
+
         Commands::Tokenize {
             input,
             output,
             tokenizer,
         } => tokenize_corpus(&input, &output, &tokenizer),
+
         Commands::Train {
             data,
             tokenizer,
@@ -268,6 +320,8 @@ fn main() {
             learning_rate,
             warmup_steps,
             seq_len,
+            eval_every,
+            eval_samples,
         } => train_model(
             &data,
             &tokenizer,
@@ -280,7 +334,10 @@ fn main() {
             learning_rate,
             warmup_steps,
             seq_len,
+            eval_every,
+            eval_samples,
         ),
+
         Commands::Resume {
             checkpoint,
             data,
@@ -304,11 +361,13 @@ fn main() {
             learning_rate,
             seq_len,
         ),
+
         Commands::TestModel {
             model,
             tokenizer,
             model_size,
         } => test_model(&model, &tokenizer, &model_size),
+
         Commands::Generate {
             model,
             tokenizer,
@@ -326,13 +385,17 @@ fn main() {
             temperature,
             top_k,
         ),
+
         Commands::AuditCorpus { input, output } => audit_corpus_cmd(&input, &output),
+
         Commands::CleanCorpus {
             input,
             output,
             verbose,
         } => clean_corpus(&input, &output, verbose),
+
         Commands::Info { model_size } => show_info(&model_size),
+
         Commands::BuildDataset {
             tokenizer,
             output,
@@ -341,11 +404,252 @@ fn main() {
             blocks,
             clean,
             seed,
-        } => {
-            build_dataset(&tokenizer, &output, &source, min_chars, blocks, clean, seed);
-        }
-        
+        } => build_dataset(&tokenizer, &output, &source, min_chars, blocks, clean, seed),
+
+        Commands::TestGpu { model_size, seq_len } => test_gpu(&model_size, seq_len),
+
+        Commands::FindLr {
+            data,
+            tokenizer,
+            model_size,
+            num_steps,
+        } => find_lr(&data, &tokenizer, &model_size, num_steps),
+
+        Commands::Benchmark {
+            model_size,
+            seq_len,
+            num_iterations,
+        } => benchmark(&model_size, seq_len, num_iterations),
     }
+}
+
+// ============ TEST GPU ============
+fn test_gpu(model_size: &str, seq_len: usize) {
+    println!("═══════════════════════════════════════════════════════════");
+    println!("  🧪 Testando GPU para modelo {}", model_size);
+    println!("═══════════════════════════════════════════════════════════");
+
+    std::env::set_var("CUDA_VISIBLE_DEVICES", "0");
+
+    let device = get_device();
+    let config = get_model_config(model_size);
+
+    println!("  Parâmetros: {}", format_params(config.num_parameters()));
+    println!(
+        "  VRAM estimada: {}",
+        format_bytes(config.estimated_vram(1, seq_len))
+    );
+    println!();
+
+    println!("  [1/3] Criando modelo...");
+    let start = Instant::now();
+    let model: RWKV<MyBackend> = RWKV::new(&config, &device);
+    println!(
+        "        ✓ Modelo criado em {:.2}s",
+        start.elapsed().as_secs_f64()
+    );
+
+    println!("  [2/3] Testando forward...");
+    let dummy: Tensor<MyBackend, 2, Int> = Tensor::zeros([1, seq_len], &device);
+    let start = Instant::now();
+    let logits = model.forward(dummy);
+    let [b, s, v] = logits.dims();
+    println!(
+        "        ✓ Forward OK: [{}, {}, {}] em {:.2}s",
+        b,
+        s,
+        v,
+        start.elapsed().as_secs_f64()
+    );
+
+    println!("  [3/3] Testando inferência...");
+    let dummy2: Tensor<MyBackend, 2, Int> = Tensor::zeros([1, 32], &device);
+    let start = Instant::now();
+    let _ = model.forward_inference(dummy2);
+    println!(
+        "        ✓ Inferência OK em {:.2}s",
+        start.elapsed().as_secs_f64()
+    );
+
+    println!();
+    println!("═══════════════════════════════════════════════════════════");
+    println!("  🎉 GPU suporta {} com seq_len={}!", model_size, seq_len);
+    println!("═══════════════════════════════════════════════════════════");
+}
+
+// ============ BENCHMARK ============
+fn benchmark(model_size: &str, seq_len: usize, num_iterations: usize) {
+    println!("═══════════════════════════════════════════════════════════");
+    println!("  ⚡ Benchmark de Performance");
+    println!("═══════════════════════════════════════════════════════════");
+
+    std::env::set_var("CUDA_VISIBLE_DEVICES", "0");
+
+    let device = get_device();
+    let config = get_model_config(model_size);
+
+    println!("  Modelo: {} ({} params)", model_size, format_params(config.num_parameters()));
+    println!("  Seq len: {}", seq_len);
+    println!("  Iterações: {}", num_iterations);
+    println!();
+
+    let model: RWKV<MyBackend> = RWKV::new(&config, &device);
+
+    // Warmup
+    println!("  Warmup...");
+    for _ in 0..3 {
+        let dummy: Tensor<MyBackend, 2, Int> = Tensor::zeros([1, seq_len], &device);
+        let _ = model.forward(dummy);
+    }
+
+    // Forward benchmark
+    println!("  Benchmarking forward...");
+    let mut forward_times = Vec::with_capacity(num_iterations);
+    for _ in 0..num_iterations {
+        let dummy: Tensor<MyBackend, 2, Int> = Tensor::zeros([1, seq_len], &device);
+        let start = Instant::now();
+        let _ = model.forward(dummy);
+        forward_times.push(start.elapsed().as_secs_f64());
+    }
+
+    // Inference benchmark
+    println!("  Benchmarking inference...");
+    let mut inference_times = Vec::with_capacity(num_iterations);
+    for _ in 0..num_iterations {
+        let dummy: Tensor<MyBackend, 2, Int> = Tensor::zeros([1, 32], &device);
+        let start = Instant::now();
+        let _ = model.forward_inference(dummy);
+        inference_times.push(start.elapsed().as_secs_f64());
+    }
+
+    // Stats
+    let avg_forward = forward_times.iter().sum::<f64>() / forward_times.len() as f64;
+    let avg_inference = inference_times.iter().sum::<f64>() / inference_times.len() as f64;
+    let tokens_per_sec = seq_len as f64 / avg_forward;
+
+    println!();
+    println!("═══════════════════════════════════════════════════════════");
+    println!("  📊 Resultados:");
+    println!("  Forward (seq={}): {:.2}ms avg", seq_len, avg_forward * 1000.0);
+    println!("  Inference (seq=32): {:.2}ms avg", avg_inference * 1000.0);
+    println!("  Throughput: {:.1} tokens/s", tokens_per_sec);
+    println!("═══════════════════════════════════════════════════════════");
+}
+
+// ============ FIND LR ============
+fn find_lr(data: &PathBuf, tokenizer_path: &PathBuf, model_size: &str, num_steps: usize) {
+    println!("═══════════════════════════════════════════════════════════");
+    println!("  🔍 Learning Rate Finder");
+    println!("═══════════════════════════════════════════════════════════");
+
+    std::env::set_var("CUDA_VISIBLE_DEVICES", "0");
+
+    let device = get_device();
+    let config = get_model_config(model_size);
+
+    let tokenizer = BPETokenizer::from_file(tokenizer_path.to_str().unwrap())
+        .expect("Erro carregando tokenizer");
+
+    let dataset_path = if data.join("train.bin").exists() {
+        data.join("train.bin")
+    } else {
+        data.clone()
+    };
+
+    let dataset = MmapDataset::from_file(&dataset_path, 256).expect("Erro carregando dataset");
+
+    println!("  Modelo: {}", model_size);
+    println!("  Dataset: {} tokens", format_number(dataset.num_tokens()));
+    println!("  Steps: {}", num_steps);
+    println!();
+
+    let start_lr: f64 = 1e-7;
+    let end_lr: f64 = 1e-1;  
+    let lr_mult = (end_lr / start_lr).powf(1.0 / num_steps as f64);
+
+    let mut current_lr = start_lr;
+    let mut lrs = Vec::with_capacity(num_steps);
+    let mut losses = Vec::with_capacity(num_steps);
+
+    let train_config = TrainingConfig {
+        learning_rate: start_lr,
+        batch_size: 1,
+        gradient_accumulation_steps: 1,
+        warmup_steps: 0,
+        max_steps: num_steps,
+        weight_decay: 0.0,
+        gradient_clip: 1.0,
+        save_every: num_steps + 1,
+        log_every: 1,
+        min_lr_ratio: 1.0,
+        ..Default::default()
+    };
+
+    let mut trainer: Trainer<TrainBackend> = Trainer::new(&config, train_config, device.clone());
+
+    let loader = DataLoader::new(&dataset, 1);
+
+    println!("  LR Range: {:.2e} → {:.2e}", start_lr, end_lr);
+    println!();
+
+    for (i, (inputs, targets)) in loader.into_iter().enumerate() {
+        if i >= num_steps {
+            break;
+        }
+
+        let input_tensor = create_batch_tensor::<TrainBackend>(&inputs, &device);
+        let target_tensor = create_batch_tensor::<TrainBackend>(&targets, &device);
+
+        if let Some(stats) = trainer.train_step(input_tensor, target_tensor) {
+            lrs.push(current_lr);
+            losses.push(stats.loss);
+
+            if i % 10 == 0 {
+                println!(
+                    "  Step {:>4} | LR: {:.2e} | Loss: {:.4}",
+                    i, current_lr, stats.loss
+                );
+            }
+
+            // Early stop se loss explodiu
+            if stats.loss > losses.first().unwrap_or(&10.0) * 10.0 || !stats.loss.is_finite() {
+                println!("  ⚠️ Loss explodiu, parando...");
+                break;
+            }
+
+            current_lr *= lr_mult;
+        }
+    }
+
+    // Encontra LR sugerido (menor gradiente)
+    let suggested = find_suggested_lr(&lrs, &losses);
+
+    println!();
+    println!("═══════════════════════════════════════════════════════════");
+    println!("  📊 Resultado:");
+    println!("  LR sugerido: {:.2e}", suggested);
+    println!("  (Use ~10x menor para estabilidade: {:.2e})", suggested / 10.0);
+    println!("═══════════════════════════════════════════════════════════");
+}
+
+fn find_suggested_lr(lrs: &[f64], losses: &[f32]) -> f64 {
+    if losses.len() < 5 {
+        return lrs.get(lrs.len() / 2).copied().unwrap_or(3e-4);
+    }
+
+    // Encontra ponto de maior descida
+    let mut min_grad = f32::MAX;
+    let mut best_idx = 0;
+
+    for i in 2..losses.len() - 2 {
+        let grad = (losses[i + 1] - losses[i - 1]) / 2.0;
+        if grad < min_grad && losses[i].is_finite() {
+            min_grad = grad;
+            best_idx = i;
+        }
+    }
+
+    lrs[best_idx]
 }
 
 // ============ PROCESS WIKI ============
@@ -373,14 +677,12 @@ fn process_wiki(input: &PathBuf, output: &PathBuf, min_chars: usize) {
     let start = Instant::now();
 
     for article in parser.parse_streaming(input.to_str().unwrap()) {
-        // Normaliza -> Limpa
         let normalized = normalizer.normalize(&article.text);
         let clean_text = cleaner.clean(&normalized);
 
         if clean_text.len() >= min_chars {
-            use std::io::Write;
             writeln!(current_file, "{}", clean_text).expect("Erro escrevendo");
-            writeln!(current_file).expect("Erro escrevendo newline"); // Separador de docs
+            writeln!(current_file).expect("Erro escrevendo newline");
 
             articles_in_file += 1;
             total_articles += 1;
@@ -410,8 +712,7 @@ fn process_wiki(input: &PathBuf, output: &PathBuf, min_chars: usize) {
 }
 
 fn create_output_file(output: &PathBuf, idx: usize) -> std::fs::File {
-    std::fs::File::create(output.join(format!("wiki_{:04}.txt", idx)))
-        .expect("Erro criando arquivo")
+    std::fs::File::create(output.join(format!("wiki_{:04}.txt", idx))).expect("Erro criando arquivo")
 }
 
 // ============ TRAIN TOKENIZER ============
@@ -425,7 +726,6 @@ fn train_tokenizer(corpus: &PathBuf, output: &PathBuf, vocab_size: usize) {
 
     let trainer = BPETrainer::new(vocab_size, 5);
 
-    // Coleta textos
     let texts: Vec<String> = if corpus.is_file() {
         println!("  Lendo arquivo único...");
         let content = std::fs::read_to_string(corpus).expect("Erro lendo arquivo");
@@ -474,8 +774,8 @@ fn tokenize_corpus(input: &PathBuf, output: &PathBuf, tokenizer_path: &PathBuf) 
     println!("  🔢 Tokenizando Corpus");
     println!("═══════════════════════════════════════════════════════════");
 
-    let mut tokenizer = BPETokenizer::from_file(tokenizer_path.to_str().unwrap())
-        .expect("Erro carregando tokenizer");
+    let tokenizer =
+        BPETokenizer::from_file(tokenizer_path.to_str().unwrap()).expect("Erro carregando tokenizer");
 
     let bos = tokenizer.bos_id();
     let eos = tokenizer.eos_id();
@@ -494,7 +794,6 @@ fn tokenize_corpus(input: &PathBuf, output: &PathBuf, tokenizer_path: &PathBuf) 
     let mut total_tokens = 0usize;
     let mut total_docs = 0usize;
 
-    // Processa arquivos
     let files = collect_text_files(input);
 
     for path in &files {
@@ -511,7 +810,6 @@ fn tokenize_corpus(input: &PathBuf, output: &PathBuf, tokenizer_path: &PathBuf) 
             }
         };
 
-        // Split por parágrafo duplo (documentos)
         for doc in content.split("\n\n") {
             let doc = doc.trim();
             if doc.len() < 100 {
@@ -568,21 +866,32 @@ fn train_model(
     learning_rate: f64,
     warmup_steps: usize,
     seq_len: usize,
+    eval_every: usize,
+    eval_samples: usize,
 ) {
+    std::env::set_var("CUDA_VISIBLE_DEVICES", "0");
+
+    let (safe_seq_len, safe_grad_accum) = get_safe_config(model_size, seq_len, grad_accum);
+
+    if safe_seq_len != seq_len || safe_grad_accum != grad_accum {
+        println!("  ⚠️ Config ajustada para T4 16GB:");
+        println!("     seq_len: {} -> {}", seq_len, safe_seq_len);
+        println!("     grad_accum: {} -> {}", grad_accum, safe_grad_accum);
+        println!();
+    }
+
     println!("═══════════════════════════════════════════════════════════");
     println!("  🚀 Iniciando Treinamento RWKV");
     println!("═══════════════════════════════════════════════════════════");
 
     let device = get_device();
 
-    // Carrega config do modelo
     let mut model_config = get_model_config(model_size);
-    model_config.max_seq_len = seq_len;
-    model_config.dropout = 0.05; // Dropout só no treino
+    model_config.max_seq_len = safe_seq_len;
+    model_config.dropout = 0.05;
 
-    // Valida vocab size com tokenizer
-    let tokenizer = BPETokenizer::from_file(tokenizer_path.to_str().unwrap())
-        .expect("Erro carregando tokenizer");
+    let tokenizer =
+        BPETokenizer::from_file(tokenizer_path.to_str().unwrap()).expect("Erro carregando tokenizer");
 
     if tokenizer.vocab_size() != model_config.vocab_size {
         println!(
@@ -593,7 +902,7 @@ fn train_model(
         model_config.vocab_size = tokenizer.vocab_size();
     }
 
-    let effective_batch = batch_size * grad_accum;
+    let effective_batch = batch_size * safe_grad_accum;
 
     println!(
         "  Modelo: {} ({} params)",
@@ -601,47 +910,73 @@ fn train_model(
         format_params(model_config.num_parameters())
     );
     println!(
-        "  Batch size: {} x {} = {} efetivo",
-        batch_size, grad_accum, effective_batch
+        "  VRAM estimada: {}",
+        format_bytes(model_config.estimated_vram(batch_size, safe_seq_len))
     );
-    println!("  Seq len: {}", seq_len);
+    println!(
+        "  Batch size: {} x {} = {} efetivo",
+        batch_size, safe_grad_accum, effective_batch
+    );
+    println!("  Seq len: {}", safe_seq_len);
     println!("  Learning rate: {:.2e}", learning_rate);
     println!("  Warmup: {} steps", warmup_steps);
     println!("  Max steps: {}", format_number(max_steps));
     println!("  Save every: {} steps", save_every);
+    println!("  Eval every: {} steps", eval_every);
     println!();
 
-    // Carrega dataset
+    let dataset_path = if data.join("train.bin").exists() {
+        data.join("train.bin")
+    } else if data.extension().map(|e| e == "bin").unwrap_or(false) {
+        data.clone()
+    } else {
+        panic!("❌ Dataset não encontrado em {:?}", data);
+    };
+
     let mut dataset =
-        MmapDataset::from_file(&data.join("train.bin"), seq_len).expect("Erro carregando dataset");
+        MmapDataset::from_file(&dataset_path, safe_seq_len).expect("Erro carregando dataset");
 
     if dataset.is_empty() {
         panic!(
-            "❌ Dataset vazio! Verifique seq_len ({}) e o arquivo train.bin",
-            seq_len
+            "❌ Dataset vazio! Verifique seq_len ({}) e o arquivo",
+            safe_seq_len
         );
     }
 
     dataset.shuffle(42);
-    println!("  Sequências: {}", format_number(dataset.len()));
+    println!(
+        "  Dataset: {} tokens, {} sequências",
+        format_number(dataset.num_tokens()),
+        format_number(dataset.len())
+    );
     println!();
 
     std::fs::create_dir_all(output).expect("Erro criando diretório");
 
-    // Config de treino
+    let mut metrics_file =
+        std::fs::File::create(output.join("metrics.csv")).expect("Erro criando metrics.csv");
+    writeln!(
+        metrics_file,
+        "step,loss,ppl,lr,grad_norm,tokens_per_sec,eval_loss,eval_ppl"
+    )
+    .expect("Erro escrevendo header");
+
     let train_config = TrainingConfig {
         learning_rate,
         batch_size,
-        gradient_accumulation_steps: grad_accum,
+        gradient_accumulation_steps: safe_grad_accum,
         warmup_steps,
         max_steps,
         weight_decay: 0.01,
         gradient_clip: 1.0,
         save_every,
         log_every: 10,
+        min_lr_ratio: 0.1,
+        ..Default::default()
     };
 
-    let mut trainer: Trainer<TrainBackend> = Trainer::new(&model_config, train_config, device);
+    let mut trainer: Trainer<TrainBackend> =
+        Trainer::new(&model_config, train_config, device.clone());
 
     println!("═══════════════════════════════════════════════════════════");
     println!("  Iniciando loop de treino...");
@@ -651,11 +986,26 @@ fn train_model(
     run_training_loop(
         &mut trainer,
         &mut dataset,
+        &tokenizer,
         max_steps,
         save_every,
+        eval_every,
+        eval_samples,
         batch_size,
         output,
+        &mut metrics_file,
+        &device,
     );
+}
+
+fn get_safe_config(model_size: &str, seq_len: usize, grad_accum: usize) -> (usize, usize) {
+    match model_size {
+        "800m" | "800M" => (seq_len.min(256), grad_accum.min(4)),
+        "400m" | "400M" => (seq_len.min(512), grad_accum.min(8)),
+        "1b" | "1B" => (seq_len.min(192), grad_accum.min(2)),
+        "1.5b" | "1.5B" => (seq_len.min(128), grad_accum.min(2)),
+        _ => (seq_len.min(1024), grad_accum),
+    }
 }
 
 // ============ RESUME TRAINING ============
@@ -671,6 +1021,8 @@ fn resume_training(
     learning_rate: f64,
     seq_len: usize,
 ) {
+    std::env::set_var("CUDA_VISIBLE_DEVICES", "0");
+
     println!("═══════════════════════════════════════════════════════════");
     println!("  🔄 Retomando Treinamento");
     println!("═══════════════════════════════════════════════════════════");
@@ -678,32 +1030,56 @@ fn resume_training(
 
     let device = get_device();
 
+    let (safe_seq_len, safe_grad_accum) = get_safe_config(model_size, seq_len, grad_accum);
+
     let mut model_config = get_model_config(model_size);
-    model_config.max_seq_len = seq_len;
+    model_config.max_seq_len = safe_seq_len;
     model_config.dropout = 0.05;
 
     let train_config = TrainingConfig {
         learning_rate,
         batch_size,
-        gradient_accumulation_steps: grad_accum,
-        warmup_steps: 100, // Warmup curto para resume
+        gradient_accumulation_steps: safe_grad_accum,
+        warmup_steps: 100,
         max_steps: additional_steps,
         weight_decay: 0.01,
         gradient_clip: 1.0,
         save_every,
         log_every: 10,
+        min_lr_ratio: 0.1,
+        ..Default::default()
     };
 
-    let mut trainer: Trainer<TrainBackend> = Trainer::new(&model_config, train_config, device);
+    let mut trainer: Trainer<TrainBackend> =
+        Trainer::new(&model_config, train_config, device.clone());
     trainer
         .load_checkpoint(checkpoint.to_str().unwrap())
         .expect("Erro carregando checkpoint");
 
+    let dataset_path = if data.join("train.bin").exists() {
+        data.join("train.bin")
+    } else {
+        data.clone()
+    };
+
     let mut dataset =
-        MmapDataset::from_file(&data.join("train.bin"), seq_len).expect("Erro carregando dataset");
+        MmapDataset::from_file(&dataset_path, safe_seq_len).expect("Erro carregando dataset");
     dataset.shuffle(42 + trainer.step() as u64);
 
     std::fs::create_dir_all(output).expect("Erro criando diretório");
+
+    let mut metrics_file = std::fs::OpenOptions::new()
+        .create(true)
+        .append(true)
+        .open(output.join("metrics.csv"))
+        .expect("Erro abrindo metrics.csv");
+
+    let tokenizer_path = data
+        .parent()
+        .unwrap_or(data)
+        .join("tokenizer.json");
+    let tokenizer = BPETokenizer::from_file(tokenizer_path.to_str().unwrap())
+        .unwrap_or_else(|_| BPETokenizer::from_vocab(BPEVocab::new()));
 
     println!("  Continuando do step {}...", trainer.step());
     println!();
@@ -711,10 +1087,15 @@ fn resume_training(
     run_training_loop(
         &mut trainer,
         &mut dataset,
+        &tokenizer,
         additional_steps,
         save_every,
+        500,
+        100,
         batch_size,
         output,
+        &mut metrics_file,
+        &device,
     );
 }
 
@@ -722,45 +1103,91 @@ fn resume_training(
 fn run_training_loop(
     trainer: &mut Trainer<TrainBackend>,
     dataset: &mut MmapDataset,
+    tokenizer: &BPETokenizer,
     max_steps: usize,
     save_every: usize,
+    eval_every: usize,
+    eval_samples: usize,
     batch_size: usize,
     output: &PathBuf,
+    metrics_file: &mut std::fs::File,
+    device: &<MyBackend as Backend>::Device,
 ) {
-    let device = get_device();
     let start = Instant::now();
     let initial_step = trainer.step();
 
     let mut last_log = Instant::now();
+    let mut tokens_since_log = 0usize;
     let mut epoch = 0;
 
+    let sample_prompts = ["O Brasil é", "A Constituição Federal", "Em 2024"];
+
     'training: loop {
-        // Re-shuffle a cada epoch
         dataset.shuffle(42 + epoch);
         let loader = DataLoader::new(dataset, batch_size);
 
         for (inputs, targets) in loader {
-            let input_tensor = create_batch_tensor::<TrainBackend>(&inputs, &device);
-            let target_tensor = create_batch_tensor::<TrainBackend>(&targets, &device);
+            let seq_len = inputs[0].len();
+            let input_tensor = create_batch_tensor::<TrainBackend>(&inputs, device);
+            let target_tensor = create_batch_tensor::<TrainBackend>(&targets, device);
 
-            if let Some(loss) = trainer.train_step(input_tensor, target_tensor) {
+            if let Some(stats) = trainer.train_step(input_tensor, target_tensor) {
                 let step = trainer.step();
                 let steps_done = step - initial_step;
+                tokens_since_log +=
+                    batch_size * seq_len * trainer.config().gradient_accumulation_steps;
 
-                // Log
+                // Log periódico
                 if last_log.elapsed().as_secs() >= 5 {
                     let elapsed = start.elapsed().as_secs_f64();
                     let steps_per_sec = steps_done as f64 / elapsed;
+                    let tokens_per_sec = tokens_since_log as f64 / last_log.elapsed().as_secs_f64();
                     let remaining = max_steps.saturating_sub(steps_done);
                     let eta_secs = remaining as f64 / steps_per_sec.max(0.01);
-                    let ppl = (loss as f64).exp();
+                    let ppl = (stats.loss as f64).exp();
 
                     println!(
-                        "  Step {:6} | Loss: {:.4} | PPL: {:7.2} | LR: {:.2e} | {:.2} step/s | ETA: {}",
-                        step, loss, ppl, trainer.current_lr(), steps_per_sec, format_duration(eta_secs as u64)
+                        "  Step {:>6} | Loss: {:.4} | PPL: {:>7.2} | LR: {:.2e} | Grad: {:.3} | {:.1}K tok/s | ETA: {}",
+                        step,
+                        stats.loss,
+                        ppl,
+                        stats.lr,
+                        stats.grad_norm,
+                        tokens_per_sec / 1000.0,
+                        format_duration(eta_secs as u64)
                     );
 
+                    writeln!(
+                        metrics_file,
+                        "{},{:.6},{:.2},{:.2e},{:.4},{:.1},,",
+                        step, stats.loss, ppl, stats.lr, stats.grad_norm, tokens_per_sec
+                    )
+                    .ok();
+
                     last_log = Instant::now();
+                    tokens_since_log = 0;
+                }
+
+                // Evaluation
+                if step % eval_every == 0 && step > 0 {
+                    let eval_loss = evaluate_model(trainer, dataset, eval_samples, device);
+                    let eval_ppl = (eval_loss as f64).exp();
+                    println!(
+                        "  📊 Eval Step {} | Loss: {:.4} | PPL: {:.2}",
+                        step, eval_loss, eval_ppl
+                    );
+
+                    writeln!(metrics_file, "{},,,,,,{:.6},{:.2}", step, eval_loss, eval_ppl).ok();
+
+                    // Gera samples
+                    if tokenizer.vocab_size() > 256 {
+                        println!("  📝 Samples:");
+                        for prompt in &sample_prompts {
+                            let sample = generate_sample(trainer, tokenizer, prompt, 30, device);
+                            println!("     \"{}\" → {}", prompt, sample.trim());
+                        }
+                    }
+                    println!();
                 }
 
                 // Save checkpoint
@@ -796,8 +1223,95 @@ fn run_training_loop(
     println!("  ✅ Treinamento concluído!");
     println!("  Steps: {}", trainer.step());
     println!("  Tempo: {}", format_duration(elapsed.as_secs()));
+    println!("  EMA Loss: {:.4}", trainer.ema_loss());
     println!("  Modelo: {:?}", final_path);
     println!("═══════════════════════════════════════════════════════════");
+}
+
+fn evaluate_model(
+    trainer: &Trainer<TrainBackend>,
+    dataset: &MmapDataset,
+    num_samples: usize,
+    device: &<MyBackend as Backend>::Device,
+) -> f32 {
+    let mut total_loss = 0.0f64;
+    let mut count = 0;
+
+    let start_idx = dataset.len().saturating_sub(num_samples);
+
+    for idx in start_idx..dataset.len() {
+        if let Some((input, target)) = dataset.get(idx) {
+            let input_tensor = create_batch_tensor::<TrainBackend>(&[input], device);
+            let target_tensor = create_batch_tensor::<TrainBackend>(&[target], device);
+
+            let logits = trainer.model.forward(input_tensor);
+            let loss = compute_loss::<TrainBackend>(logits, target_tensor);
+
+            total_loss += loss as f64;
+            count += 1;
+        }
+    }
+
+    (total_loss / count.max(1) as f64) as f32
+}
+
+fn compute_loss<B: Backend>(logits: Tensor<B, 3>, targets: Tensor<B, 2, Int>) -> f32 {
+    use burn::tensor::activation;
+    use burn::tensor::ElementConversion;  // ← Adicionar se não tiver no topo
+    
+    let [batch_size, seq_len, vocab_size] = logits.dims();
+    let logits_flat = logits.reshape([batch_size * seq_len, vocab_size]);
+    let targets_flat = targets.reshape([batch_size * seq_len]);
+    
+    let log_probs = activation::log_softmax(logits_flat, 1);
+    let targets_idx = targets_flat.unsqueeze_dim(1);
+    let selected = log_probs.gather(1, targets_idx);
+    
+    // Corrigido: usa elem() do trait ElementConversion
+    let loss_scalar = selected.mean().neg().into_scalar();
+    loss_scalar.elem::<f32>()
+}
+
+fn generate_sample(
+    trainer: &Trainer<TrainBackend>,
+    tokenizer: &BPETokenizer,
+    prompt: &str,
+    max_tokens: usize,
+    device: &<MyBackend as Backend>::Device,
+) -> String {
+    let mut tokens = tokenizer.encode(prompt);
+
+    for _ in 0..max_tokens {
+        if tokens.len() > 512 {
+            tokens = tokens[tokens.len() - 512..].to_vec();
+        }
+
+        let input_vec: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+        let seq_len = input_vec.len();
+
+        let input: Tensor<TrainBackend, 1, Int> = Tensor::from_ints(input_vec.as_slice(), device);
+        let input = input.reshape([1, seq_len]);
+
+        let logits = trainer.model.forward(input);
+        let [_, s, v] = logits.dims();
+        let last_logits = logits.slice([0..1, s - 1..s, 0..v]).reshape([v]);
+
+        let logits_data: Vec<f32> = last_logits.into_data().iter::<f32>().collect();
+        let next_token = logits_data
+            .iter()
+            .enumerate()
+            .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+            .map(|(i, _)| i as u16)
+            .unwrap_or(0);
+
+        if next_token == tokenizer.eos_id() {
+            break;
+        }
+
+        tokens.push(next_token);
+    }
+
+    tokenizer.decode(&tokens)
 }
 
 // ============ TEST MODEL ============
@@ -808,11 +1322,11 @@ fn test_model(model_path: &PathBuf, tokenizer_path: &PathBuf, model_size: &str) 
 
     let device = get_device();
 
-    let mut tokenizer = BPETokenizer::from_file(tokenizer_path.to_str().unwrap())
-        .expect("Erro carregando tokenizer");
+    let tokenizer =
+        BPETokenizer::from_file(tokenizer_path.to_str().unwrap()).expect("Erro carregando tokenizer");
 
     let mut config = get_model_config(model_size);
-    config.dropout = 0.0; // CRÍTICO: Dropout OFF
+    config.dropout = 0.0;
 
     let model: RWKV<MyBackend> = RWKV::new(&config, &device);
     let model = model
@@ -838,14 +1352,12 @@ fn test_model(model_path: &PathBuf, tokenizer_path: &PathBuf, model_size: &str) 
         let input_vec: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
         let seq_len = input_vec.len();
 
-        // CORREÇÃO: Especificar tipo explicitamente
         let input: Tensor<MyBackend, 1, Int> = Tensor::from_ints(input_vec.as_slice(), &device);
         let input = input.reshape([1, seq_len]);
 
         let logits = model.forward_inference(input);
         let logits_vec: Vec<f32> = logits.into_data().iter::<f32>().collect();
 
-        // Top-5
         let probs = softmax(&logits_vec);
         let mut indexed: Vec<(usize, f32)> = probs.iter().cloned().enumerate().collect();
         indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
@@ -885,11 +1397,11 @@ fn generate(
 
     let device = get_device();
 
-    let mut tokenizer = BPETokenizer::from_file(tokenizer_path.to_str().unwrap())
-        .expect("Erro carregando tokenizer");
+    let tokenizer =
+        BPETokenizer::from_file(tokenizer_path.to_str().unwrap()).expect("Erro carregando tokenizer");
 
     let mut config = get_model_config(model_size);
-    config.dropout = 0.0; // CRÍTICO
+    config.dropout = 0.0;
 
     let model: RWKV<MyBackend> = RWKV::new(&config, &device);
     let model = model
@@ -910,14 +1422,13 @@ fn generate(
         let input_vec: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
         let seq_len = input_vec.len();
 
-        // CORREÇÃO: Especificar tipo explicitamente
         let input: Tensor<MyBackend, 1, Int> = Tensor::from_ints(input_vec.as_slice(), &device);
         let input = input.reshape([1, seq_len]);
 
         let logits = model.forward_inference(input);
         let logits_vec: Vec<f32> = logits.into_data().iter::<f32>().collect();
 
-        // Apply temperature
+        // Temperature scaling
         let scaled: Vec<f32> = logits_vec.iter().map(|x| x / temperature).collect();
 
         // Top-K filtering
@@ -942,7 +1453,6 @@ fn generate(
         let sampled_idx = dist.sample(&mut rng);
         let next_token = indices[sampled_idx] as u16;
 
-        // Check EOS
         if next_token == tokenizer.eos_id() {
             break;
         }
@@ -1024,53 +1534,16 @@ fn show_info(model_size: &str) {
     println!("  max_seq_len: {}", config.max_seq_len);
     println!();
 
-    // Estimativa de memória
-    let params = config.num_parameters();
-    let mem_fp32 = params * 4;
-    let mem_fp16 = params * 2;
-    let mem_train_fp32 = mem_fp32 * 4; // pesos + grads + adam states
-    let mem_train_fp16 = mem_fp16 + mem_fp32 * 3; // mixed precision
-
-    println!("  Memória (Inferência):");
-    println!("    FP32: {}", format_bytes(mem_fp32));
-    println!("    FP16: {}", format_bytes(mem_fp16));
-    println!();
-    println!("  Memória (Treino, estimativa):");
-    println!("    FP32: {}", format_bytes(mem_train_fp32));
-    println!("    Mixed: {}", format_bytes(mem_train_fp16));
+    println!("  📦 VRAM Estimada (Treino, batch=1):");
+    for seq in [256, 512, 1024] {
+        let vram = config.estimated_vram(1, seq);
+        let fit = if vram < 15_000_000_000 { "✅ T4" } else { "❌" };
+        println!("    seq_len={}: {} {}", seq, format_bytes(vram), fit);
+    }
     println!("═══════════════════════════════════════════════════════════");
 }
 
-// ============ HELPERS ============
-fn get_model_config(model_size: &str) -> RWKVConfig {
-    match model_size {
-        "85m" | "85M" => RWKVConfig::ptbr_85m(),
-        "400m" | "400M" => RWKVConfig::ptbr_400m(),
-        "800m" | "800M" => RWKVConfig::ptbr_800m(),
-        "1b" | "1B" => RWKVConfig::ptbr_1b(),
-        "1.5b" | "1.5B" => RWKVConfig::ptbr_1_5b(),
-        _ => {
-            println!("  ⚠️ Tamanho '{}' não reconhecido, usando 85m", model_size);
-            RWKVConfig::ptbr_85m()
-        }
-    }
-}
-
-fn file_has_double_newline(path: &PathBuf) -> bool {
-    use std::io::Read;
-    let mut f = match std::fs::File::open(path) {
-        Ok(f) => f,
-        Err(_) => return false,
-    };
-    let mut buf = vec![0u8; 1024 * 1024]; // 1MB
-    let n = match f.read(&mut buf) {
-        Ok(n) => n,
-        Err(_) => return false,
-    };
-    buf.truncate(n);
-    buf.windows(2).any(|w| w == b"\n\n")
-}
-
+// ============ BUILD DATASET ============
 fn build_dataset(
     tokenizer_path: &PathBuf,
     output_bin: &PathBuf,
@@ -1078,9 +1551,8 @@ fn build_dataset(
     min_chars: usize,
     blocks: bool,
     clean: bool,
-    seed: u64,
+    _seed: u64,
 ) {
-    // <-- ADD THIS BRACE
     use std::io::{BufRead, BufReader};
 
     println!("═══════════════════════════════════════════════════════════");
@@ -1094,12 +1566,10 @@ fn build_dataset(
         if blocks { "blocks(\\n\\n)" } else { "lines" }
     );
     println!("  clean: {}", clean);
-    println!("  seed: {}", seed);
     println!();
 
-    // Carrega tokenizer
-    let mut tokenizer = BPETokenizer::from_file(tokenizer_path.to_str().unwrap())
-        .expect("Erro carregando tokenizer");
+    let tokenizer =
+        BPETokenizer::from_file(tokenizer_path.to_str().unwrap()).expect("Erro carregando tokenizer");
     let bos = tokenizer.bos_id();
     let eos = tokenizer.eos_id();
 
@@ -1111,21 +1581,18 @@ fn build_dataset(
     let normalizer = PTBRNormalizer::new();
     let cleaner = WikiCleaner::new();
 
-    // Writer direto no binário final
     if let Some(parent) = output_bin.parent() {
         std::fs::create_dir_all(parent).expect("Erro criando diretório de saída");
     }
     let mut writer =
         TokenizedDatasetWriter::new(output_bin.as_path()).expect("Erro criando train.bin");
 
-    // Parse sources
     let mut parsed: Vec<(PathBuf, usize)> = Vec::new();
     for s in sources {
         let (path, weight) = parse_source_spec(s);
         parsed.push((path, weight));
     }
 
-    // Ordem determinística
     let mut total_docs = 0usize;
     let mut total_tokens = 0usize;
 
@@ -1173,7 +1640,7 @@ fn build_dataset(
                                 clean,
                                 &normalizer,
                                 &cleaner,
-                                &mut tokenizer,
+                                &tokenizer,
                                 &mut writer,
                                 bos,
                                 eos,
@@ -1191,7 +1658,7 @@ fn build_dataset(
                                 clean,
                                 &normalizer,
                                 &cleaner,
-                                &mut tokenizer,
+                                &tokenizer,
                                 &mut writer,
                                 bos,
                                 eos,
@@ -1236,7 +1703,7 @@ fn build_dataset(
                     }
                 }
             }
-        } // <-- ADDED: closes `for w in 0..weight`
+        }
     }
 
     let written = writer.finish().expect("Erro finalizando writer");
@@ -1252,10 +1719,7 @@ fn build_dataset(
 }
 
 fn parse_source_spec(s: &str) -> (PathBuf, usize) {
-    // formato: PATH:WEIGHT
-    // se não tiver :WEIGHT => weight=1
     if let Some((a, b)) = s.rsplit_once(':') {
-        // tenta parse weight
         if let Ok(w) = b.parse::<usize>() {
             return (PathBuf::from(a), w.max(1));
         }
@@ -1282,13 +1746,28 @@ fn collect_txt_files_sorted(path: &PathBuf) -> Vec<PathBuf> {
     files
 }
 
+fn file_has_double_newline(path: &PathBuf) -> bool {
+    use std::io::Read;
+    let mut f = match std::fs::File::open(path) {
+        Ok(f) => f,
+        Err(_) => return false,
+    };
+    let mut buf = vec![0u8; 1024 * 1024];
+    let n = match f.read(&mut buf) {
+        Ok(n) => n,
+        Err(_) => return false,
+    };
+    buf.truncate(n);
+    buf.windows(2).any(|w| w == b"\n\n")
+}
+
 fn flush_doc(
     doc: &mut String,
     min_chars: usize,
     clean: bool,
     normalizer: &PTBRNormalizer,
     cleaner: &WikiCleaner,
-    tokenizer: &mut BPETokenizer,
+    tokenizer: &BPETokenizer,
     writer: &mut TokenizedDatasetWriter,
     bos: u16,
     eos: u16,
@@ -1318,72 +1797,7 @@ fn flush_doc(
     *total_tokens += toks.len();
 }
 
-fn create_batch_tensor<B: Backend>(data: &[Vec<u16>], device: &B::Device) -> Tensor<B, 2, Int> {
-    let batch_size = data.len();
-    let seq_len = data[0].len();
-
-    let flat: Vec<i32> = data.iter().flatten().map(|&x| x as i32).collect();
-
-    // CORREÇÃO: Criar tensor 1D primeiro, depois reshape
-    let tensor: Tensor<B, 1, Int> = Tensor::from_ints(flat.as_slice(), device);
-    tensor.reshape([batch_size, seq_len])
-}
-
-fn softmax(logits: &[f32]) -> Vec<f32> {
-    let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-    let exp: Vec<f32> = logits.iter().map(|x| (x - max).exp()).collect();
-    let sum: f32 = exp.iter().sum();
-    exp.iter().map(|x| x / sum).collect()
-}
-
-fn format_params(n: usize) -> String {
-    if n >= 1_000_000_000 {
-        format!("{:.2}B", n as f64 / 1e9)
-    } else if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1e6)
-    } else if n >= 1_000 {
-        format!("{:.1}K", n as f64 / 1e3)
-    } else {
-        n.to_string()
-    }
-}
-
-fn format_number(n: usize) -> String {
-    if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1e6)
-    } else if n >= 1_000 {
-        format!("{:.1}K", n as f64 / 1e3)
-    } else {
-        n.to_string()
-    }
-}
-
-fn format_bytes(n: usize) -> String {
-    if n >= 1_000_000_000 {
-        format!("{:.2}GB", n as f64 / 1e9)
-    } else if n >= 1_000_000 {
-        format!("{:.1}MB", n as f64 / 1e6)
-    } else if n >= 1_000 {
-        format!("{:.1}KB", n as f64 / 1e3)
-    } else {
-        format!("{}B", n)
-    }
-}
-
-fn format_duration(secs: u64) -> String {
-    let h = secs / 3600;
-    let m = (secs % 3600) / 60;
-    let s = secs % 60;
-    if h > 0 {
-        format!("{}h{}m{}s", h, m, s)
-    } else if m > 0 {
-        format!("{}m{}s", m, s)
-    } else {
-        format!("{}s", s)
-    }
-}
-// ============ AUDIT CORPUS (FISCAL DE QUALIDADE) ============
-
+// ============ AUDIT CORPUS ============
 struct FileAudit {
     path: PathBuf,
     score: f32,
@@ -1397,32 +1811,31 @@ fn audit_corpus_cmd(input: &PathBuf, output: &PathBuf) {
     println!("  🕵️  Auditoria Profunda de Corpus (Quality Score)");
     println!("═══════════════════════════════════════════════════════════");
 
-    // Coleta arquivos
     let files = collect_all_txt_files(input);
     println!("  Arquivos encontrados: {}", files.len());
-    println!("  Analisando paralelamente (Fiscal Elite)...");
+    println!("  Analisando paralelamente...");
 
-    // Processamento Paralelo
-    let mut results: Vec<FileAudit> = files.par_iter()
-        .map(|path| analyze_file_quality(path))
-        .collect();
+    let mut results: Vec<FileAudit> = files.par_iter().map(|path| analyze_file_quality(path)).collect();
 
-    // Ordena por score (piores primeiro) para facilitar visualização
     results.sort_by(|a, b| a.score.partial_cmp(&b.score).unwrap());
 
-    // Relatório
     let mut approved = 0;
     let mut rejected = 0;
     let mut report_file = std::fs::File::create(output).expect("Erro criando report");
-    
+
     writeln!(report_file, "SCORE\tPATH\tISSUES").unwrap();
-    
+
     for r in &results {
         if r.score >= 50.0 {
             approved += 1;
         } else {
             rejected += 1;
-            println!("❌ REJEITADO ({:.1}): {:?} -> {:?}", r.score, r.path.file_name().unwrap(), r.issues);
+            println!(
+                "❌ REJEITADO ({:.1}): {:?} -> {:?}",
+                r.score,
+                r.path.file_name().unwrap(),
+                r.issues
+            );
         }
         writeln!(report_file, "{:.1}\t{:?}\t{:?}", r.score, r.path, r.issues).unwrap();
     }
@@ -1457,20 +1870,37 @@ fn collect_all_txt_files(path: &PathBuf) -> Vec<PathBuf> {
 fn analyze_file_quality(path: &PathBuf) -> FileAudit {
     let mut issues = Vec::new();
     let mut score: f32 = 100.0;
-    
+
     let content = match std::fs::read_to_string(path) {
         Ok(c) => c,
-        Err(_) => return FileAudit { path: path.clone(), score: 0.0, issues: vec!["Erro leitura".into()], bytes: 0 },
+        Err(_) => {
+            return FileAudit {
+                path: path.clone(),
+                score: 0.0,
+                issues: vec!["Erro leitura".into()],
+                bytes: 0,
+            }
+        }
     };
 
     let len = content.len();
     if len < 500 {
-        return FileAudit { path: path.clone(), score: 0.0, issues: vec!["Muito curto".into()], bytes: len as u64 };
+        return FileAudit {
+            path: path.clone(),
+            score: 0.0,
+            issues: vec!["Muito curto".into()],
+            bytes: len as u64,
+        };
     }
 
-    // 1. Encoding (Mojibake)
+    // Encoding (Mojibake)
     if content.contains("Ã£") || content.contains("Ã©") || content.contains("Ã³") {
-        return FileAudit { path: path.clone(), score: 0.0, issues: vec!["Encoding quebrado".into()], bytes: len as u64 };
+        return FileAudit {
+            path: path.clone(),
+            score: 0.0,
+            issues: vec!["Encoding quebrado".into()],
+            bytes: len as u64,
+        };
     }
 
     let lower = content.to_lowercase();
@@ -1482,23 +1912,25 @@ fn analyze_file_quality(path: &PathBuf) -> FileAudit {
         issues.push("Poucas palavras".into());
     }
 
-    // 2. Stopwords Ratio
-    let stopwords = [" o ", " a ", " de ", " que ", " e ", " do ", " da ", " em ", " um ", " para "];
+    // Stopwords Ratio
+    let stopwords = [
+        " o ", " a ", " de ", " que ", " e ", " do ", " da ", " em ", " um ", " para ",
+    ];
     let mut stop_count = 0;
     for s in stopwords {
         stop_count += lower.matches(s).count();
     }
     let stop_ratio = stop_count as f32 / word_count.max(1) as f32;
 
-    if stop_ratio < 0.05 { 
+    if stop_ratio < 0.05 {
         score -= 40.0;
         issues.push("Texto não-natural (sem conectivos)".into());
-    } else if stop_ratio > 0.6 { 
+    } else if stop_ratio > 0.6 {
         score -= 30.0;
         issues.push("Repetitivo demais".into());
     }
 
-    // 3. Riqueza Lexical
+    // Riqueza Lexical
     let unique_words: HashSet<&str> = words.iter().cloned().collect();
     let ttr = unique_words.len() as f32 / word_count.max(1) as f32;
 
@@ -1507,7 +1939,7 @@ fn analyze_file_quality(path: &PathBuf) -> FileAudit {
         issues.push("Vocabulário pobre".into());
     }
 
-    // 4. Frases
+    // Frases
     let sentences: Vec<&str> = content.split(|c| c == '.' || c == '!' || c == '?').collect();
     let avg_sentence_len = word_count as f32 / sentences.len().max(1) as f32;
 
@@ -1519,38 +1951,37 @@ fn analyze_file_quality(path: &PathBuf) -> FileAudit {
         issues.push("Frases longas demais".into());
     }
 
-    // 5. Markup
-    let symbols = content.chars().filter(|c| "{[]}<>@#$%=|\\".contains(*c)).count();
+    // Markup
+    let symbols = content
+        .chars()
+        .filter(|c| "{[]}<>@#$%=|\\".contains(*c))
+        .count();
     let symbol_ratio = symbols as f32 / len as f32;
-    if symbol_ratio > 0.05 { 
+    if symbol_ratio > 0.05 {
         score -= 30.0;
         issues.push("Markup/Código".into());
     }
 
-    // 6. Línguas Estrangeiras
+    // Línguas Estrangeiras
     let en_markers = [" the ", " and ", " is ", " with ", " for "];
     let mut en_count = 0;
-    for m in en_markers { en_count += lower.matches(m).count(); }
-    
+    for m in en_markers {
+        en_count += lower.matches(m).count();
+    }
+
     let es_markers = [" y ", " el ", " los ", " las ", " una "];
     let mut es_count = 0;
-    for m in es_markers { es_count += lower.matches(m).count(); }
+    for m in es_markers {
+        es_count += lower.matches(m).count();
+    }
 
-    let fr_markers = [" le ", " la ", " et ", " du ", " dans "];
-    let mut fr_count = 0;
-    for m in fr_markers { fr_count += lower.matches(m).count(); }
-
-    if en_count > stop_count { 
+    if en_count > stop_count {
         score = 0.0;
         issues.push("Inglês".into());
     }
     if es_count > stop_count / 2 {
         score -= 60.0;
         issues.push("Espanhol".into());
-    }
-    if fr_count > stop_count / 2 {
-        score -= 60.0;
-        issues.push("Francês".into());
     }
 
     FileAudit {
@@ -1559,4 +1990,36 @@ fn analyze_file_quality(path: &PathBuf) -> FileAudit {
         issues,
         bytes: len as u64,
     }
+}
+
+// ============ HELPERS ============
+fn get_model_config(model_size: &str) -> RWKVConfig {
+    match model_size {
+        "85m" | "85M" => RWKVConfig::ptbr_85m(),
+        "400m" | "400M" => RWKVConfig::ptbr_400m(),
+        "800m" | "800M" => RWKVConfig::ptbr_800m(),
+        "1b" | "1B" => RWKVConfig::ptbr_1b(),
+        "1.5b" | "1.5B" => RWKVConfig::ptbr_1_5b(),
+        _ => {
+            println!("  ⚠️ Tamanho '{}' não reconhecido, usando 85m", model_size);
+            RWKVConfig::ptbr_85m()
+        }
+    }
+}
+
+fn create_batch_tensor<B: Backend>(data: &[Vec<u16>], device: &B::Device) -> Tensor<B, 2, Int> {
+    let batch_size = data.len();
+    let seq_len = data[0].len();
+
+    let flat: Vec<i32> = data.iter().flatten().map(|&x| x as i32).collect();
+
+    let tensor: Tensor<B, 1, Int> = Tensor::from_ints(flat.as_slice(), device);
+    tensor.reshape([batch_size, seq_len])
+}
+
+fn softmax(logits: &[f32]) -> Vec<f32> {
+    let max = logits.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+    let exp: Vec<f32> = logits.iter().map(|x| (x - max).exp()).collect();
+    let sum: f32 = exp.iter().sum();
+    exp.iter().map(|x| x / sum).collect()
 }

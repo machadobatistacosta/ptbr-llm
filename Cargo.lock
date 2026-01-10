@@ -1833,6 +1833,7 @@ dependencies = [
  "crossbeam-channel",
  "memmap2",
  "once_cell",
+ "parking_lot",
  "quick-xml",
  "rand 0.8.5",
  "rand_chacha 0.3.1",
