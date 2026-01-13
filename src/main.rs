@@ -1068,8 +1068,23 @@ fn run_training_loop(
     'training: loop {
         dataset.shuffle(42 + epoch);
         let loader = DataLoader::new(dataset, batch_size);
+        let total_batches = loader.total_batches();
+        let mut batch_count = 0;
+
+        if epoch == 0 && trainer.step() == 0 {
+            println!("  📦 Processando {} batches no primeiro epoch...", total_batches);
+            std::io::stdout().flush().unwrap();
+        }
 
         for (inputs, targets) in loader {
+            batch_count += 1;
+            
+            // Log progresso durante processamento inicial
+            if trainer.step() == 0 && batch_count % 50 == 0 {
+                println!("  ⏳ Processando batch {}/{}...", batch_count, total_batches);
+                std::io::stdout().flush().unwrap();
+            }
+            
             let seq_len = inputs[0].len();
             let input_tensor = create_batch_tensor::<TrainBackend>(&inputs, device);
             let target_tensor = create_batch_tensor::<TrainBackend>(&targets, device);
@@ -1080,8 +1095,14 @@ fn run_training_loop(
                 tokens_since_log +=
                     batch_size * seq_len * trainer.config().gradient_accumulation_steps;
 
+                // Log imediato no primeiro step
+                if step == 1 {
+                    println!("  ✅ Primeiro step completo! Loss inicial: {:.4}", stats.loss);
+                    std::io::stdout().flush().unwrap();
+                }
+
                 // Log periódico
-                if last_log.elapsed().as_secs() >= 5 {
+                if last_log.elapsed().as_secs() >= 5 || step == 1 {
                     let elapsed = start.elapsed().as_secs_f64();
                     let steps_per_sec = steps_done as f64 / elapsed;
                     let tokens_per_sec = tokens_since_log as f64 / last_log.elapsed().as_secs_f64();
