@@ -1,5 +1,3 @@
-#![allow(dead_code)]
-#![allow(unused_imports)]
 
 mod data;
 mod model;
@@ -17,7 +15,7 @@ use rayon::prelude::*;
 use burn::backend::Autodiff;
 use burn::module::Module;
 use burn::record::CompactRecorder;
-use burn::tensor::{backend::Backend, ElementConversion, Int, Tensor};
+use burn::tensor::{backend::Backend, Int, Tensor};
 
 // Utils
 use utils::{format_bytes, format_duration, format_number, format_params};
@@ -73,7 +71,7 @@ type TrainBackend = Autodiff<MyBackend>;
 
 // ============ IMPORTS DO PROJETO ============
 use data::{DataLoader, MmapDataset, TokenizedDatasetWriter, WikiCleaner, WikiStreamParser};
-use model::{RWKVConfig, Trainer, TrainingConfig, RWKV};
+use model::{RWKVConfig, Trainer, TrainingConfig, RWKV, find_lr as find_lr_fn, LRFinderResult, Evaluator, RWKVState};
 use tokenizer::{BPETokenizer, BPETrainer, PTBRNormalizer};
 
 use rand::distributions::WeightedIndex;
@@ -537,7 +535,7 @@ fn benchmark(model_size: &str, seq_len: usize, num_iterations: usize) {
 }
 
 // ============ FIND LR ============
-fn find_lr(data: &PathBuf, tokenizer_path: &PathBuf, model_size: &str, num_steps: usize) {
+fn find_lr(data: &PathBuf, _tokenizer_path: &PathBuf, model_size: &str, num_steps: usize) {
     println!("═══════════════════════════════════════════════════════════");
     println!("  🔍 Learning Rate Finder");
     println!("═══════════════════════════════════════════════════════════");
@@ -546,9 +544,6 @@ fn find_lr(data: &PathBuf, tokenizer_path: &PathBuf, model_size: &str, num_steps
 
     let device = get_device();
     let config = get_model_config(model_size);
-
-    let tokenizer = BPETokenizer::from_file(tokenizer_path.to_str().unwrap())
-        .expect("Erro carregando tokenizer");
 
     let dataset_path = if data.join("train.bin").exists() {
         data.join("train.bin")
@@ -564,92 +559,37 @@ fn find_lr(data: &PathBuf, tokenizer_path: &PathBuf, model_size: &str, num_steps
     println!();
 
     let start_lr: f64 = 1e-7;
-    let end_lr: f64 = 1e-1;  
-    let lr_mult = (end_lr / start_lr).powf(1.0 / num_steps as f64);
-
-    let mut current_lr = start_lr;
-    let mut lrs = Vec::with_capacity(num_steps);
-    let mut losses = Vec::with_capacity(num_steps);
-
-    let train_config = TrainingConfig {
-        learning_rate: start_lr,
-        batch_size: 1,
-        gradient_accumulation_steps: 1,
-        warmup_steps: 0,
-        max_steps: num_steps,
-        weight_decay: 0.0,
-        gradient_clip: 1.0,
-        save_every: num_steps + 1,
-        log_every: 1,
-        min_lr_ratio: 1.0,
-        ..Default::default()
-    };
-
-    let mut trainer: Trainer<TrainBackend> = Trainer::new(&config, train_config, device.clone());
-
-    let loader = DataLoader::new(&dataset, 1);
+    let end_lr: f64 = 1e-1;
 
     println!("  LR Range: {:.2e} → {:.2e}", start_lr, end_lr);
     println!();
 
-    for (i, (inputs, targets)) in loader.into_iter().enumerate() {
-        if i >= num_steps {
-            break;
-        }
+    // Usa função do módulo lr_finder
+    let result: LRFinderResult = find_lr_fn::<TrainBackend>(
+        &config,
+        &dataset,
+        &device,
+        start_lr,
+        end_lr,
+        num_steps,
+    );
 
-        let input_tensor = create_batch_tensor::<TrainBackend>(&inputs, &device);
-        let target_tensor = create_batch_tensor::<TrainBackend>(&targets, &device);
-
-        if let Some(stats) = trainer.train_step(input_tensor, target_tensor) {
-            lrs.push(current_lr);
-            losses.push(stats.loss);
-
-            if i % 10 == 0 {
-                println!(
-                    "  Step {:>4} | LR: {:.2e} | Loss: {:.4}",
-                    i, current_lr, stats.loss
-                );
-            }
-
-            // Early stop se loss explodiu
-            if stats.loss > losses.first().unwrap_or(&10.0) * 10.0 || !stats.loss.is_finite() {
-                println!("  ⚠️ Loss explodiu, parando...");
-                break;
-            }
-
-            current_lr *= lr_mult;
+    // Log durante execução
+    for (i, (lr, loss)) in result.lrs.iter().zip(result.losses.iter()).enumerate() {
+        if i % 10 == 0 {
+            println!(
+                "  Step {:>4} | LR: {:.2e} | Loss: {:.4}",
+                i, lr, loss
+            );
         }
     }
-
-    // Encontra LR sugerido (menor gradiente)
-    let suggested = find_suggested_lr(&lrs, &losses);
 
     println!();
     println!("═══════════════════════════════════════════════════════════");
     println!("  📊 Resultado:");
-    println!("  LR sugerido: {:.2e}", suggested);
-    println!("  (Use ~10x menor para estabilidade: {:.2e})", suggested / 10.0);
+    println!("  LR sugerido: {:.2e}", result.suggested_lr);
+    println!("  (Use ~10x menor para estabilidade: {:.2e})", result.suggested_lr / 10.0);
     println!("═══════════════════════════════════════════════════════════");
-}
-
-fn find_suggested_lr(lrs: &[f64], losses: &[f32]) -> f64 {
-    if losses.len() < 5 {
-        return lrs.get(lrs.len() / 2).copied().unwrap_or(3e-4);
-    }
-
-    // Encontra ponto de maior descida
-    let mut min_grad = f32::MAX;
-    let mut best_idx = 0;
-
-    for i in 2..losses.len() - 2 {
-        let grad = (losses[i + 1] - losses[i - 1]) / 2.0;
-        if grad < min_grad && losses[i].is_finite() {
-            min_grad = grad;
-            best_idx = i;
-        }
-    }
-
-    lrs[best_idx]
 }
 
 // ============ PROCESS WIKI ============
@@ -1121,6 +1061,9 @@ fn run_training_loop(
     let mut epoch = 0;
 
     let sample_prompts = ["O Brasil é", "A Constituição Federal", "Em 2024"];
+    
+    // Cria evaluator para métricas de validação
+    let evaluator = Evaluator::new(eval_samples);
 
     'training: loop {
         dataset.shuffle(42 + epoch);
@@ -1170,14 +1113,17 @@ fn run_training_loop(
 
                 // Evaluation
                 if step % eval_every == 0 && step > 0 {
-                    let eval_loss = evaluate_model(trainer, dataset, eval_samples, device);
-                    let eval_ppl = (eval_loss as f64).exp();
+                    let eval_metrics = evaluator.evaluate(&trainer.model, dataset, device);
                     println!(
-                        "  📊 Eval Step {} | Loss: {:.4} | PPL: {:.2}",
-                        step, eval_loss, eval_ppl
+                        "  📊 Eval Step {} | {}",
+                        step, eval_metrics
                     );
 
-                    writeln!(metrics_file, "{},,,,,,{:.6},{:.2}", step, eval_loss, eval_ppl).ok();
+                    writeln!(
+                        metrics_file, 
+                        "{},,,,,,{:.6},{:.2}",
+                        step, eval_metrics.loss, eval_metrics.perplexity
+                    ).ok();
 
                     // Gera samples
                     if tokenizer.vocab_size() > 256 {
@@ -1228,49 +1174,6 @@ fn run_training_loop(
     println!("═══════════════════════════════════════════════════════════");
 }
 
-fn evaluate_model(
-    trainer: &Trainer<TrainBackend>,
-    dataset: &MmapDataset,
-    num_samples: usize,
-    device: &<MyBackend as Backend>::Device,
-) -> f32 {
-    let mut total_loss = 0.0f64;
-    let mut count = 0;
-
-    let start_idx = dataset.len().saturating_sub(num_samples);
-
-    for idx in start_idx..dataset.len() {
-        if let Some((input, target)) = dataset.get(idx) {
-            let input_tensor = create_batch_tensor::<TrainBackend>(&[input], device);
-            let target_tensor = create_batch_tensor::<TrainBackend>(&[target], device);
-
-            let logits = trainer.model.forward(input_tensor);
-            let loss = compute_loss::<TrainBackend>(logits, target_tensor);
-
-            total_loss += loss as f64;
-            count += 1;
-        }
-    }
-
-    (total_loss / count.max(1) as f64) as f32
-}
-
-fn compute_loss<B: Backend>(logits: Tensor<B, 3>, targets: Tensor<B, 2, Int>) -> f32 {
-    use burn::tensor::activation;
-    use burn::tensor::ElementConversion;  // ← Adicionar se não tiver no topo
-    
-    let [batch_size, seq_len, vocab_size] = logits.dims();
-    let logits_flat = logits.reshape([batch_size * seq_len, vocab_size]);
-    let targets_flat = targets.reshape([batch_size * seq_len]);
-    
-    let log_probs = activation::log_softmax(logits_flat, 1);
-    let targets_idx = targets_flat.unsqueeze_dim(1);
-    let selected = log_probs.gather(1, targets_idx);
-    
-    // Corrigido: usa elem() do trait ElementConversion
-    let loss_scalar = selected.mean().neg().into_scalar();
-    loss_scalar.elem::<f32>()
-}
 
 fn generate_sample(
     trainer: &Trainer<TrainBackend>,
@@ -1418,14 +1321,31 @@ fn generate(
     print!("{}", prompt);
     std::io::stdout().flush().unwrap();
 
+    // Inicializa estado para inferência incremental
+    let mut state = RWKVState::new(config.n_layers, config.d_model, 1, &device);
+
+    // Processa prompt inicial para inicializar o estado
+    if !tokens.is_empty() {
+        // Processa prompt token por token para inicializar estado
+        for &token in &tokens {
+            let token_array = [token as i32];
+            let token_tensor_1d: Tensor<MyBackend, 1, Int> = 
+                Tensor::from_ints(token_array.as_slice(), &device);
+            let token_tensor: Tensor<MyBackend, 2, Int> = token_tensor_1d.reshape([1, 1]);
+            let _ = model.forward_step(token_tensor, &mut state);
+        }
+    }
+
+    // Gera tokens incrementalmente
     for _ in 0..max_tokens {
-        let input_vec: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
-        let seq_len = input_vec.len();
+        // Usa último token para gerar próximo
+        let last_token = tokens[tokens.len() - 1];
+        let token_array = [last_token as i32];
+        let token_tensor_1d: Tensor<MyBackend, 1, Int> = 
+            Tensor::from_ints(token_array.as_slice(), &device);
+        let token_tensor: Tensor<MyBackend, 2, Int> = token_tensor_1d.reshape([1, 1]);
 
-        let input: Tensor<MyBackend, 1, Int> = Tensor::from_ints(input_vec.as_slice(), &device);
-        let input = input.reshape([1, seq_len]);
-
-        let logits = model.forward_inference(input);
+        let logits = model.forward_step(token_tensor, &mut state);
         let logits_vec: Vec<f32> = logits.into_data().iter::<f32>().collect();
 
         // Temperature scaling

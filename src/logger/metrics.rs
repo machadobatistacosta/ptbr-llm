@@ -7,12 +7,14 @@ use std::path::Path;
 use std::time::Instant;
 
 /// Logger de treino para arquivo de texto
+#[allow(dead_code)]
 pub struct TrainLogger {
     file: File,
     start_time: Instant,
     log_every: usize,
 }
 
+#[allow(dead_code)]
 impl TrainLogger {
     /// Cria novo logger
     pub fn new(output_dir: &Path, log_every: usize) -> std::io::Result<Self> {
@@ -104,11 +106,14 @@ impl TrainLogger {
 }
 
 /// CSV de métricas para análise posterior
+#[allow(dead_code)]
 pub struct MetricsCSV {
     file: File,
+    #[allow(dead_code)]
     has_header: bool,
 }
 
+#[allow(dead_code)]
 impl MetricsCSV {
     /// Cria novo arquivo CSV de métricas
     pub fn new(output_dir: &Path) -> std::io::Result<Self> {
@@ -202,6 +207,7 @@ impl MetricsCSV {
 }
 
 /// Estatísticas agregadas de treino
+#[allow(dead_code)]
 #[derive(Debug, Clone, Default)]
 pub struct TrainingStats {
     pub total_steps: usize,
@@ -213,6 +219,7 @@ pub struct TrainingStats {
     pub training_time_secs: u64,
 }
 
+#[allow(dead_code)]
 impl TrainingStats {
     pub fn new() -> Self {
         Self {

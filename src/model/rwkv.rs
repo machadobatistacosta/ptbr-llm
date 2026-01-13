@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 
 use super::config::RWKVConfig;
 use burn::{
@@ -19,8 +18,9 @@ const WKV_CHUNK_SIZE: usize = 32;
 /// Estado do RWKV para inferência incremental
 #[derive(Clone, Debug)]
 pub struct RWKVState<B: Backend> {
-    pub time_state: Vec<(Tensor<B, 2>, Tensor<B, 2>, Tensor<B, 2>)>,
-    pub channel_state: Vec<Tensor<B, 2>>,
+    pub time_state: Vec<(Tensor<B, 2>, Tensor<B, 2>, Tensor<B, 2>)>, // (aa, bb, pp) para WKV
+    pub channel_state: Vec<Tensor<B, 2>>, // Estado anterior para ChannelMixing
+    pub prev_embedding: Vec<Tensor<B, 2>>, // Embedding anterior para token_shift
 }
 
 impl<B: Backend> RWKVState<B> {
@@ -36,6 +36,9 @@ impl<B: Backend> RWKVState<B> {
                 })
                 .collect(),
             channel_state: (0..n_layers)
+                .map(|_| Tensor::zeros([batch_size, d_model], device))
+                .collect(),
+            prev_embedding: (0..n_layers)
                 .map(|_| Tensor::zeros([batch_size, d_model], device))
                 .collect(),
         }
@@ -109,8 +112,40 @@ impl<B: Backend> RWKV<B> {
         logits.slice([0..b, s - 1..s, 0..v]).reshape([b, v])
     }
 
+    /// Forward incremental - processa um único token usando estado
+    pub fn forward_step(&self, token_id: Tensor<B, 2, Int>, state: &mut RWKVState<B>) -> Tensor<B, 2> {
+        let [b, _] = token_id.dims();
+        
+        // Embedding + LayerNorm
+        let mut x = self.embedding.forward(token_id);
+        x = self.ln_pre.forward(x);
+        let x = x.reshape([b, self.d_model]); // [B, C]
+
+        // Processa através dos blocos incrementalmente
+        let mut x = x;
+        for (layer_idx, block) in self.blocks.iter().enumerate() {
+            let prev_emb = state.prev_embedding[layer_idx].clone();
+            x = block.forward_step(
+                x, 
+                &mut state.time_state[layer_idx], 
+                &mut state.channel_state[layer_idx],
+                prev_emb
+            );
+            // Atualiza embedding anterior para próximo token
+            state.prev_embedding[layer_idx] = x.clone();
+        }
+
+        // LayerNorm final + Head
+        let x = x.reshape([b, 1, self.d_model]);
+        let x = self.ln_out.forward(x);
+        self.head.forward(x).reshape([b, self.vocab_size])
+    }
+
+    #[allow(dead_code)]
     pub fn vocab_size(&self) -> usize { self.vocab_size }
+    #[allow(dead_code)]
     pub fn d_model(&self) -> usize { self.d_model }
+    #[allow(dead_code)]
     pub fn n_layers(&self) -> usize { self.n_layers }
 }
 
@@ -151,6 +186,28 @@ impl<B: Backend> RWKVBlock<B> {
 
         let cm = self.channel_mixing.forward(self.ln2.forward(x.clone()));
         x + self.dropout.forward(cm)
+    }
+
+    /// Forward incremental - processa um único token [B, C]
+    pub fn forward_step(
+        &self,
+        x: Tensor<B, 2>,
+        time_state: &mut (Tensor<B, 2>, Tensor<B, 2>, Tensor<B, 2>),
+        channel_state: &mut Tensor<B, 2>,
+        prev_embedding: Tensor<B, 2>,
+    ) -> Tensor<B, 2> {
+        let [b, c] = x.dims();
+        
+        // Time Mixing incremental
+        let x_3d = x.clone().reshape([b, 1, c]);
+        let ln1_out = self.ln1.forward(x_3d).reshape([b, c]);
+        let tm = self.time_mixing.forward_step(ln1_out, time_state, prev_embedding);
+        let x = x + tm; // Residual
+
+        // Channel Mixing incremental
+        let ln2_out = self.ln2.forward(x.clone().reshape([b, 1, c])).reshape([b, c]);
+        let cm = self.channel_mixing.forward_step(ln2_out, channel_state);
+        x + cm // Residual
     }
 }
 
@@ -242,6 +299,80 @@ impl<B: Backend> TimeMixing<B> {
 
         // Output
         self.output.forward(r * wkv)
+    }
+
+    /// Forward incremental - processa um único token [B, C] usando estado
+    pub fn forward_step(
+        &self,
+        x: Tensor<B, 2>,
+        state: &mut (Tensor<B, 2>, Tensor<B, 2>, Tensor<B, 2>),
+        prev_embedding: Tensor<B, 2>,
+    ) -> Tensor<B, 2> {
+        let [b, c] = x.dims();
+        
+        // x_prev é o embedding anterior (zero no primeiro token)
+        let x_prev = prev_embedding;
+
+        let xk = self.mix_single(x.clone(), x_prev.clone(), self.time_mix_k.val(), c);
+        let xv = self.mix_single(x.clone(), x_prev.clone(), self.time_mix_v.val(), c);
+        let xr = self.mix_single(x, x_prev, self.time_mix_r.val(), c);
+
+        // Projections
+        let r = activation::sigmoid(self.receptance.forward(xr.reshape([b, 1, c])).reshape([b, c]));
+        let k = self.key.forward(xk.reshape([b, 1, c])).reshape([b, c]);
+        let v = self.value.forward(xv.reshape([b, 1, c])).reshape([b, c]);
+
+        // WKV incremental
+        let wkv = self.wkv_step(k, v, state);
+
+        // Output
+        self.output.forward((r * wkv).reshape([b, 1, c])).reshape([b, c])
+    }
+
+    fn mix_single(&self, x: Tensor<B, 2>, x_prev: Tensor<B, 2>, mix: Tensor<B, 1>, c: usize) -> Tensor<B, 2> {
+        let [b, _] = x.dims();
+        let m = mix.reshape([1, c]);
+        let device = x.device();
+        let one_minus_m = Tensor::ones([b, c], &device) - m.clone();
+        x * m + x_prev * one_minus_m
+    }
+
+    /// WKV incremental - processa um único token usando estado
+    fn wkv_step(
+        &self,
+        k: Tensor<B, 2>,
+        v: Tensor<B, 2>,
+        state: &mut (Tensor<B, 2>, Tensor<B, 2>, Tensor<B, 2>),
+    ) -> Tensor<B, 2> {
+        let [_b, c] = k.dims();
+        let w = self.time_decay.val().exp().neg(); // [C]
+        let u = self.time_first.val(); // [C]
+
+        let (aa, bb, pp) = state;
+
+        // ww = u + k_t
+        let ww = u.clone().reshape([1, c]) + k.clone();
+
+        // Log-sum-exp trick para estabilidade
+        let p = pp.clone().max_pair(ww.clone());
+        let e1 = (pp.clone() - p.clone()).exp();
+        let e2 = (ww - p.clone()).exp();
+
+        // WKV output
+        let denom = e1.clone() * bb.clone() + e2.clone() + NUMERIC_EPS;
+        let wkv = (e1.clone() * aa.clone() + e2.clone() * v.clone()) / denom;
+
+        // Atualiza estado
+        let ww2 = w.clone().reshape([1, c]) + pp.clone();
+        let p2 = ww2.clone().max_pair(k.clone());
+        let e1_2 = (ww2 - p2.clone()).exp();
+        let e2_2 = (k - p2.clone()).exp();
+
+        *aa = e1_2.clone() * aa.clone() + e2_2.clone() * v;
+        *bb = e1_2 * bb.clone() + e2_2;
+        *pp = p2;
+
+        wkv
     }
 
     fn token_shift(&self, x: Tensor<B, 3>, b: usize, t: usize, c: usize) -> Tensor<B, 3> {
@@ -385,6 +516,42 @@ impl<B: Backend> ChannelMixing<B> {
         let k_sq = k.clone() * k;
 
         r * self.value.forward(k_sq)
+    }
+
+    /// Forward incremental - processa um único token [B, C] usando estado
+    pub fn forward_step(
+        &self,
+        x: Tensor<B, 2>,
+        state: &mut Tensor<B, 2>,
+    ) -> Tensor<B, 2> {
+        let [b, c] = x.dims();
+        
+        // x_prev é o estado anterior
+        let x_prev = state.clone();
+
+        let xk = self.mix_single(x.clone(), x_prev.clone(), self.time_mix_k.val(), c);
+        let xr = self.mix_single(x, x_prev.clone(), self.time_mix_r.val(), c);
+
+        let r = activation::sigmoid(self.receptance.forward(xr.reshape([b, 1, c])).reshape([b, c]));
+        let k = activation::relu(self.key.forward(xk.reshape([b, 1, c])).reshape([b, c]));
+
+        // Squared ReLU
+        let k_sq = k.clone() * k;
+
+        let output = r * self.value.forward(k_sq.reshape([b, 1, c])).reshape([b, c]);
+        
+        // Atualiza estado para próximo token
+        *state = output.clone();
+        
+        output
+    }
+
+    fn mix_single(&self, x: Tensor<B, 2>, x_prev: Tensor<B, 2>, mix: Tensor<B, 1>, c: usize) -> Tensor<B, 2> {
+        let [b, _] = x.dims();
+        let m = mix.reshape([1, c]);
+        let device = x.device();
+        let one_minus_m = Tensor::ones([b, c], &device) - m.clone();
+        x * m + x_prev * one_minus_m
     }
 
     fn token_shift(&self, x: Tensor<B, 3>, b: usize, t: usize, c: usize) -> Tensor<B, 3> {

@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use super::config::{RWKVConfig, TrainingConfig};
 use super::rwkv::RWKV;
 use burn::{
@@ -14,6 +13,7 @@ pub struct TrainStats {
     pub loss: f32,
     pub grad_norm: f32,
     pub lr: f64,
+    #[allow(dead_code)]
     pub tokens_per_sec: f32,
 }
 
@@ -21,6 +21,7 @@ pub struct Trainer<B: AutodiffBackend> {
     pub model: RWKV<B>,
     optimizer: OptimizerAdaptor<AdamW<B::InnerBackend>, RWKV<B>, B>,
     config: TrainingConfig,
+    #[allow(dead_code)]
     model_config: RWKVConfig,
 
     // Estado
@@ -239,13 +240,23 @@ impl<B: AutodiffBackend> Trainer<B> {
         Ok(())
     }
 
+    /// Define learning rate manualmente (para LR finder)
+    pub fn set_learning_rate(&mut self, lr: f64) {
+        self.config.learning_rate = lr;
+    }
+
     // Getters
     pub fn step(&self) -> usize { self.step }
-    pub fn micro_step(&self) -> usize { self.micro_step }
-    pub fn current_lr(&self) -> f64 { self.get_learning_rate() }
-    pub fn ema_loss(&self) -> f32 { self.ema_loss }
-    pub fn best_loss(&self) -> f32 { self.best_loss }
-    pub fn last_grad_norm(&self) -> f32 { self.last_grad_norm }
     pub fn config(&self) -> &TrainingConfig { &self.config }
+    pub fn ema_loss(&self) -> f32 { self.ema_loss }
+    #[allow(dead_code)]
+    pub fn micro_step(&self) -> usize { self.micro_step }
+    #[allow(dead_code)]
+    pub fn current_lr(&self) -> f64 { self.get_learning_rate() }
+    #[allow(dead_code)]
+    pub fn best_loss(&self) -> f32 { self.best_loss }
+    #[allow(dead_code)]
+    pub fn last_grad_norm(&self) -> f32 { self.last_grad_norm }
+    #[allow(dead_code)]
     pub fn model_config(&self) -> &RWKVConfig { &self.model_config }
 }

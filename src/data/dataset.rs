@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use memmap2::Mmap;
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
@@ -101,8 +100,10 @@ impl MmapDataset {
 
     pub fn len(&self) -> usize { self.indices.len() }
     pub fn is_empty(&self) -> bool { self.indices.is_empty() }
-    pub fn epoch(&self) -> usize { self.epoch }
     pub fn num_tokens(&self) -> usize { self.num_tokens }
+    #[allow(dead_code)]
+    pub fn epoch(&self) -> usize { self.epoch }
+    #[allow(dead_code)]
     pub fn seq_len(&self) -> usize { self.seq_len }
 
     pub fn get(&self, idx: usize) -> Option<(Vec<u16>, Vec<u16>)> {
@@ -155,12 +156,15 @@ impl<'a> DataLoader<'a> {
         }
     }
 
+    #[allow(dead_code)]
     pub fn reset(&mut self) { self.current_idx = 0; }
 
+    #[allow(dead_code)]
     pub fn remaining(&self) -> usize {
         self.dataset.len().saturating_sub(self.current_idx)
     }
 
+    #[allow(dead_code)]
     pub fn total_batches(&self) -> usize {
         (self.dataset.len() + self.batch_size - 1) / self.batch_size
     }
@@ -220,6 +224,7 @@ impl TokenizedDatasetWriter {
         Ok(self.tokens_written)
     }
 
+    #[allow(dead_code)]
     pub fn tokens_written(&self) -> usize { self.tokens_written }
 }
 

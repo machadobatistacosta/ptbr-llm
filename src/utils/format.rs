@@ -54,6 +54,7 @@ pub fn format_duration(secs: u64) -> String {
 }
 
 /// Formata tokens por segundo
+#[allow(dead_code)]
 pub fn format_throughput(tokens_per_sec: f64) -> String {
     if tokens_per_sec >= 1_000_000.0 {
         format!("{:.2}M tok/s", tokens_per_sec / 1e6)

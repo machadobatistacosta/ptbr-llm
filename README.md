@@ -1,4 +1,4 @@
-# 🇧🇷 PTBR-LLM
+# 🇧🇷 PTBR-SLM
 
 **Small Language Model para Português Brasileiro, treinado do zero em Rust.**
 
@@ -34,7 +34,7 @@ Modelo de linguagem baseado na arquitetura **RWKV**, otimizado para:
 cargo build --release
 
 # Treinar (exemplo mini, 20k steps)
-./target/release/ptbr-llm train \
+./target/release/ptbr-slm train \
   --data data/tokenized \
   --tokenizer data/tokenizer/tokenizer.json \
   --output checkpoints \
@@ -44,7 +44,7 @@ cargo build --release
   --save-every 5000
 
 # Gerar texto
-./target/release/ptbr-llm generate \
+./target/release/ptbr-slm generate \
   --model checkpoints/checkpoint_20000.bin \
   --tokenizer data/tokenizer/tokenizer.json \
   --prompt "O Brasil é" \
@@ -56,7 +56,7 @@ cargo build --release
 ## 📁 Estrutura
 
 ```
-ptbr-llm/
+ptbr-slm/
 ├── src/
 │   ├── main.rs           # CLI
 │   ├── model/            # RWKV + Trainer
@@ -104,7 +104,7 @@ Todas públicas e com licença compatível:
 3. Execute:
 
 ```bash
-./target/release/ptbr-llm train \
+./target/release/ptbr-slm train \
   --data /kaggle/input/seu-dataset \
   --tokenizer /kaggle/input/seu-dataset/tokenizer.json \
   --output /kaggle/working/checkpoints \

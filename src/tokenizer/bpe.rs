@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use parking_lot::RwLock;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -84,6 +83,7 @@ impl BPETokenizer {
     pub const EOS_TOKEN: &'static str = "[EOS]";
     pub const SEP_TOKEN: &'static str = "[SEP]";
 
+    #[allow(dead_code)]
     pub fn pad_id(&self) -> u16 { *self.special_tokens.get(Self::PAD_TOKEN).unwrap_or(&0) }
     pub fn unk_id(&self) -> u16 { *self.special_tokens.get(Self::UNK_TOKEN).unwrap_or(&1) }
     pub fn bos_id(&self) -> u16 { *self.special_tokens.get(Self::BOS_TOKEN).expect("No [BOS]") }
@@ -149,6 +149,7 @@ impl BPETokenizer {
         result
     }
 
+    #[allow(dead_code)]
     pub fn encode_batch(&self, texts: &[String]) -> Vec<Vec<u16>> {
         texts.par_iter().map(|t| self.encode(t)).collect()
     }

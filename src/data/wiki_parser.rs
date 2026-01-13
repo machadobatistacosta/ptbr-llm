@@ -1,4 +1,3 @@
-#![allow(dead_code)]
 use bzip2::read::BzDecoder;
 use quick_xml::events::Event;
 use quick_xml::Reader;
@@ -8,6 +7,7 @@ use std::io::{BufRead, BufReader};
 /// Artigo parseado da Wikipedia
 #[derive(Debug, Clone)]
 pub struct WikiArticle {
+    #[allow(dead_code)]
     pub title: String,
     pub text: String,
 }

@@ -1,16 +1,15 @@
-mod adapters;
 mod config;
 mod evaluator;
+mod lr_finder;
 mod rwkv;
 mod trainer;
 
 pub use config::{RWKVConfig, TrainingConfig};
-pub use evaluator::{Evaluator, EvalMetrics};
+pub use evaluator::Evaluator;
+pub use lr_finder::{LRFinderResult, find_lr};
 pub use rwkv::RWKV;
-pub use trainer::{Trainer, TrainStats};
+pub use trainer::Trainer;
 
 // Exports opcionais
-#[allow(unused_imports)]
-pub use adapters::{Domain, DomainAdapterBank, DomainFineTuneConfig, LoRAAdapter};
 #[allow(unused_imports)]
 pub use rwkv::{ChannelMixing, RWKVBlock, RWKVState, TimeMixing};

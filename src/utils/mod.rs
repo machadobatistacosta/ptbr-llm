@@ -8,5 +8,4 @@ pub use format::{
     format_duration,
     format_number,
     format_params,
-    format_throughput,
 };
