@@ -415,7 +415,7 @@ impl<B: Backend> TimeMixing<B> {
         // exp(k) para pesos de atenção - estabilizado com log-sum-exp trick
         let k_max = k.clone().max_dim(2).reshape([b, t, 1]);
         let k_stable = k.clone() - k_max; // Valores <= 0, exp será <= 1
-        let k_exp = k_stable.exp(); // [B, T, C] estabilizado, valores em (0, 1]
+        let k_exp = k_stable.clone().exp(); // [B, T, C] estabilizado, valores em (0, 1]
         
         // Weighted values: exp(k) * v
         let weighted_v = k_exp.clone() * v.clone(); // [B, T, C]
