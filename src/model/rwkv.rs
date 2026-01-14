@@ -447,9 +447,8 @@ impl<B: Backend> TimeMixing<B> {
         let global_avg = sum_weighted_v / sum_k_exp; // [B, 1, C]
         
         // Adiciona influência local (token atual tem bonus u)
-        // u também precisa ser estabilizado
-        let u_stable = u_broadcast.clone() - u_broadcast.clone().max();
-        let u_exp = u_stable.exp();
+        // u_broadcast já está em escala razoável, usar diretamente
+        let u_exp = u_broadcast.exp();
         let k_exp_local = k_stable.exp(); // Reusar k_stable que já está estabilizado
         let local_contrib = u_exp.clone() * k_exp_local.clone() * v;
         let local_norm = u_exp * k_exp_local + NUMERIC_EPS;
