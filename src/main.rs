@@ -172,6 +172,10 @@ enum Commands {
         learning_rate: f64,
         #[arg(long, default_value = "1024")]
         seq_len: usize,
+        #[arg(long, default_value = "500")]
+        eval_every: usize,
+        #[arg(long, default_value = "100")]
+        eval_samples: usize,
     },
 
     /// Testa modelo com prompts
@@ -347,6 +351,8 @@ fn main() {
             grad_accum,
             learning_rate,
             seq_len,
+            eval_every,
+            eval_samples,
         } => resume_training(
             &checkpoint,
             &data,
@@ -358,6 +364,8 @@ fn main() {
             grad_accum,
             learning_rate,
             seq_len,
+            eval_every,
+            eval_samples,
         ),
 
         Commands::TestModel {
@@ -959,7 +967,10 @@ fn resume_training(
     batch_size: usize,
     grad_accum: usize,
     learning_rate: f64,
+
     seq_len: usize,
+    eval_every: usize,
+    eval_samples: usize,
 ) {
     std::env::set_var("CUDA_VISIBLE_DEVICES", "0");
 
@@ -1030,8 +1041,8 @@ fn resume_training(
         &tokenizer,
         additional_steps,
         save_every,
-        500,
-        100,
+        eval_every,
+        eval_samples,
         batch_size,
         output,
         &mut metrics_file,
