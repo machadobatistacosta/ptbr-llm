@@ -406,26 +406,32 @@ impl<B: Backend> TimeMixing<B> {
         let u = self.time_first.val(); // [C] - first token bonus
         let u_broadcast = u.reshape([1, 1, c]);
         
-        // Usa time_decay para calcular taxa de decay média
+        // Usa time_decay para calcular taxa de decay (clampado para estabilidade)
         let w = self.time_decay.val(); // [C]
         let w_mean: f32 = w.clone().mean().into_scalar().elem();
-        let decay_rate = (-w_mean).exp().clamp(0.01, 0.5); // Taxa de decay entre 0.01 e 0.5
+        // Clamp para evitar valores extremos: decay deve ser pequeno
+        let decay_rate = (-w_mean).exp().clamp(0.001, 0.1);
         
-        // exp(k) para pesos de atenção - estabilizado
+        // exp(k) para pesos de atenção - estabilizado com log-sum-exp trick
         let k_max = k.clone().max_dim(2).reshape([b, t, 1]);
-        let k_exp = (k.clone() - k_max).exp(); // [B, T, C] estabilizado
+        let k_stable = k.clone() - k_max; // Valores <= 0, exp será <= 1
+        let k_exp = k_stable.exp(); // [B, T, C] estabilizado, valores em (0, 1]
         
         // Weighted values: exp(k) * v
         let weighted_v = k_exp.clone() * v.clone(); // [B, T, C]
         
-        // Cria pesos de decay baseados na posição
-        // Posições mais recentes (maiores) têm mais peso
-        let positions: Vec<f32> = (0..t).map(|i| i as f32 * decay_rate).collect();
+        // Cria pesos de decay baseados na posição NORMALIZADA
+        // Posições normalizadas para [0, 1] para evitar overflow
+        let t_f32 = t.max(1) as f32;
+        let positions: Vec<f32> = (0..t)
+            .map(|i| (i as f32 / t_f32) * decay_rate * 10.0) // Escala para ~[0, 1] max
+            .collect();
         let pos_tensor = Tensor::<B, 1>::from_floats(positions.as_slice(), device)
             .reshape([1, t, 1]); // [1, T, 1]
         
-        // decay_weights normalizados
-        let decay_weights = pos_tensor.exp(); // [1, T, 1] - pesos crescentes
+        // decay_weights: softmax-like normalization para estabilidade
+        let pos_max: f32 = positions.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
+        let decay_weights = (pos_tensor - pos_max).exp(); // Subtrair max para estabilidade
         let decay_sum: f32 = decay_weights.clone().sum().into_scalar().elem();
         let decay_weights_norm = decay_weights / (decay_sum + NUMERIC_EPS);
         
@@ -441,8 +447,10 @@ impl<B: Backend> TimeMixing<B> {
         let global_avg = sum_weighted_v / sum_k_exp; // [B, 1, C]
         
         // Adiciona influência local (token atual tem bonus u)
-        let u_exp = u_broadcast.exp();
-        let k_exp_local = k.exp();
+        // u também precisa ser estabilizado
+        let u_stable = u_broadcast.clone() - u_broadcast.clone().max();
+        let u_exp = u_stable.exp();
+        let k_exp_local = k_stable.exp(); // Reusar k_stable que já está estabilizado
         let local_contrib = u_exp.clone() * k_exp_local.clone() * v;
         let local_norm = u_exp * k_exp_local + NUMERIC_EPS;
         let local_output = local_contrib / local_norm; // [B, T, C]
