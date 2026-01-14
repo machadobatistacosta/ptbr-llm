@@ -536,12 +536,16 @@ impl<B: Backend> ChannelMixing<B> {
         let xr = self.mix_single(x, x_prev.clone(), self.time_mix_r.val(), c);
 
         let r = activation::sigmoid(self.receptance.forward(xr.reshape([b, 1, c])).reshape([b, c]));
-        let k = activation::relu(self.key.forward(xk.reshape([b, 1, c])).reshape([b, c]));
+        
+        // key projection produces [B, 1, d_ffn], flattening to [B, d_ffn]
+        let k_logits = self.key.forward(xk.reshape([b, 1, c]));
+        let k = activation::relu(k_logits).flatten(1, 2);
 
         // Squared ReLU
         let k_sq = k.clone() * k;
 
-        let output = r * self.value.forward(k_sq.reshape([b, 1, c])).reshape([b, c]);
+        // value projection takes [B, 1, d_ffn] -> [B, 1, d_model]
+        let output = r * self.value.forward(k_sq.reshape([b, 1, -1])).reshape([b, c]);
         
         // Atualiza estado para próximo token
         *state = output.clone();
