@@ -1165,13 +1165,17 @@ fn run_training_loop(
                     println!();
                 }
 
-                // Save checkpoint
+                // Save checkpoint in its own scope to drop temporaries
                 if step % save_every == 0 && step > 0 {
-                    let ckpt_path = output.join(format!("checkpoint_{}", step));
-                    match trainer.save_checkpoint(ckpt_path.to_str().unwrap()) {
-                        Ok(_) => println!("  💾 Checkpoint salvo: {:?}", ckpt_path),
-                        Err(e) => println!("  ⚠️ Erro salvando: {}", e),
+                    {
+                        let ckpt_path = output.join(format!("checkpoint_{}", step));
+                        match trainer.save_checkpoint(ckpt_path.to_str().unwrap()) {
+                            Ok(_) => println!("  💾 Checkpoint salvo: {:?}", ckpt_path),
+                            Err(e) => println!("  ⚠️ Erro salvando: {}", e),
+                        }
                     }
+                    // Tenta liberar memória do sistema operacional
+                    // Não temos clear_cache explícito no backend padrão, mas isso dropa vars locais
                 }
 
                 // Check completion
