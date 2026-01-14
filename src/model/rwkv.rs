@@ -6,7 +6,7 @@ use burn::{
         Dropout, DropoutConfig, Embedding, EmbeddingConfig, LayerNorm, LayerNormConfig, Linear,
         LinearConfig,
     },
-    tensor::{activation, backend::Backend, Int, Tensor},
+    tensor::{activation, backend::Backend, ElementConversion, Int, Tensor},
 };
 
 /// Epsilon para estabilidade numérica
@@ -406,10 +406,10 @@ impl<B: Backend> TimeMixing<B> {
         let u = self.time_first.val(); // [C] - first token bonus
         let u_broadcast = u.reshape([1, 1, c]);
         
-        // Usa time_decay para calcular taxa de decay média (convertida para escalar)
+        // Usa time_decay para calcular taxa de decay média
         let w = self.time_decay.val(); // [C]
         let w_mean: f32 = w.clone().mean().into_scalar().elem();
-        let decay_rate = (-w_mean).exp().clamp(0.01, 0.99); // Taxa de decay entre 0.01 e 0.99
+        let decay_rate = (-w_mean).exp().clamp(0.01, 0.5); // Taxa de decay entre 0.01 e 0.5
         
         // exp(k) para pesos de atenção - estabilizado
         let k_max = k.clone().max_dim(2).reshape([b, t, 1]);
@@ -420,13 +420,13 @@ impl<B: Backend> TimeMixing<B> {
         
         // Cria pesos de decay baseados na posição
         // Posições mais recentes (maiores) têm mais peso
-        let positions: Vec<f32> = (0..t).map(|i| i as f32).collect();
+        let positions: Vec<f32> = (0..t).map(|i| i as f32 * decay_rate).collect();
         let pos_tensor = Tensor::<B, 1>::from_floats(positions.as_slice(), device)
             .reshape([1, t, 1]); // [1, T, 1]
         
-        // decay_weights normalizados para somar ~1
-        let decay_weights = (pos_tensor * decay_rate).exp(); // [1, T, 1] - pesos crescentes
-        let decay_sum = decay_weights.clone().sum();
+        // decay_weights normalizados
+        let decay_weights = pos_tensor.exp(); // [1, T, 1] - pesos crescentes
+        let decay_sum: f32 = decay_weights.clone().sum().into_scalar().elem();
         let decay_weights_norm = decay_weights / (decay_sum + NUMERIC_EPS);
         
         // Aplica pesos de decay aos valores ponderados
@@ -448,8 +448,7 @@ impl<B: Backend> TimeMixing<B> {
         let local_output = local_contrib / local_norm; // [B, T, C]
         
         // Mix entre global e local: output = alpha * local + (1-alpha) * global
-        let alpha = 0.7f32; // Mais peso para contribuição local
-        alpha * local_output + (1.0 - alpha) * global_avg
+        local_output * 0.7 + global_avg * 0.3
     }
 }
 
