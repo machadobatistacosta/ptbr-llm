@@ -6,7 +6,6 @@ use burn::{
     record::CompactRecorder,
     tensor::{activation, backend::AutodiffBackend, ElementConversion, Int, Tensor},
 };
-use std::io::Write;
 
 /// Estatísticas de um step de treino
 #[derive(Debug, Clone, Default)]

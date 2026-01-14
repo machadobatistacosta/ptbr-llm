@@ -1069,7 +1069,6 @@ fn run_training_loop(
         dataset.shuffle(42 + epoch);
         let loader = DataLoader::new(dataset, batch_size);
         let total_batches = loader.total_batches();
-        let mut batch_count = 0;
 
         if epoch == 0 && trainer.step() == 0 {
             println!("  📦 Processando {} batches no primeiro epoch...", total_batches);
@@ -1077,7 +1076,6 @@ fn run_training_loop(
         }
 
         for (inputs, targets) in loader {
-            batch_count += 1;
             
             // Validação do batch
             if inputs.is_empty() || targets.is_empty() {

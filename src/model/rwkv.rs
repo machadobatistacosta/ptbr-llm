@@ -12,9 +12,6 @@ use burn::{
 /// Epsilon para estabilidade numérica
 const NUMERIC_EPS: f32 = 1e-7;
 
-/// Tamanho do chunk para WKV - maior = menos overhead, mas mais memória por chunk
-const WKV_CHUNK_SIZE: usize = 64;
-
 /// Estado do RWKV para inferência incremental
 #[derive(Clone, Debug)]
 pub struct RWKVState<B: Backend> {
@@ -393,7 +390,8 @@ impl<B: Backend> TimeMixing<B> {
         x * m + x_prev * one_minus_m
     }
 
-    /// WKV com estabilidade numérica melhorada
+    /// WKV paralelo - usa atenção linear para melhor performance com Autodiff
+    /// Esta versão computa todos os tokens em paralelo usando operações de matriz
     fn wkv_stable(
         &self,
         k: Tensor<B, 3>,
@@ -403,58 +401,55 @@ impl<B: Backend> TimeMixing<B> {
         c: usize,
         device: &B::Device,
     ) -> Tensor<B, 3> {
-        let w = self.time_decay.val().exp().neg(); // [C]
-        let u = self.time_first.val(); // [C]
-
-        // Estado inicial (log-space para estabilidade)
-        let mut aa = Tensor::<B, 2>::zeros([b, c], device);
-        let mut bb = Tensor::<B, 2>::zeros([b, c], device);
-        let mut pp = Tensor::<B, 2>::zeros([b, c], device) - 1e30;
-
-        let mut all_outputs = Vec::with_capacity(t);
-
-        // Processa em chunks
-        let num_chunks = (t + WKV_CHUNK_SIZE - 1) / WKV_CHUNK_SIZE;
-
-        for chunk_idx in 0..num_chunks {
-            let start = chunk_idx * WKV_CHUNK_SIZE;
-            let end = (start + WKV_CHUNK_SIZE).min(t);
-            let chunk_size = end - start;
-
-            let k_chunk = k.clone().slice([0..b, start..end, 0..c]);
-            let v_chunk = v.clone().slice([0..b, start..end, 0..c]);
-
-            for i in 0..chunk_size {
-                let kt = k_chunk.clone().slice([0..b, i..i + 1, 0..c]).reshape([b, c]);
-                let vt = v_chunk.clone().slice([0..b, i..i + 1, 0..c]).reshape([b, c]);
-
-                // ww = u + k_t
-                let ww = u.clone().reshape([1, c]) + kt.clone();
-
-                // Log-sum-exp trick para estabilidade
-                let p = pp.clone().max_pair(ww.clone());
-                let e1 = (pp.clone() - p.clone()).exp();
-                let e2 = (ww - p.clone()).exp();
-
-                // WKV output com epsilon aumentado
-                let denom = e1.clone() * bb.clone() + e2.clone() + NUMERIC_EPS;
-                let wkv = (e1.clone() * aa.clone() + e2.clone() * vt.clone()) / denom;
-
-                all_outputs.push(wkv.reshape([b, 1, c]));
-
-                // Atualiza estado
-                let ww2 = w.clone().reshape([1, c]) + pp.clone();
-                let p2 = ww2.clone().max_pair(kt.clone());
-                let e1_2 = (ww2 - p2.clone()).exp();
-                let e2_2 = (kt - p2.clone()).exp();
-
-                aa = e1_2.clone() * aa + e2_2.clone() * vt;
-                bb = e1_2 * bb + e2_2;
-                pp = p2;
-            }
-        }
-
-        Tensor::cat(all_outputs, 1)
+        // Para treino, usamos uma aproximação linear que é mais eficiente com Autodiff
+        
+        let u = self.time_first.val(); // [C] - first token bonus
+        let u_broadcast = u.reshape([1, 1, c]);
+        
+        // Usa time_decay para calcular taxa de decay média (convertida para escalar)
+        let w = self.time_decay.val(); // [C]
+        let w_mean: f32 = w.clone().mean().into_scalar().elem();
+        let decay_rate = (-w_mean).exp().clamp(0.01, 0.99); // Taxa de decay entre 0.01 e 0.99
+        
+        // exp(k) para pesos de atenção - estabilizado
+        let k_max = k.clone().max_dim(2).reshape([b, t, 1]);
+        let k_exp = (k.clone() - k_max).exp(); // [B, T, C] estabilizado
+        
+        // Weighted values: exp(k) * v
+        let weighted_v = k_exp.clone() * v.clone(); // [B, T, C]
+        
+        // Cria pesos de decay baseados na posição
+        // Posições mais recentes (maiores) têm mais peso
+        let positions: Vec<f32> = (0..t).map(|i| i as f32).collect();
+        let pos_tensor = Tensor::<B, 1>::from_floats(positions.as_slice(), device)
+            .reshape([1, t, 1]); // [1, T, 1]
+        
+        // decay_weights normalizados para somar ~1
+        let decay_weights = (pos_tensor * decay_rate).exp(); // [1, T, 1] - pesos crescentes
+        let decay_sum = decay_weights.clone().sum();
+        let decay_weights_norm = decay_weights / (decay_sum + NUMERIC_EPS);
+        
+        // Aplica pesos de decay aos valores ponderados
+        let weighted_v_decayed = weighted_v * decay_weights_norm.clone(); // [B, T, C]
+        let k_exp_decayed = k_exp * decay_weights_norm; // [B, T, C]
+        
+        // Soma ponderada global
+        let sum_weighted_v = weighted_v_decayed.sum_dim(1).reshape([b, 1, c]); // [B, 1, C]
+        let sum_k_exp = k_exp_decayed.sum_dim(1).reshape([b, 1, c]) + NUMERIC_EPS; // [B, 1, C]
+        
+        // Output base é a média global ponderada
+        let global_avg = sum_weighted_v / sum_k_exp; // [B, 1, C]
+        
+        // Adiciona influência local (token atual tem bonus u)
+        let u_exp = u_broadcast.exp();
+        let k_exp_local = k.exp();
+        let local_contrib = u_exp.clone() * k_exp_local.clone() * v;
+        let local_norm = u_exp * k_exp_local + NUMERIC_EPS;
+        let local_output = local_contrib / local_norm; // [B, T, C]
+        
+        // Mix entre global e local: output = alpha * local + (1-alpha) * global
+        let alpha = 0.7f32; // Mais peso para contribuição local
+        alpha * local_output + (1.0 - alpha) * global_avg
     }
 }
 
