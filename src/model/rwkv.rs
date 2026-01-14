@@ -403,45 +403,49 @@ impl<B: Backend> TimeMixing<B> {
     ) -> Tensor<B, 3> {
         // Para treino, usamos uma aproximação linear que é mais eficiente com Autodiff
         
-        let u = self.time_first.val(); // [C] - first token bonus
+        // u: [C] -> [1, 1, C]
+        let u = self.time_first.val();
         let u_broadcast = u.reshape([1, 1, c]);
         
-        // Usa time_decay para calcular taxa de decay (clampado para estabilidade)
-        let w = self.time_decay.val(); // [C]
-        let w_mean: f32 = w.clone().mean().into_scalar().elem();
+        // Calcula taxa de decay baseada na média dos canais
+        let w = self.time_decay.val();
+        let w_mean = w.clone().mean(); // [1]
         // Clamp para evitar valores extremos: decay deve ser pequeno
-        let decay_rate = (-w_mean).exp().clamp(0.001, 0.1);
+        let decay_rate = (-w_mean).exp().clamp(0.001, 0.1); // [1]
         
-        // exp(k) para pesos de atenção - estabilizado com log-sum-exp trick
+        // exp(k) para pesos de atenção
         let k_max = k.clone().max_dim(2).reshape([b, t, 1]);
-        let k_stable = k.clone() - k_max; // Valores <= 0, exp será <= 1
-        let k_exp = k_stable.clone().exp(); // [B, T, C] estabilizado, valores em (0, 1]
+        let k_stable = k.clone() - k_max;
+        let k_exp = k_stable.clone().exp(); // [B, T, C]
         
         // Weighted values: exp(k) * v
         let weighted_v = k_exp.clone() * v.clone(); // [B, T, C]
         
-        // Cria pesos de decay baseados na posição NORMALIZADA
-        // Posições normalizadas para [0, 1] para evitar overflow
-        let t_f32 = t.max(1) as f32;
-        let positions: Vec<f32> = (0..t)
-            .map(|i| (i as f32 / t_f32) * decay_rate * 10.0) // Escala para ~[0, 1] max
-            .collect();
-        let pos_tensor = Tensor::<B, 1>::from_floats(positions.as_slice(), device)
-            .reshape([1, t, 1]); // [1, T, 1]
+        // Cria pesos de decay baseados na posição
+        // arange retorna Int, convertemos para Float
+        let indices = Tensor::<B, 1, Int>::arange(0..(t as i64), device).float(); // [T]
+        let t_float = t.max(1) as f32;
+        let positions = indices / t_float; // [T]
         
-        // decay_weights: softmax-like normalization para estabilidade
-        let pos_max: f32 = positions.iter().cloned().fold(f32::NEG_INFINITY, f32::max);
-        let decay_weights = (pos_tensor - pos_max).exp(); // Subtrair max para estabilidade
-        let decay_sum: f32 = decay_weights.clone().sum().into_scalar().elem();
+        // Broadcast
+        let positions = positions.reshape([1, t, 1]);
+        let decay_rate = decay_rate.reshape([1, 1, 1]);
+        
+        let pos_tensor = positions * decay_rate * 10.0; // [1, T, 1]
+        
+        // decay_weights: softmax-like normalization
+        let pos_max = pos_tensor.clone().max_dim(1); // [1, 1, 1]
+        let decay_weights = (pos_tensor - pos_max).exp(); 
+        let decay_sum = decay_weights.clone().sum_dim(1); // [1, 1, 1]
         let decay_weights_norm = decay_weights / (decay_sum + NUMERIC_EPS);
         
-        // Aplica pesos de decay aos valores ponderados
-        let weighted_v_decayed = weighted_v * decay_weights_norm.clone(); // [B, T, C]
-        let k_exp_decayed = k_exp * decay_weights_norm; // [B, T, C]
+        // Aplica pesos
+        let weighted_v_decayed = weighted_v * decay_weights_norm.clone();
+        let k_exp_decayed = k_exp * decay_weights_norm;
         
         // Soma ponderada global
-        let sum_weighted_v = weighted_v_decayed.sum_dim(1).reshape([b, 1, c]); // [B, 1, C]
-        let sum_k_exp = k_exp_decayed.sum_dim(1).reshape([b, 1, c]) + NUMERIC_EPS; // [B, 1, C]
+        let sum_weighted_v = weighted_v_decayed.sum_dim(1).reshape([b, 1, c]); 
+        let sum_k_exp = k_exp_decayed.sum_dim(1).reshape([b, 1, c]) + NUMERIC_EPS;
         
         // Output base é a média global ponderada
         let global_avg = sum_weighted_v / sum_k_exp; // [B, 1, C]
@@ -545,7 +549,8 @@ impl<B: Backend> ChannelMixing<B> {
         let k_sq = k.clone() * k;
 
         // value projection takes [B, 1, d_ffn] -> [B, 1, d_model]
-        let output = r * self.value.forward(k_sq.reshape([b, 1, -1])).reshape([b, c]);
+        let [b_dim, d_ffn_dim] = k_sq.dims();
+        let output = r * self.value.forward(k_sq.reshape([b_dim, 1, d_ffn_dim])).reshape([b, c]);
         
         // Atualiza estado para próximo token
         *state = output.clone();
