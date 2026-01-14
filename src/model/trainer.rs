@@ -179,7 +179,9 @@ impl<B: AutodiffBackend> Trainer<B> {
 
     pub fn save_checkpoint(&self, path: &str) -> std::io::Result<()> {
         let path = path.trim_end_matches(".mpk").trim_end_matches(".bin");
-        std::fs::create_dir_all(path)?;
+        if let Some(parent) = std::path::Path::new(path).parent() {
+            std::fs::create_dir_all(parent)?;
+        }
         
         let recorder = CompactRecorder::new();
         self.model
