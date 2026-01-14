@@ -1079,52 +1079,26 @@ fn run_training_loop(
         for (inputs, targets) in loader {
             batch_count += 1;
             
-            // Log progresso durante processamento inicial
-            if trainer.step() == 0 && batch_count % 50 == 0 {
-                println!("  ⏳ Processando batch {}/{}...", batch_count, total_batches);
-                std::io::stdout().flush().unwrap();
-            }
-            
             // Validação do batch
             if inputs.is_empty() || targets.is_empty() {
-                eprintln!("  ⚠️ Batch vazio no batch {}", batch_count);
                 continue;
             }
             
             let seq_len = inputs[0].len();
             if seq_len == 0 {
-                eprintln!("  ⚠️ Sequência vazia no batch {}", batch_count);
                 continue;
             }
             
             // Valida que todas as sequências têm o mesmo tamanho
             if !inputs.iter().all(|x| x.len() == seq_len) || !targets.iter().all(|x| x.len() == seq_len) {
-                eprintln!("  ⚠️ Batch {} tem sequências de tamanhos diferentes (seq_len={})", batch_count, seq_len);
                 continue;
             }
             
-            // Log primeiro batch para debug
-            if batch_count == 1 {
-                println!("  🔍 Debug: Primeiro batch - {} sequências, seq_len={}", inputs.len(), seq_len);
-                std::io::stdout().flush().unwrap();
-            }
-            
-            // Log antes do primeiro train_step
-            if batch_count == 1 {
-                println!("  🔍 Debug: Criando tensores para batch {}...", batch_count);
-                std::io::stdout().flush().unwrap();
-            }
-            
-            // Cria tensores (se falhar aqui, o panic mostrará onde)
+            // Cria tensores
             let input_tensor = create_batch_tensor::<TrainBackend>(&inputs, device);
             let target_tensor = create_batch_tensor::<TrainBackend>(&targets, device);
 
-            if batch_count == 1 {
-                println!("  🔍 Debug: Tensores criados, iniciando train_step...");
-                std::io::stdout().flush().unwrap();
-            }
-
-            // Train step (se falhar aqui, o panic mostrará onde)
+            // Train step
             if let Some(stats) = trainer.train_step(input_tensor, target_tensor) {
                 let step = trainer.step();
                 let steps_done = step - initial_step;

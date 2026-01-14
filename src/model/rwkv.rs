@@ -12,8 +12,8 @@ use burn::{
 /// Epsilon para estabilidade numérica
 const NUMERIC_EPS: f32 = 1e-7;
 
-/// Tamanho do chunk para WKV
-const WKV_CHUNK_SIZE: usize = 32;
+/// Tamanho do chunk para WKV - maior = menos overhead, mas mais memória por chunk
+const WKV_CHUNK_SIZE: usize = 64;
 
 /// Estado do RWKV para inferência incremental
 #[derive(Clone, Debug)]
@@ -94,48 +94,15 @@ impl<B: Backend> RWKV<B> {
     }
 
     pub fn forward(&self, input_ids: Tensor<B, 2, Int>) -> Tensor<B, 3> {
-        use std::io::Write;
-        
-        eprintln!("  🔍 RWKV forward: Iniciando embedding...");
-        std::io::Write::flush(&mut std::io::stderr()).ok();
         let mut x = self.embedding.forward(input_ids);
-        
-        eprintln!("  🔍 RWKV forward: Embedding completo, shape: {:?}", x.dims());
-        std::io::Write::flush(&mut std::io::stderr()).ok();
-        
-        eprintln!("  🔍 RWKV forward: Aplicando ln_pre...");
-        std::io::Write::flush(&mut std::io::stderr()).ok();
         x = self.ln_pre.forward(x);
-        
-        eprintln!("  🔍 RWKV forward: ln_pre completo, processando {} blocos...", self.blocks.len());
-        std::io::Write::flush(&mut std::io::stderr()).ok();
 
-        for (idx, block) in self.blocks.iter().enumerate() {
-            if idx == 0 {
-                eprintln!("  🔍 RWKV forward: Processando bloco {}/{}...", idx + 1, self.blocks.len());
-                std::io::Write::flush(&mut std::io::stderr()).ok();
-            } else if idx == self.blocks.len() / 2 {
-                eprintln!("  🔍 RWKV forward: Processando bloco {}/{} (meio)...", idx + 1, self.blocks.len());
-                std::io::Write::flush(&mut std::io::stderr()).ok();
-            } else if idx == self.blocks.len() - 1 {
-                eprintln!("  🔍 RWKV forward: Processando último bloco {}/{}...", idx + 1, self.blocks.len());
-                std::io::Write::flush(&mut std::io::stderr()).ok();
-            }
+        for block in self.blocks.iter() {
             x = block.forward(x);
         }
         
-        eprintln!("  🔍 RWKV forward: Todos os blocos processados, aplicando ln_out...");
-        std::io::Write::flush(&mut std::io::stderr()).ok();
         x = self.ln_out.forward(x);
-        
-        eprintln!("  🔍 RWKV forward: ln_out completo, aplicando head...");
-        std::io::Write::flush(&mut std::io::stderr()).ok();
-        let result = self.head.forward(x);
-        
-        eprintln!("  🔍 RWKV forward: Head completo, shape final: {:?}", result.dims());
-        std::io::Write::flush(&mut std::io::stderr()).ok();
-        
-        result
+        self.head.forward(x)
     }
 
     /// Forward para inferência - retorna logits do último token
@@ -213,31 +180,13 @@ impl<B: Backend> RWKVBlock<B> {
     }
 
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
-        use std::io::Write;
-        
         // Pre-norm architecture com residual
-        eprintln!("    🔍 Block: Aplicando ln1...");
-        std::io::Write::flush(&mut std::io::stderr()).ok();
         let ln1_out = self.ln1.forward(x.clone());
-        
-        eprintln!("    🔍 Block: Chamando time_mixing.forward...");
-        std::io::Write::flush(&mut std::io::stderr()).ok();
         let tm = self.time_mixing.forward(ln1_out);
-        eprintln!("    🔍 Block: time_mixing completo");
-        std::io::Write::flush(&mut std::io::stderr()).ok();
-        
         let x = x + self.dropout.forward(tm);
 
-        eprintln!("    🔍 Block: Aplicando ln2...");
-        std::io::Write::flush(&mut std::io::stderr()).ok();
         let ln2_out = self.ln2.forward(x.clone());
-        
-        eprintln!("    🔍 Block: Chamando channel_mixing.forward...");
-        std::io::Write::flush(&mut std::io::stderr()).ok();
         let cm = self.channel_mixing.forward(ln2_out);
-        eprintln!("    🔍 Block: channel_mixing completo");
-        std::io::Write::flush(&mut std::io::stderr()).ok();
-        
         x + self.dropout.forward(cm)
     }
 
@@ -331,39 +280,25 @@ impl<B: Backend> TimeMixing<B> {
     }
 
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
-        use std::io::Write;
-        
         let [b, t, c] = x.dims();
         let device = x.device();
 
-        eprintln!("      🔍 TimeMixing: Token shift...");
-        std::io::Write::flush(&mut std::io::stderr()).ok();
         // Token shift
         let x_prev = self.token_shift(x.clone(), b, t, c);
 
-        eprintln!("      🔍 TimeMixing: Mixing...");
-        std::io::Write::flush(&mut std::io::stderr()).ok();
-        // Mix
+        // Mix - reuse x_prev reference
         let xk = self.mix(x.clone(), x_prev.clone(), self.time_mix_k.val(), c);
         let xv = self.mix(x.clone(), x_prev.clone(), self.time_mix_v.val(), c);
-        let xr = self.mix(x.clone(), x_prev, self.time_mix_r.val(), c);
+        let xr = self.mix(x, x_prev, self.time_mix_r.val(), c);
 
-        eprintln!("      🔍 TimeMixing: Projections...");
-        std::io::Write::flush(&mut std::io::stderr()).ok();
         // Projections
         let r = activation::sigmoid(self.receptance.forward(xr));
         let k = self.key.forward(xk);
         let v = self.value.forward(xv);
 
-        eprintln!("      🔍 TimeMixing: Chamando WKV (isso pode demorar na primeira vez devido à compilação CUDA JIT)...");
-        std::io::Write::flush(&mut std::io::stderr()).ok();
         // WKV
         let wkv = self.wkv_stable(k, v, b, t, c, &device);
-        eprintln!("      🔍 TimeMixing: WKV completo!");
-        std::io::Write::flush(&mut std::io::stderr()).ok();
 
-        eprintln!("      🔍 TimeMixing: Output...");
-        std::io::Write::flush(&mut std::io::stderr()).ok();
         // Output
         self.output.forward(r * wkv)
     }

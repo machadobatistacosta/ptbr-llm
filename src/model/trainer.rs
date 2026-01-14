@@ -71,38 +71,12 @@ impl<B: AutodiffBackend> Trainer<B> {
         input_ids: Tensor<B, 2, Int>,
         target_ids: Tensor<B, 2, Int>,
     ) -> Option<TrainStats> {
-        // Log debug no primeiro micro-step
-        if self.step == 0 && self.micro_step == 0 {
-            eprintln!("  🔍 Debug train_step: Iniciando forward...");
-            std::io::Write::flush(&mut std::io::stderr()).ok();
-        }
-        
         // Forward
-        let logits = {
-            if self.step == 0 && self.micro_step == 0 {
-                eprintln!("  🔍 Debug train_step: Chamando model.forward...");
-                std::io::Write::flush(&mut std::io::stderr()).ok();
-            }
-            let result = self.model.forward(input_ids);
-            if self.step == 0 && self.micro_step == 0 {
-                eprintln!("  🔍 Debug train_step: Forward completo, shape: {:?}", result.dims());
-                std::io::Write::flush(&mut std::io::stderr()).ok();
-            }
-            result
-        };
+        let logits = self.model.forward(input_ids);
 
         // Cross-entropy loss
-        if self.step == 0 && self.micro_step == 0 {
-            eprintln!("  🔍 Debug train_step: Calculando loss...");
-            std::io::Write::flush(&mut std::io::stderr()).ok();
-        }
         let loss = self.cross_entropy_loss(logits, target_ids);
         let loss_value: f32 = loss.clone().into_scalar().elem();
-        
-        if self.step == 0 && self.micro_step == 0 {
-            eprintln!("  🔍 Debug train_step: Loss calculado: {:.4}", loss_value);
-            std::io::Write::flush(&mut std::io::stderr()).ok();
-        }
 
         // Verifica divergência
         if !loss_value.is_finite() {
@@ -125,44 +99,15 @@ impl<B: AutodiffBackend> Trainer<B> {
         self.micro_step += 1;
 
         // Backward
-        if self.step == 0 && self.micro_step == 1 {
-            eprintln!("  🔍 Debug train_step: Iniciando backward...");
-            std::io::Write::flush(&mut std::io::stderr()).ok();
-        }
         let grads = loss.backward();
-        if self.step == 0 && self.micro_step == 1 {
-            eprintln!("  🔍 Debug train_step: Backward completo");
-            std::io::Write::flush(&mut std::io::stderr()).ok();
-        }
-        
         let grad_params = GradientsParams::from_grads(grads, &self.model);
-        if self.step == 0 && self.micro_step == 1 {
-            eprintln!("  🔍 Debug train_step: GradParams criado");
-            std::io::Write::flush(&mut std::io::stderr()).ok();
-        }
 
         // Atualiza apenas quando completou gradient accumulation
         if self.micro_step >= self.config.gradient_accumulation_steps {
-            if self.step == 0 {
-                eprintln!("  🔍 Debug train_step: Completou gradient accumulation, fazendo optimizer step...");
-                std::io::Write::flush(&mut std::io::stderr()).ok();
-            }
-            
             let lr = self.get_learning_rate();
 
-            // TODO: Gradient clipping quando Burn expor API
-            // Por enquanto, confiamos no Adam para estabilidade
-
             // Optimizer step
-            if self.step == 0 {
-                eprintln!("  🔍 Debug train_step: Chamando optimizer.step...");
-                std::io::Write::flush(&mut std::io::stderr()).ok();
-            }
             self.model = self.optimizer.step(lr, self.model.clone(), grad_params);
-            if self.step == 0 {
-                eprintln!("  🔍 Debug train_step: Optimizer step completo!");
-                std::io::Write::flush(&mut std::io::stderr()).ok();
-            }
 
             // Calcula métricas
             let avg_loss = self.accumulated_loss / self.micro_step as f32;
@@ -184,7 +129,7 @@ impl<B: AutodiffBackend> Trainer<B> {
                 loss: avg_loss,
                 grad_norm: self.last_grad_norm,
                 lr,
-                tokens_per_sec: 0.0, // Calculado externamente
+                tokens_per_sec: 0.0,
             };
 
             self.accumulated_loss = 0.0;
