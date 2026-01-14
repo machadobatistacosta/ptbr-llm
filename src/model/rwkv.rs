@@ -6,7 +6,7 @@ use burn::{
         Dropout, DropoutConfig, Embedding, EmbeddingConfig, LayerNorm, LayerNormConfig, Linear,
         LinearConfig,
     },
-    tensor::{activation, backend::Backend, ElementConversion, Int, Tensor},
+    tensor::{activation, backend::Backend, Int, Tensor},
 };
 
 /// Epsilon para estabilidade numérica
