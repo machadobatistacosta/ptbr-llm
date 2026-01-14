@@ -108,6 +108,7 @@ impl<B: AutodiffBackend> Trainer<B> {
             // Optimizer step
             self.model = self.optimizer.step(lr, self.model.clone(), grad_params);
 
+
             // Calcula métricas
             let avg_loss = self.accumulated_loss / self.micro_step as f32;
 

@@ -13,7 +13,7 @@ use std::collections::HashSet;
 use rayon::prelude::*;
 
 use burn::backend::Autodiff;
-use burn::module::Module;
+use burn::module::{Module, AutodiffModule};
 use burn::record::CompactRecorder;
 use burn::tensor::{backend::Backend, Int, Tensor};
 
@@ -1142,7 +1142,7 @@ fn run_training_loop(
 
                 // Evaluation
                 if step % eval_every == 0 && step > 0 {
-                    let eval_metrics = evaluator.evaluate(&trainer.model, dataset, device);
+                    let eval_metrics = evaluator.evaluate(&trainer.model.valid(), dataset, device);
                     println!(
                         "  📊 Eval Step {} | {}",
                         step, eval_metrics
