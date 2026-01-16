@@ -108,6 +108,10 @@ enum Commands {
         output: PathBuf,
         #[arg(short, long, default_value = "32000")]
         vocab_size: usize,
+        /// Special tokens (comma-separated): '[PAD]','[UNK]','[BOS]','[EOS]','[SEP]'
+        /// Para ChatML: '[PAD]','[UNK]','[BOS]','[EOS]','[SEP]','<|im_start|>','<|im_end|>'
+        #[arg(long)]
+        special_tokens: Option<String>,
     },
 
     /// Tokeniza corpus para binário
@@ -302,7 +306,8 @@ fn main() {
             corpus,
             output,
             vocab_size,
-        } => train_tokenizer(&corpus, &output, vocab_size),
+            special_tokens,
+        } => train_tokenizer(&corpus, &output, vocab_size, special_tokens),
 
         Commands::Tokenize {
             input,
@@ -664,7 +669,7 @@ fn create_output_file(output: &PathBuf, idx: usize) -> std::fs::File {
 }
 
 // ============ TRAIN TOKENIZER ============
-fn train_tokenizer(corpus: &PathBuf, output: &PathBuf, vocab_size: usize) {
+fn train_tokenizer(corpus: &PathBuf, output: &PathBuf, vocab_size: usize, special_tokens: Option<String>) {
     println!("═══════════════════════════════════════════════════════════");
     println!("  🔤 Treinando Tokenizer BPE");
     println!("═══════════════════════════════════════════════════════════");
@@ -672,7 +677,26 @@ fn train_tokenizer(corpus: &PathBuf, output: &PathBuf, vocab_size: usize) {
     println!("  Vocab size: {}", vocab_size);
     println!();
 
-    let trainer = BPETrainer::new(vocab_size, 5);
+    let mut trainer = BPETrainer::new(vocab_size, 5);
+
+    // ✨ Injeta custom special tokens se fornecidos
+    if let Some(tokens_str) = special_tokens {
+        let custom_tokens: Vec<&str> = tokens_str
+            .split(',')
+            .map(|s| s.trim())
+            .filter(|s| !s.is_empty())
+            .collect();
+        
+        if !custom_tokens.is_empty() {
+            println!("  🎯 Special tokens customizados:");
+            for token in &custom_tokens {
+                println!("     - {}", token);
+            }
+            trainer = trainer.with_special_tokens(custom_tokens);
+        }
+    }
+
+    println!();
 
     let texts: Vec<String> = if corpus.is_file() {
         println!("  Lendo arquivo único...");
@@ -713,6 +737,7 @@ fn train_tokenizer(corpus: &PathBuf, output: &PathBuf, vocab_size: usize) {
     println!("═══════════════════════════════════════════════════════════");
     println!("  ✅ Tokenizer salvo em {:?}", tokenizer_path);
     println!("  Vocab size: {}", tokenizer.vocab_size());
+    println!("  Special tokens: {}", tokenizer.get_all_special_tokens().len());
     println!("═══════════════════════════════════════════════════════════");
 }
 

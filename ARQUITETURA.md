@@ -1,8 +1,42 @@
-﻿# PTBR-SLM - Arquitetura (Verificado)
+﻿# PTBR-SLM - Arquitetura v2 (Tokenizer Dinâmico)
 
-**Data: 2026-01-10**  
-**Verificação: Terminal PowerShell**  
+**Data: 2026-01-15**  
+**Atualização: Tokenizer Dinâmico ChatML-Ready**  
 **Framework: Burn 0.14 + Rust 2021**  
+
+---
+
+## 🎯 Mudanças Principais (v2.0)
+
+### ✨ Tokenizer Dinâmico
+
+O `BPETrainer` agora suporta **special tokens personalizados** ao invés de hardcoded:
+
+```rust
+// v1: Hardcoded
+pub struct BPETrainer { vocab_size, min_frequency }
+
+// v2: Dinâmico
+pub struct BPETrainer { 
+    vocab_size, 
+    min_frequency, 
+    special_tokens: Vec<String>  ← NOVO!
+}
+```
+
+#### Uso:
+```bash
+# Padrão (backward compatible)
+./target/release/ptbr-slm train-tokenizer --corpus data/ --output out/
+
+# ChatML
+./target/release/ptbr-slm train-tokenizer --corpus data/ --output out/ \
+  --special-tokens "[PAD],[UNK],[BOS],[EOS],[SEP],<|im_start|>,<|im_end|>"
+
+# Jurídico/RAG
+./target/release/ptbr-slm train-tokenizer --corpus data/ --output out/ \
+  --special-tokens "[PAD],[UNK],[BOS],[EOS],[SEP],<|DOC|>,<|ARTIGO|>,<|LEI|>"
+```
 
 ---
 

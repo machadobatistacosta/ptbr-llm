@@ -90,6 +90,16 @@ impl BPETokenizer {
     pub fn eos_id(&self) -> u16 { *self.special_tokens.get(Self::EOS_TOKEN).expect("No [EOS]") }
     pub fn vocab_size(&self) -> usize { self.id_to_token.len() }
 
+    /// Retorna o ID de um special token customizado (se existir)
+    pub fn special_token_id(&self, token_name: &str) -> Option<u16> {
+        self.special_tokens.get(token_name).copied()
+    }
+
+    /// Lista todos os special tokens carregados
+    pub fn get_all_special_tokens(&self) -> &HashMap<String, u16> {
+        &self.special_tokens
+    }
+
     pub fn from_vocab(vocab: BPEVocab) -> Self {
         let token_to_id = vocab.build_token_to_id();
         Self {
@@ -270,18 +280,39 @@ impl Clone for BPETokenizer {
     }
 }
 
-// BPETrainer permanece igual ao original...
+/// BPETrainer com suporte a special tokens dinâmicos (v2 - ChatML Ready)
 pub struct BPETrainer {
     vocab_size: usize,
     min_frequency: usize,
+    special_tokens: Vec<String>,
 }
 
 impl BPETrainer {
+    /// Cria trainer com tokens especiais padrão (backward compatible)
     pub fn new(vocab_size: usize, min_frequency: usize) -> Self {
         Self {
             vocab_size,
             min_frequency: min_frequency.max(2),
+            special_tokens: vec![
+                "[PAD]".to_string(),
+                "[UNK]".to_string(),
+                "[BOS]".to_string(),
+                "[EOS]".to_string(),
+                "[SEP]".to_string(),
+            ],
         }
+    }
+
+    /// Injeta custom special tokens (Chat, Instruction, etc.)
+    pub fn with_special_tokens(mut self, tokens: Vec<&str>) -> Self {
+        self.special_tokens = tokens.into_iter().map(|s| s.to_string()).collect();
+        self
+    }
+
+    /// Adiciona tokens customizados aos padrão (útil para expandir, não substituir)
+    pub fn append_special_tokens(mut self, tokens: Vec<&str>) -> Self {
+        self.special_tokens.extend(tokens.into_iter().map(|s| s.to_string()));
+        self
     }
 
     pub fn train<I>(&self, texts: I) -> BPEVocab
@@ -341,20 +372,14 @@ impl BPETrainer {
             .map(|(i, t)| (t.clone(), i as u16))
             .collect();
 
-        let special = [
-            BPETokenizer::PAD_TOKEN,
-            BPETokenizer::UNK_TOKEN,
-            BPETokenizer::BOS_TOKEN,
-            BPETokenizer::EOS_TOKEN,
-            BPETokenizer::SEP_TOKEN,
-        ];
-
+        // ✨ Usa special_tokens dinâmicos ao invés de constantes hardcoded
         let mut special_map = HashMap::new();
-        for token in special {
+        for token_str in &self.special_tokens {
             let id = id_to_token.len() as u16;
-            id_to_token.push(token.as_bytes().to_vec());
-            token_to_id.insert(token.as_bytes().to_vec(), id);
-            special_map.insert(token.to_string(), id);
+            let token_bytes = token_str.as_bytes().to_vec();
+            id_to_token.push(token_bytes.clone());
+            token_to_id.insert(token_bytes, id);
+            special_map.insert(token_str.clone(), id);
         }
 
         let mut word_splits: Vec<(Vec<u16>, usize)> = word_freqs
