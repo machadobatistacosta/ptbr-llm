@@ -541,7 +541,7 @@ impl<B: Backend> ChannelMixing<B> {
 
         let r = activation::sigmoid(self.receptance.forward(xr.reshape([b, 1, c])).reshape([b, c]));
         
-        // key projection produces [B, 1, d_ffn], flattening to [B, d_ffn]
+        //key projection produces [B, 1, d_ffn], flattening to [B, d_ffn]
         let k_logits = self.key.forward(xk.reshape([b, 1, c]));
         let k = activation::relu(k_logits).flatten(1, 2);
 
@@ -552,8 +552,10 @@ impl<B: Backend> ChannelMixing<B> {
         let [b_dim, d_ffn_dim] = k_sq.dims();
         let output = r * self.value.forward(k_sq.reshape([b_dim, 1, d_ffn_dim])).reshape([b, c]);
         
-        // Atualiza estado para próximo token
-        *state = output.clone();
+        // CRITICAL FIX: Atualiza estado com INPUT atual (x), NÃO output
+        // O estado é usado como x_prev no próximo token
+        // Usar output causava explosão numérica (feedback loop)
+        *state = x_prev; // Salva x anterior (que foi usado neste step)
         
         output
     }
