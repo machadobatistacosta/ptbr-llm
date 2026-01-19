@@ -48,20 +48,27 @@ impl MmapDataset {
         let metadata = file.metadata()?;
         let file_size = metadata.len() as usize;
 
-        // Validações
-        if file_size % 2 != 0 {
+        // CRITICAL FIX: Dataset format includes 8-byte header
+        const HEADER_SIZE: usize = 8;
+        
+        if file_size < HEADER_SIZE {
             return Err(DatasetError::InvalidFormat(
-                "File size not multiple of 2 (expected u16 tokens)".into(),
+                "File too small to contain header".into(),
             ));
         }
 
-        if file_size == 0 {
-            return Err(DatasetError::InvalidFormat("Empty file".into()));
+        let data = unsafe { Mmap::map(&file)? };
+        
+        // CRITICAL FIX: Skip header, only count actual token data
+        let data_size = file_size - HEADER_SIZE;
+        
+        if data_size % 2 != 0 {
+            return Err(DatasetError::InvalidFormat(
+                "Data size not multiple of 2 (expected u16 tokens)".into(),
+            ));
         }
 
-        let data = unsafe { Mmap::map(&file)? };
-
-        let num_tokens = file_size / 2;
+        let num_tokens = data_size / 2;
         let required_tokens = seq_len + 2;
 
         if num_tokens < required_tokens {
@@ -80,7 +87,10 @@ impl MmapDataset {
             });
         }
 
-        let indices: Vec<usize> = (0..num_sequences).map(|i| i * seq_len * 2).collect();
+        // CRITICAL FIX: Indices start AFTER the 8-byte header
+        let indices: Vec<usize> = (0..num_sequences)
+            .map(|i| HEADER_SIZE + i * seq_len * 2)
+            .collect();
 
         println!(
             "  ✓ Dataset: {} tokens, {} sequências (seq_len={})",
@@ -199,15 +209,22 @@ impl<'a> Iterator for DataLoader<'a> {
 pub struct TokenizedDatasetWriter {
     writer: BufWriter<File>,
     tokens_written: usize,
+    header_written: bool,
 }
 
 impl TokenizedDatasetWriter {
     pub fn new(path: &Path) -> std::io::Result<Self> {
         let file = File::create(path)?;
-        let writer = BufWriter::with_capacity(4 * 1024 * 1024, file);
+        let mut writer = BufWriter::with_capacity(4 * 1024 * 1024, file);
+        
+        // CRITICAL FIX: Write placeholder header (will be updated in finish())
+        // Header format: u64 (8 bytes) containing total token count
+        writer.write_all(&0u64.to_le_bytes())?;
+        
         Ok(Self {
             writer,
             tokens_written: 0,
+            header_written: true,
         })
     }
 
@@ -220,7 +237,16 @@ impl TokenizedDatasetWriter {
     }
 
     pub fn finish(mut self) -> std::io::Result<usize> {
+        use std::io::Seek;
+        
         self.writer.flush()?;
+        
+        // CRITICAL FIX: Update header with actual token count
+        let mut file = self.writer.into_inner()?;
+        file.seek(std::io::SeekFrom::Start(0))?;
+        file.write_all(&(self.tokens_written as u64).to_le_bytes())?;
+        file.flush()?;
+        
         Ok(self.tokens_written)
     }
 
