@@ -208,6 +208,9 @@ enum Commands {
         temperature: f32,
         #[arg(long, default_value = "40")]
         top_k: usize,
+        /// Saída em formato JSON (para integração com Python)
+        #[arg(long, default_value = "false")]
+        json: bool,
     },
 
     /// Limpa corpus de texto
@@ -387,6 +390,7 @@ fn main() {
             model_size,
             temperature,
             top_k,
+            json,
         } => generate(
             &model,
             &tokenizer,
@@ -395,6 +399,7 @@ fn main() {
             &model_size,
             temperature,
             top_k,
+            json,
         ),
 
         Commands::AuditCorpus { input, output } => audit_corpus_cmd(&input, &output),
@@ -1359,14 +1364,17 @@ fn generate(
     model_size: &str,
     temperature: f32,
     top_k: usize,
+    json_output: bool,
 ) {
-    println!("═══════════════════════════════════════════════════════════");
-    println!("  ✨ Gerando Texto");
-    println!("═══════════════════════════════════════════════════════════");
-    println!("  Prompt: {}", prompt);
-    println!("  Temperature: {}", temperature);
-    println!("  Top-K: {}", top_k);
-    println!();
+    if !json_output {
+        println!("═══════════════════════════════════════════════════════════");
+        println!("  ✨ Gerando Texto");
+        println!("═══════════════════════════════════════════════════════════");
+        println!("  Prompt: {}", prompt);
+        println!("  Temperature: {}", temperature);
+        println!("  Top-K: {}", top_k);
+        println!();
+    }
 
     let device = get_device();
 
@@ -1386,10 +1394,14 @@ fn generate(
         .expect("Erro carregando modelo");
 
     let mut tokens = tokenizer.encode(prompt);
+    let initial_token_count = tokens.len();
     let mut rng = rand::thread_rng();
+    let mut generated_text = String::new();
 
-    print!("{}", prompt);
-    std::io::stdout().flush().unwrap();
+    if !json_output {
+        print!("{}", prompt);
+        std::io::stdout().flush().unwrap();
+    }
 
     // Inicializa estado para inferência incremental
     let mut state = RWKVState::new(config.n_layers, config.d_model, 1, &device);
@@ -1422,8 +1434,20 @@ fn generate(
         let scaled: Vec<f32> = logits_vec.iter().map(|x| x / temperature).collect();
 
         // Top-K filtering
-        let mut indexed: Vec<(usize, f32)> = scaled.iter().cloned().enumerate().collect();
-        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+        let mut indexed: Vec<(usize, f32)> = scaled
+            .iter()
+            .cloned()
+            .enumerate()
+            .filter(|(_, v)| v.is_finite()) // ✨ Proteção contra NaNs/Infs
+            .collect();
+            
+        // Fallback seguro se tudo for NaN (evita vetor vazio se top_k > 0)
+        if indexed.is_empty() {
+             eprintln!("⚠️ AVISO: Todos os logits são NaN/Inf! Usando token 0 como fallback.");
+             indexed.push((0, 0.0));
+        }
+
+        indexed.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap_or(std::cmp::Ordering::Equal));
         indexed.truncate(top_k);
 
         // Softmax over top-k
@@ -1439,9 +1463,23 @@ fn generate(
         let indices: Vec<usize> = indexed.iter().map(|(i, _)| *i).collect();
 
         // Sample
-        let dist = WeightedIndex::new(&probs).unwrap();
-        let sampled_idx = dist.sample(&mut rng);
-        let next_token = indices[sampled_idx] as u16;
+        let next_token = if let Ok(dist) = WeightedIndex::new(&probs) {
+            // Normal sampling
+            let sampled_idx = dist.sample(&mut rng);
+            indices[sampled_idx] as u16
+        } else {
+            // Fallback: probs inválidas (todas zero ou NaN)
+            // Usa determinístico: token com maior logit (primeiro em indexed, pois está sorted)
+            if !json_output {
+                eprintln!("⚠️ Probabilidades inválidas no sampling, usando greedy fallback");
+            }
+            if !indices.is_empty() {
+                indices[0] as u16
+            } else {
+                // Último recurso: EOS
+                tokenizer.eos_id()
+            }
+        };
 
         if next_token == tokenizer.eos_id() {
             break;
@@ -1449,12 +1487,30 @@ fn generate(
 
         tokens.push(next_token);
         let decoded = tokenizer.decode(&[next_token]);
-        print!("{}", decoded);
-        std::io::stdout().flush().unwrap();
+        generated_text.push_str(&decoded);
+        
+        if !json_output {
+            print!("{}", decoded);
+            std::io::stdout().flush().unwrap();
+        }
     }
 
-    println!();
-    println!();
+    if json_output {
+        // Output JSON estruturado para integração Python
+        let json_response = serde_json::json!({
+            "prompt": prompt,
+            "generated_text": generated_text,
+            "full_text": format!("{}{}", prompt, generated_text),
+            "tokens_generated": tokens.len() - initial_token_count,
+            "model_size": model_size,
+            "temperature": temperature,
+            "top_k": top_k
+        });
+        println!("{}", json_response);
+    } else {
+        println!();
+        println!();
+    }
 }
 
 // ============ CLEAN CORPUS ============
