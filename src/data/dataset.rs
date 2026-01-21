@@ -209,6 +209,7 @@ impl<'a> Iterator for DataLoader<'a> {
 pub struct TokenizedDatasetWriter {
     writer: BufWriter<File>,
     tokens_written: usize,
+    #[allow(dead_code)]
     header_written: bool,
 }
 

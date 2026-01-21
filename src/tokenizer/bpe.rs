@@ -81,6 +81,7 @@ impl BPETokenizer {
     pub const UNK_TOKEN: &'static str = "[UNK]";
     pub const BOS_TOKEN: &'static str = "[BOS]";
     pub const EOS_TOKEN: &'static str = "[EOS]";
+    #[allow(dead_code)]
     pub const SEP_TOKEN: &'static str = "[SEP]";
 
     #[allow(dead_code)]
@@ -91,6 +92,7 @@ impl BPETokenizer {
     pub fn vocab_size(&self) -> usize { self.id_to_token.len() }
 
     /// Retorna o ID de um special token customizado (se existir)
+    #[allow(dead_code)]
     pub fn special_token_id(&self, token_name: &str) -> Option<u16> {
         self.special_tokens.get(token_name).copied()
     }
@@ -310,6 +312,7 @@ impl BPETrainer {
     }
 
     /// Adiciona tokens customizados aos padrão (útil para expandir, não substituir)
+    #[allow(dead_code)]
     pub fn append_special_tokens(mut self, tokens: Vec<&str>) -> Self {
         self.special_tokens.extend(tokens.into_iter().map(|s| s.to_string()));
         self
