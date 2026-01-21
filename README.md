@@ -1,6 +1,6 @@
-# 🇧🇷 PTBR-SLM
+# 🇧🇷 PTBR-LLM
 
-**Portuguese Brazilian Small Language Model — trained from scratch in Rust.**
+**Portuguese Brazilian Language Model — trained from scratch in Rust.**
 
 <p align="left">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" /></a>
@@ -14,7 +14,7 @@
 
 ## 🎯 Overview
 
-**PTBR-SLM** is a family of small language models based on the **RWKV-v6 architecture**, optimized for the Rust ecosystem. Unlike traditional Transformers, RWKV combines efficient parallel training with RNN-like inference — enabling **constant memory usage** regardless of sequence length.
+**PTBR-LLM** is a family of language models based on the **RWKV-v6 architecture**, optimized for the Rust ecosystem. Unlike traditional Transformers, RWKV combines efficient parallel training with RNN-like inference — enabling **constant memory usage** regardless of sequence length.
 
 ### Why RWKV?
 
@@ -32,8 +32,10 @@
 | **85M** | 85 million | ~2GB | ~200MB | ⚙️ Ready |
 | **170M** | 170 million | ~4GB | ~400MB | ⚙️ Ready |
 | **400M** | 418 million | ~7GB | ~1GB | 🔄 Training |
+| **1B** | 1 billion | ~16GB | ~2GB | ⚙️ Ready |
+| **1.5B** | 1.5 billion | ~24GB | ~3GB | ⚙️ Ready |
 
-> **Note:** RWKV inference memory is dramatically lower than training. All models are trained on **378M tokens** of Brazilian Portuguese.
+> **Note:** RWKV inference memory is dramatically lower than training. 1B+ models require A100 or multi-GPU setup.
 
 ---
 
@@ -100,7 +102,7 @@ cargo run --release -- train \
 **Kaggle GPU (400M):**
 
 ```bash
-./target/release/ptbr-slm train \
+./target/release/ptbr-llm train \
   --data /kaggle/input/dataset/train.bin \
   --tokenizer /kaggle/input/dataset/tokenizer.json \
   --output /kaggle/working/checkpoints \
@@ -160,7 +162,7 @@ os.environ['PATH'] += ":/root/.cargo/bin"
 ## 🏗️ Project Structure
 
 ```
-ptbr-slm/
+ptbr-llm/
 ├── src/
 │   ├── main.rs              # CLI
 │   ├── model/               # RWKV implementation

@@ -129,18 +129,18 @@ def example_training_command():
     print()
     
     examples = {
-        "Standard": """./target/release/ptbr-slm train-tokenizer \\
+        "Standard": """./target/release/ptbr-llm train-tokenizer \\
   --corpus data/planalto_clean \\
   --output data/tokenizer_standard \\
   --vocab-size 32000""",
         
-        "ChatML": """./target/release/ptbr-slm train-tokenizer \\
+        "ChatML": """./target/release/ptbr-llm train-tokenizer \\
   --corpus data/planalto_clean \\
   --output data/tokenizer_chatml \\
   --vocab-size 32000 \\
   --special-tokens "[PAD],[UNK],[BOS],[EOS],[SEP],<|im_start|>,<|im_end|>,<|system|>,<|user|>,<|assistant|>" """,
         
-        "Jurídico": """./target/release/ptbr-slm train-tokenizer \\
+        "Jurídico": """./target/release/ptbr-llm train-tokenizer \\
   --corpus data/planalto_clean \\
   --output data/tokenizer_juridico \\
   --vocab-size 32000 \\

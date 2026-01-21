@@ -1,4 +1,4 @@
-//! PTBR-SLM: Small Language Model para Português Brasileiro
+//! PTBR-LLM: Language Model para Português Brasileiro
 
 pub mod data;
 pub mod model;

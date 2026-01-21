@@ -1,7 +1,7 @@
 import os
 
-PLAN_FILE = r'c:\Users\caike\Desktop\ptbr-slm\data\CLEANUP_PLAN.txt'
-DATA_DIR = r'c:\Users\caike\Desktop\ptbr-slm\data'
+PLAN_FILE = r'c:\Users\caike\Desktop\ptbr-llm\data\CLEANUP_PLAN.txt'
+DATA_DIR = r'c:\Users\caike\Desktop\ptbr-llm\data'
 
 def execute_cleanup():
     print(f"Reading plan from {PLAN_FILE}")

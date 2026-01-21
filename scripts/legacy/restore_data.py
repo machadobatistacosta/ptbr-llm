@@ -1,7 +1,7 @@
 import os
 import shutil
 
-BASE_DIR = r'c:\Users\caike\Desktop\ptbr-slm\data'
+BASE_DIR = r'c:\Users\caike\Desktop\ptbr-llm\data'
 SOURCE_DIR = os.path.join(BASE_DIR, 'tokenizer_full_input')
 
 # Mapping from prefix in tokenizer_full_input to target directory

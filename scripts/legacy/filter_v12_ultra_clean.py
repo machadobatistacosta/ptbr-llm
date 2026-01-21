@@ -420,7 +420,7 @@ def processar_v12(input_path: str, output_path: str):
     print(f"  1. Verificar amostra:")
     print(f"     python -c \"import random; lines=open('{output_path}').readlines(); [print(s[:100]) for s in random.sample(lines,10)]\"")
     print(f"  2. Retreinar tokenizer:")
-    print(f"     .\\target\\release\\ptbr-slm.exe train-tokenizer --input {output_path} --output data/tokenizer_v12/")
+    print(f"     .\\target\\release\\ptbr-llm.exe train-tokenizer --input {output_path} --output data/tokenizer_v12/")
     print(f"  3. Tokenizar e treinar")
     
     return len(linhas_boas)

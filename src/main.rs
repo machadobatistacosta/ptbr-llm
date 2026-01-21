@@ -79,7 +79,7 @@ use rand::prelude::*;
 
 // ============ CLI ============
 #[derive(Parser)]
-#[command(name = "ptbr-slm")]
+#[command(name = "ptbr-llm")]
 #[command(author = "Caike Costa")]
 #[command(version = "1.1.0")]
 #[command(about = "RWKV Language Model para Português Brasileiro")]

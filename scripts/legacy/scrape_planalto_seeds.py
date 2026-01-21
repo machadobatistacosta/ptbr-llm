@@ -47,7 +47,7 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
 
     s = requests.Session()
-    s.headers.update({"User-Agent": "ptbr-slm/0.1 (+local research)"})
+    s.headers.update({"User-Agent": "ptbr-llm/0.1 (+local research)"})
 
     ok = 0
     fail = 0

@@ -1,5 +1,5 @@
 [package]
-name = "ptbr-slm"
+name = "ptbr-llm"
 version = "1.0.0"
 edition = "2021"
 authors = ["Caike Machado Batista Costa"]

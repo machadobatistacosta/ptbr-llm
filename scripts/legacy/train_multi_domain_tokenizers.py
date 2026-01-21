@@ -19,7 +19,7 @@ class MultiDomainTokenizerTrainer:
         
         self.domains = self.config['domains']
         self.training_config = self.config['training_config']
-        self.ptbr_exe = Path("./target/release/ptbr-slm.exe")
+        self.ptbr_exe = Path("./target/release/ptbr-llm.exe")
         
     def validate_setup(self) -> bool:
         """Verifica se tudo está configurado"""

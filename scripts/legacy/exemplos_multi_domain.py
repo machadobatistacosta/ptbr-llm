@@ -181,7 +181,7 @@ COMPREENSÃO: 95% (modelo entende contexto jurídico nativo)
 API_USAGE = """
 # Cliente usando API multi-domínio
 
-from ptbr_slm_api import PTBRClient
+from ptbr_llm_api import PTBRClient
 
 client = PTBRClient(api_key="seu_token")
 
@@ -248,18 +248,18 @@ python scripts/train_multi_domain_tokenizers.py --all
 
 # 2. Copiar para diretório de deployment
 echo "2️⃣ Copiando tokenizadores..."
-cp data/tokenizers/v2_*/*.json /var/ptbr-slm/tokenizers/
+cp data/tokenizers/v2_*/*.json /var/ptbr-llm/tokenizers/
 
 # 3. Compilar modelo
 echo "3️⃣ Compilando modelo..."
 cargo build --release --features cuda
 
 # 4. Copy executável
-cp target/release/ptbr-slm /usr/local/bin/ptbr-slm
+cp target/release/ptbr-llm /usr/local/bin/ptbr-llm
 
 # 5. Iniciar API
 echo "4️⃣ Iniciando API..."
-python -m ptbr_slm.api \\
+python -m ptbr_llm.api \\
     --host 0.0.0.0 \\
     --port 8000 \\
     --models checkpoints/model_legal_400m.bin \\

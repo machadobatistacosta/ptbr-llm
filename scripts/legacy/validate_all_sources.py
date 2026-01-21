@@ -13,7 +13,7 @@ sources = {
 }
 
 print("=" * 80)
-print("🔍 AUDITORIA COMPLETA DE FONTES - PTBR-SLM")
+print("🔍 AUDITORIA COMPLETA DE FONTES - PTBR-LLM")
 print("=" * 80)
 
 total_bytes = 0
