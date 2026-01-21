@@ -33,3 +33,7 @@ __pycache__/
 *.swp
 .DS_Store
 Thumbs.db/corpus.txt
+
+# Debug files
+*.txt
+!requirements.txt
