@@ -95,11 +95,39 @@ impl Evaluator {
         let targets_flat = targets.reshape([batch_size * seq_len]);
         
         let log_probs = activation::log_softmax(logits_flat, 1);
-        let targets_idx = targets_flat.unsqueeze_dim(1);
-        let selected = log_probs.gather(1, targets_idx);
         
-        // Usa ElementConversion para converter scalar
-        let loss_scalar = selected.mean().neg().into_scalar();
-        loss_scalar.elem::<f32>()
+        // GPU/CUDA: usar gather (rápido)
+        #[cfg(any(feature = "cuda", feature = "gpu"))]
+        {
+            let targets_idx = targets_flat.unsqueeze_dim(1);
+            let selected = log_probs.gather(1, targets_idx);
+            let loss_scalar = selected.mean().neg().into_scalar();
+            return loss_scalar.elem::<f32>();
+        }
+
+        // CPU (ndarray): usar loop (compatível)
+        #[cfg(feature = "cpu")]
+        {
+            let targets_data: Vec<i64> = targets_flat.to_data().as_slice().unwrap().to_vec();
+            let n = targets_data.len();
+            
+            let mut sum_loss = 0.0f32;
+            for (i, &target_idx) in targets_data.iter().enumerate() {
+                let row = log_probs.clone().slice([i..i+1, target_idx as usize..target_idx as usize + 1]);
+                let val: f32 = row.into_scalar().elem();
+                sum_loss += val;
+            }
+            
+            return -sum_loss / n as f32;
+        }
+
+        // Fallback
+        #[cfg(not(any(feature = "cuda", feature = "gpu", feature = "cpu")))]
+        {
+            let targets_idx = targets_flat.unsqueeze_dim(1);
+            let selected = log_probs.gather(1, targets_idx);
+            let loss_scalar = selected.mean().neg().into_scalar();
+            loss_scalar.elem::<f32>()
+        }
     }
 }

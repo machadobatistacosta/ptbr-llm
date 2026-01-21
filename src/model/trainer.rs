@@ -151,12 +151,52 @@ impl<B: AutodiffBackend> Trainer<B> {
         // Log softmax para estabilidade
         let log_probs = activation::log_softmax(logits_flat, 1);
 
-        // Gather log-probs dos tokens corretos
-        let targets_idx = targets_flat.unsqueeze_dim(1);
-        let selected = log_probs.gather(1, targets_idx);
+        // GPU/CUDA: usar gather (rápido)
+        #[cfg(any(feature = "cuda", feature = "gpu"))]
+        {
+            let targets_idx = targets_flat.unsqueeze_dim(1);
+            let selected = log_probs.gather(1, targets_idx);
+            return selected.mean().neg();
+        }
 
-        // Negative log likelihood
-        selected.mean().neg()
+        // CPU (ndarray): usar one-hot encoding (evita bugs do slice/gather)
+        #[cfg(feature = "cpu")]
+        {
+            use burn::tensor::TensorData;
+            
+            let [n_tokens, vocab_size] = log_probs.dims();
+            
+            // Criar one-hot manualmente (ndarray não tem gather funcional)
+            let targets_data: Vec<i64> = targets_flat.to_data().as_slice().unwrap().to_vec();
+            
+            // Criar matriz one-hot [n_tokens, vocab_size]
+            let mut one_hot_data = vec![0.0f32; n_tokens * vocab_size];
+            for (i, &target_idx) in targets_data.iter().enumerate() {
+                let idx = i * vocab_size + target_idx as usize;
+                if idx < one_hot_data.len() {
+                    one_hot_data[idx] = 1.0;
+                }
+            }
+            
+            let tensor_data = TensorData::new(one_hot_data, [n_tokens, vocab_size]);
+            let one_hot: Tensor<B, 2> = Tensor::from_data(tensor_data, &self.device);
+            
+            // Multiplica e soma tudo (evita sum_dim que é bugado)
+            // Como one_hot tem só 1s nas posições corretas, sum de (log_probs * one_hot) = soma dos log_probs corretos
+            let product = log_probs.mul(one_hot);
+            let total_sum = product.sum(); // Soma global, evita sum_dim
+            
+            // -mean = -sum / n_tokens
+            return (total_sum / (n_tokens as f32)).neg();
+        }
+
+        // Fallback (não deve chegar aqui)
+        #[cfg(not(any(feature = "cuda", feature = "gpu", feature = "cpu")))]
+        {
+            let targets_idx = targets_flat.unsqueeze_dim(1);
+            let selected = log_probs.gather(1, targets_idx);
+            selected.mean().neg()
+        }
     }
 
     /// Cosine annealing com linear warmup

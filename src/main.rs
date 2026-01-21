@@ -42,7 +42,17 @@ mod backend_impl {
     }
 }
 
-#[cfg(all(feature = "cpu", not(feature = "cuda"), not(feature = "gpu")))]
+#[cfg(all(feature = "torch", not(feature = "cuda"), not(feature = "gpu"), not(feature = "cpu")))]
+mod backend_impl {
+    pub use burn::backend::libtorch::{LibTorch, LibTorchDevice};
+    pub type MyBackend = LibTorch<f32>;
+    
+    pub fn get_device() -> LibTorchDevice {
+        LibTorchDevice::Cuda(0)
+    }
+}
+
+#[cfg(all(feature = "cpu", not(feature = "cuda"), not(feature = "gpu"), not(feature = "torch")))]
 mod backend_impl {
     pub use burn::backend::ndarray::{NdArray, NdArrayDevice};
     pub type MyBackend = NdArray;
@@ -53,9 +63,10 @@ mod backend_impl {
 }
 
 #[cfg(not(any(
-    all(feature = "cuda", not(feature = "cpu"), not(feature = "gpu")),
-    all(feature = "gpu", not(feature = "cuda"), not(feature = "cpu")),
-    all(feature = "cpu", not(feature = "cuda"), not(feature = "gpu"))
+    all(feature = "cuda", not(feature = "cpu"), not(feature = "gpu"), not(feature = "torch")),
+    all(feature = "gpu", not(feature = "cuda"), not(feature = "cpu"), not(feature = "torch")),
+    all(feature = "torch", not(feature = "cuda"), not(feature = "gpu"), not(feature = "cpu")),
+    all(feature = "cpu", not(feature = "cuda"), not(feature = "gpu"), not(feature = "torch"))
 )))]
 mod backend_impl {
     pub use burn::backend::ndarray::{NdArray, NdArrayDevice};
@@ -195,7 +206,7 @@ enum Commands {
     /// Gera texto a partir de prompt
     Generate {
         #[arg(short, long)]
-        model: PathBuf,
+        model: Option<PathBuf>,
         #[arg(short, long)]
         tokenizer: PathBuf,
         #[arg(short, long)]
@@ -1357,7 +1368,7 @@ fn test_model(model_path: &PathBuf, tokenizer_path: &PathBuf, model_size: &str) 
 
 // ============ GENERATE ============
 fn generate(
-    model_path: &PathBuf,
+    model_path: &Option<PathBuf>,
     tokenizer_path: &PathBuf,
     prompt: &str,
     max_tokens: usize,
@@ -1373,6 +1384,9 @@ fn generate(
         println!("  Prompt: {}", prompt);
         println!("  Temperature: {}", temperature);
         println!("  Top-K: {}", top_k);
+        if model_path.is_none() {
+            println!("  ⚠️ AVISO: Nenhum modelo fornecido, usando pesos ALEATÓRIOS!");
+        }
         println!();
     }
 
@@ -1384,14 +1398,18 @@ fn generate(
     let mut config = get_model_config(model_size);
     config.dropout = 0.0;
 
-    let model: RWKV<MyBackend> = RWKV::new(&config, &device);
-    let model = model
-        .load_file(
-            model_path.to_str().unwrap(),
-            &CompactRecorder::new(),
-            &device,
-        )
-        .expect("Erro carregando modelo");
+    let model_raw: RWKV<MyBackend> = RWKV::new(&config, &device);
+    let model = if let Some(path) = model_path {
+        model_raw
+            .load_file(
+                path.to_str().unwrap(),
+                &CompactRecorder::new(),
+                &device,
+            )
+            .expect("Erro carregando modelo")
+    } else {
+        model_raw
+    };
 
     let mut tokens = tokenizer.encode(prompt);
     let initial_token_count = tokens.len();

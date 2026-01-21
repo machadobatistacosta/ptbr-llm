@@ -11,6 +11,7 @@ default = ["cpu"]
 cpu = ["burn/ndarray"]
 gpu = ["burn/wgpu"]
 cuda = ["burn/cuda-jit"]
+torch = ["burn/tch"]
 
 [dependencies]
 burn = { version = "0.14", default-features = false, features = ["autodiff", "train"] }

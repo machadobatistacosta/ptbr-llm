@@ -441,7 +441,7 @@ impl<B: Backend> TimeMixing<B> {
         
         // Aplica pesos
         let weighted_v_decayed = weighted_v * decay_weights_norm.clone();
-        let k_exp_decayed = k_exp * decay_weights_norm;
+        let k_exp_decayed = k_exp.clone() * decay_weights_norm; // REUSE k_exp
         
         // Soma ponderada global
         let sum_weighted_v = weighted_v_decayed.sum_dim(1).reshape([b, 1, c]); 
@@ -453,9 +453,9 @@ impl<B: Backend> TimeMixing<B> {
         // Adiciona influência local (token atual tem bonus u)
         // u_broadcast já está em escala razoável, usar diretamente
         let u_exp = u_broadcast.exp();
-        let k_exp_local = k_stable.exp(); // Reusar k_stable que já está estabilizado
-        let local_contrib = u_exp.clone() * k_exp_local.clone() * v;
-        let local_norm = u_exp * k_exp_local + NUMERIC_EPS;
+        // REMOVIDO k_exp_local redundante, reusando k_stable.exp() que é k_exp
+        let local_contrib = u_exp.clone() * k_exp.clone() * v;
+        let local_norm = u_exp * k_exp + NUMERIC_EPS;
         let local_output = local_contrib / local_norm; // [B, T, C]
         
         // Mix entre global e local: output = alpha * local + (1-alpha) * global
