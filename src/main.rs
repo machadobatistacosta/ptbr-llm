@@ -1438,7 +1438,7 @@ fn generate(
             .iter()
             .cloned()
             .enumerate()
-            .filter(|(_, v)| v.is_finite()) // ✨ Proteção contra NaNs/Infs
+            .filter(|(_, v): &(usize, f32)| v.is_finite()) // ✨ Proteção contra NaNs/Infs
             .collect();
             
         // Fallback seguro se tudo for NaN (evita vetor vazio se top_k > 0)
