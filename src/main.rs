@@ -890,6 +890,9 @@ fn train_model(
         );
         model_config.vocab_size = tokenizer.vocab_size();
     }
+
+    let effective_batch = batch_size * safe_grad_accum;
+
     println!(
         "  Modelo: {} ({} params)",
         model_size,
