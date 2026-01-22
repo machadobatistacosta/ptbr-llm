@@ -1,3 +1,4 @@
+
 use super::config::{RWKVConfig, TrainingConfig};
 use super::rwkv::RWKV;
 use burn::{
@@ -64,12 +65,12 @@ impl<B: AutodiffBackend> Trainer<B> {
     }
 
     /// Executa um micro-step de treino
-    /// Retorna Some(stats) quando completa um step completo (após gradient accumulation)
     pub fn train_step(
         &mut self,
         input_ids: Tensor<B, 2, Int>,
         target_ids: Tensor<B, 2, Int>,
     ) -> Option<TrainStats> {
+        
         // Forward
         let logits = self.model.forward(input_ids);
 
@@ -80,20 +81,9 @@ impl<B: AutodiffBackend> Trainer<B> {
         // Verifica divergência
         if !loss_value.is_finite() {
             eprintln!("❌ ERRO: Loss divergiu para NaN/Inf no step {}!", self.step);
-            eprintln!("   EMA Loss anterior: {:.4}", self.ema_loss);
-            eprintln!("   Último grad_norm: {:.4}", self.last_grad_norm);
             panic!("Training diverged - loss became NaN/Inf");
         }
 
-        // Alerta se loss muito alta
-        if loss_value > 20.0 && self.step > 100 {
-            eprintln!(
-                "⚠️  Warning: Loss muito alta ({:.4}) no step {}",
-                loss_value, self.step
-            );
-        }
-
-        // Acumula
         self.accumulated_loss += loss_value;
         self.micro_step += 1;
 
@@ -101,30 +91,28 @@ impl<B: AutodiffBackend> Trainer<B> {
         let grads = loss.backward();
         let grad_params = GradientsParams::from_grads(grads, &self.model);
 
-        // Atualiza apenas quando completou gradient accumulation
+        // Gradient Accumulation
         if self.micro_step >= self.config.gradient_accumulation_steps {
             let lr = self.get_learning_rate();
 
             // Optimizer step
             self.model = self.optimizer.step(lr, self.model.clone(), grad_params);
 
-
-            // Calcula métricas
+            // Metrics
             let avg_loss = self.accumulated_loss / self.micro_step as f32;
 
-            // Atualiza EMA
+            // EMA Update
             if self.step == 0 {
                 self.ema_loss = avg_loss;
             } else {
                 self.ema_loss = 0.99 * self.ema_loss + 0.01 * avg_loss;
             }
 
-            // Atualiza best loss
+            // Best Loss Update
             if avg_loss < self.best_loss {
                 self.best_loss = avg_loss;
             }
 
-            // Reset para próximo step
             let stats = TrainStats {
                 loss: avg_loss,
                 grad_norm: self.last_grad_norm,
@@ -147,59 +135,28 @@ impl<B: AutodiffBackend> Trainer<B> {
 
         let logits_flat = logits.reshape([batch_size * seq_len, vocab_size]);
         let targets_flat = targets.reshape([batch_size * seq_len]);
-
-        // Log softmax para estabilidade
         let log_probs = activation::log_softmax(logits_flat, 1);
 
-        // GPU/CUDA: usar gather (rápido)
-        #[cfg(any(feature = "cuda", feature = "gpu"))]
+        // Standard Cross Entropy implementation using gather
+        // Works on most backends (including LibTorch on stable systems)
+        #[cfg(any(feature = "cuda", feature = "gpu", feature = "torch"))]
         {
             let targets_idx = targets_flat.unsqueeze_dim(1);
             let selected = log_probs.gather(1, targets_idx);
             return selected.mean().neg();
         }
 
-        // CPU (ndarray): usar one-hot encoding (evita bugs do slice/gather)
-        #[cfg(feature = "cpu")]
+        // Fallback for CPU/NdArray
+        #[cfg(not(any(feature = "cuda", feature = "gpu", feature = "torch")))]
         {
-            use burn::tensor::TensorData;
-            
-            let [n_tokens, vocab_size] = log_probs.dims();
-            
-            // Criar one-hot manualmente (ndarray não tem gather funcional)
-            let targets_data: Vec<i64> = targets_flat.to_data().as_slice().unwrap().to_vec();
-            
-            // Criar matriz one-hot [n_tokens, vocab_size]
-            let mut one_hot_data = vec![0.0f32; n_tokens * vocab_size];
-            for (i, &target_idx) in targets_data.iter().enumerate() {
-                let idx = i * vocab_size + target_idx as usize;
-                if idx < one_hot_data.len() {
-                    one_hot_data[idx] = 1.0;
-                }
-            }
-            
-            let tensor_data = TensorData::new(one_hot_data, [n_tokens, vocab_size]);
-            let one_hot: Tensor<B, 2> = Tensor::from_data(tensor_data, &self.device);
-            
-            // Multiplica e soma tudo (evita sum_dim que é bugado)
-            // Como one_hot tem só 1s nas posições corretas, sum de (log_probs * one_hot) = soma dos log_probs corretos
-            let product = log_probs.mul(one_hot);
-            let total_sum = product.sum(); // Soma global, evita sum_dim
-            
-            // -mean = -sum / n_tokens
-            return (total_sum / (n_tokens as f32)).neg();
-        }
-
-        // Fallback (não deve chegar aqui)
-        #[cfg(not(any(feature = "cuda", feature = "gpu", feature = "cpu")))]
-        {
-            let targets_idx = targets_flat.unsqueeze_dim(1);
-            let selected = log_probs.gather(1, targets_idx);
-            selected.mean().neg()
+             // CPU fallback logic (simplified for cleanness)
+             let targets_idx = targets_flat.unsqueeze_dim(1);
+             let selected = log_probs.gather(1, targets_idx);
+             return selected.mean().neg();
         }
     }
 
-    /// Cosine annealing com linear warmup
+    /// Cosine annealing with warmup
     fn get_learning_rate(&self) -> f64 {
         let warmup = self.config.warmup_steps as f64;
         let max_steps = self.config.max_steps as f64;
@@ -207,10 +164,8 @@ impl<B: AutodiffBackend> Trainer<B> {
         let min_lr = self.config.learning_rate * self.config.min_lr_ratio;
 
         if step < warmup {
-            // Linear warmup
             self.config.learning_rate * (step + 1.0) / warmup
         } else {
-            // Cosine decay
             let progress = (step - warmup) / (max_steps - warmup).max(1.0);
             let progress = progress.min(1.0);
             let cosine = 0.5 * (1.0 + (std::f64::consts::PI * progress).cos());
@@ -230,18 +185,9 @@ impl<B: AutodiffBackend> Trainer<B> {
             .save_file(path, &recorder)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
-        // Salva metadados
         let meta = format!(
-            "step={}\n\
-             lr={:.6e}\n\
-             ema_loss={:.6}\n\
-             best_loss={:.6}\n\
-             last_grad_norm={:.6}\n",
-            self.step,
-            self.get_learning_rate(),
-            self.ema_loss,
-            self.best_loss,
-            self.last_grad_norm,
+            "step={}\nlr={:.6e}\nema_loss={:.6}\nbest_loss={:.6}\nlast_grad_norm={:.6}\n",
+            self.step, self.get_learning_rate(), self.ema_loss, self.best_loss, self.last_grad_norm,
         );
         std::fs::write(format!("{}.meta", path), meta)?;
 
@@ -252,51 +198,29 @@ impl<B: AutodiffBackend> Trainer<B> {
         let path = path.trim_end_matches(".mpk").trim_end_matches(".bin");
         let recorder = CompactRecorder::new();
 
-        self.model = self
-            .model
+        self.model = self.model
             .clone()
             .load_file(path, &recorder, &self.device)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
-        // Carrega metadados
         if let Ok(meta) = std::fs::read_to_string(format!("{}.meta", path)) {
             for line in meta.lines() {
-                if let Some(val) = line.strip_prefix("step=") {
-                    self.step = val.parse().unwrap_or(0);
-                }
-                if let Some(val) = line.strip_prefix("ema_loss=") {
-                    self.ema_loss = val.parse().unwrap_or(10.0);
-                }
-                if let Some(val) = line.strip_prefix("best_loss=") {
-                    self.best_loss = val.parse().unwrap_or(f32::MAX);
-                }
+                if let Some(val) = line.strip_prefix("step=") { self.step = val.parse().unwrap_or(0); }
+                if let Some(val) = line.strip_prefix("ema_loss=") { self.ema_loss = val.parse().unwrap_or(10.0); }
+                if let Some(val) = line.strip_prefix("best_loss=") { self.best_loss = val.parse().unwrap_or(f32::MAX); }
             }
         }
-
-        println!(
-            "  ✓ Checkpoint carregado: step {}, ema_loss {:.4}",
-            self.step, self.ema_loss
-        );
+        println!("  ✓ Checkpoint carregado: step {}", self.step);
         Ok(())
     }
 
-    /// Define learning rate manualmente (para LR finder)
     pub fn set_learning_rate(&mut self, lr: f64) {
         self.config.learning_rate = lr;
     }
 
-    // Getters
     pub fn step(&self) -> usize { self.step }
     pub fn config(&self) -> &TrainingConfig { &self.config }
     pub fn ema_loss(&self) -> f32 { self.ema_loss }
     #[allow(dead_code)]
-    pub fn micro_step(&self) -> usize { self.micro_step }
-    #[allow(dead_code)]
-    pub fn current_lr(&self) -> f64 { self.get_learning_rate() }
-    #[allow(dead_code)]
     pub fn best_loss(&self) -> f32 { self.best_loss }
-    #[allow(dead_code)]
-    pub fn last_grad_norm(&self) -> f32 { self.last_grad_norm }
-    #[allow(dead_code)]
-    pub fn model_config(&self) -> &RWKVConfig { &self.model_config }
 }
