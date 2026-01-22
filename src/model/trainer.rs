@@ -95,7 +95,12 @@ impl<B: AutodiffBackend> Trainer<B> {
         if self.micro_step >= self.config.gradient_accumulation_steps {
             let lr = self.get_learning_rate();
 
-            // Optimizer step
+            // TODO: Burn 0.14 API changed, Gradients/GradientsParams not easily clonable for logging.
+            // Keeping 0.0 for now to ensure stability.
+            let grad_norm = 0.0;
+            
+            self.last_grad_norm = grad_norm;
+
             self.model = self.optimizer.step(lr, self.model.clone(), grad_params);
 
             // Metrics

@@ -7,7 +7,7 @@ description = "RWKV Language Model para Português Brasileiro"
 
 [features]
 # IMPORTANTE: default vazio para evitar conflitos
-default = ["cpu"]
+default = []
 cpu = ["burn/ndarray"]
 gpu = ["burn/wgpu"]
 cuda = ["burn/cuda-jit"]

@@ -105,8 +105,8 @@ impl Evaluator {
             return loss_scalar.elem::<f32>();
         }
 
-        // CPU (ndarray): usar loop (compatível)
-        #[cfg(feature = "cpu")]
+        // CPU (ndarray): selecionado apenas se não houver GPU
+        #[cfg(all(feature = "cpu", not(feature = "cuda"), not(feature = "gpu")))]
         {
             let targets_data: Vec<i64> = targets_flat.to_data().as_slice().unwrap().to_vec();
             let n = targets_data.len();
