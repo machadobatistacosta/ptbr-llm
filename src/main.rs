@@ -36,8 +36,10 @@ mod backend_impl {
 
 #[cfg(all(feature = "gpu", not(feature = "cuda"), not(feature = "cpu")))]
 mod backend_impl {
-    pub use burn::backend::wgpu::{AutoGraphicsApi, Wgpu, WgpuDevice};
-    pub type MyBackend = Wgpu<f32, i32>;
+    use burn::backend::wgpu::{WgpuDevice, WgpuRuntime, Vulkan};
+    use burn::backend::JitBackend;
+
+    pub type MyBackend = JitBackend<WgpuRuntime<Vulkan>, f32, i32>;
     
     pub fn get_device() -> WgpuDevice {
         WgpuDevice::BestAvailable
