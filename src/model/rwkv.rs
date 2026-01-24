@@ -303,22 +303,32 @@ impl<B: Backend> TimeMixing<B> {
         let device = x.device();
 
         // Token shift
+        // println!("DEBUG: TimeMixing - Token Shift");
+        // std::io::stdout().flush().unwrap();
         let x_prev = self.token_shift(x.clone(), b, t, c);
 
         // Mix - reuse x_prev reference
+        // println!("DEBUG: TimeMixing - Mix");
+        // std::io::stdout().flush().unwrap();
         let xk = self.mix(x.clone(), x_prev.clone(), self.time_mix_k.val(), c);
         let xv = self.mix(x.clone(), x_prev.clone(), self.time_mix_v.val(), c);
         let xr = self.mix(x, x_prev, self.time_mix_r.val(), c);
 
         // Projections
+        // println!("DEBUG: TimeMixing - Projections");
+        // std::io::stdout().flush().unwrap();
         let r = activation::sigmoid(self.receptance.forward(xr));
         let k = self.key.forward(xk);
         let v = self.value.forward(xv);
 
         // WKV
+        println!("DEBUG: TimeMixing - WKV Stable");
+        std::io::stdout().flush().unwrap();
         let wkv = self.wkv_stable(k, v, b, t, c, &device);
 
         // Output
+        println!("DEBUG: TimeMixing - Output");
+        std::io::stdout().flush().unwrap();
         self.output.forward(r * wkv)
     }
 
