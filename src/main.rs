@@ -2085,9 +2085,13 @@ fn create_batch_tensor<B: Backend>(data: &[Vec<u16>], device: &B::Device) -> Ten
     let batch_size = data.len();
     let seq_len = data[0].len();
 
+    // Convert u16 -> i32 (Safe common denominator)
     let flat: Vec<i32> = data.iter().flatten().map(|&x| x as i32).collect();
 
-    let tensor: Tensor<B, 1, Int> = Tensor::from_ints(flat.as_slice(), device);
+    // Use Data struct for safe conversion to Backend::IntElem (i32 or i64)
+    let data = burn::tensor::Data::from(flat.as_slice());
+    let tensor = Tensor::from_data(data, device);
+    
     tensor.reshape([batch_size, seq_len])
 }
 
