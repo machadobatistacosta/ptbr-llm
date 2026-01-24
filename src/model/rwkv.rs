@@ -91,15 +91,24 @@ impl<B: Backend> RWKV<B> {
     }
 
     pub fn forward(&self, input_ids: Tensor<B, 2, Int>) -> Tensor<B, 3> {
+        println!("DEBUG: RWKV - Embedding forward...");
+        std::io::stdout().flush().unwrap();
         let mut x = self.embedding.forward(input_ids);
+        
+        println!("DEBUG: RWKV - LayerNorm Pre forward...");
+        std::io::stdout().flush().unwrap();
         x = self.ln_pre.forward(x);
 
         for (i, block) in self.blocks.iter().enumerate() {
-            // println!("DEBUG: RWKV Layer {}", i);
+            println!("DEBUG: RWKV Layer {} start", i);
+            std::io::stdout().flush().unwrap();
             x = block.forward(x);
+            println!("DEBUG: RWKV Layer {} end", i);
+            std::io::stdout().flush().unwrap();
         }
         
         println!("DEBUG: RWKV all layers done. Final LayerNorm...");
+        std::io::stdout().flush().unwrap();
         x = self.ln_out.forward(x);
         self.head.forward(x)
     }
@@ -180,11 +189,17 @@ impl<B: Backend> RWKVBlock<B> {
 
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
         // Pre-norm architecture com residual
+        // println!("DEBUG: Block - LN1");
         let ln1_out = self.ln1.forward(x.clone());
+        
+        // println!("DEBUG: Block - TimeMixing");
         let tm = self.time_mixing.forward(ln1_out);
         let x = x + self.dropout.forward(tm);
 
+        // println!("DEBUG: Block - LN2");
         let ln2_out = self.ln2.forward(x.clone());
+        
+        // println!("DEBUG: Block - ChannelMixing");
         let cm = self.channel_mixing.forward(ln2_out);
         x + self.dropout.forward(cm)
     }
