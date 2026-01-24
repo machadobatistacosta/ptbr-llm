@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 // src/model/validation.rs
 //! Sistema de validação durante treino
 
@@ -165,7 +166,7 @@ impl Validator {
     ) -> (f32, usize, usize, f32, usize) {
         let input_i32: Vec<i32> = input.iter().map(|&x| x as i32).collect();
         let input_tensor: Tensor<B, 2, Int> =
-            Tensor::from_ints(input_i32.as_slice(), device).reshape([1, input.len()]);
+            Tensor::<B, 1, Int>::from_ints(input_i32.as_slice(), device).reshape([1, input.len()]);
 
         let logits = model.forward(input_tensor);
         let [_, seq_len, vocab_size] = logits.dims();
@@ -269,7 +270,7 @@ impl Validator {
             let seq_len = input_vec.len();
 
             let input: Tensor<B, 2, Int> =
-                Tensor::from_ints(input_vec.as_slice(), device).reshape([1, seq_len]);
+                Tensor::<B, 1, Int>::from_ints(input_vec.as_slice(), device).reshape([1, seq_len]);
 
             let logits = model.forward_inference(input);
             let [_, v] = logits.dims();

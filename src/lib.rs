@@ -7,7 +7,7 @@ pub mod logger;
 pub mod utils;
 
 // Re-exports principais
-pub use data::{DataLoader, MmapDataset, TokenizedDatasetWriter, WikiCleaner, WikiStreamParser};
+pub use data::{DataLoader, MmapDataset, TokenizedDatasetWriter, WikiCleaner, DirtySample, WikiStreamParser};
 pub use model::{RWKVConfig, Trainer, TrainingConfig, RWKV};
 pub use tokenizer::{BPETokenizer, BPETrainer, PTBRNormalizer};
 

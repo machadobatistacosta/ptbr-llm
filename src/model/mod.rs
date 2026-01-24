@@ -3,6 +3,9 @@ mod evaluator;
 mod lr_finder;
 mod rwkv;
 mod trainer;
+pub mod wkv_optimized;
+pub mod precision;
+pub mod validation;
 
 pub use config::{RWKVConfig, TrainingConfig};
 pub use evaluator::Evaluator;

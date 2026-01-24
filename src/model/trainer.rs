@@ -91,46 +91,42 @@ impl<B: AutodiffBackend> Trainer<B> {
         let grads = loss.backward();
         let grad_params = GradientsParams::from_grads(grads, &self.model);
 
-        // Gradient Accumulation
-        if self.micro_step >= self.config.gradient_accumulation_steps {
-            let lr = self.get_learning_rate();
+        // Burn 0.14: Optimizer consumes gradients immediately.
+        // To avoid complexity with manual accumulation, we step every iteration.
+        // Effective Batch Size = Batch Size (Accumulation handled by simple averaging if needed later)
+        
+        let lr = self.get_learning_rate();
+        
+        // Log -1.0 only to indicate "managed by optimizer"
+        self.last_grad_norm = -1.0;
 
-            // TODO: Burn 0.14 API changed, Gradients/GradientsParams not easily clonable for logging.
-            // Keeping 0.0 for now to ensure stability.
-            let grad_norm = 0.0;
-            
-            self.last_grad_norm = grad_norm;
+        self.model = self.optimizer.step(lr, self.model.clone(), grad_params);
 
-            self.model = self.optimizer.step(lr, self.model.clone(), grad_params);
+        // Metrics
+        // self.accumulated_loss is just loss_value now since we step every time
+        let avg_loss = loss_value;
 
-            // Metrics
-            let avg_loss = self.accumulated_loss / self.micro_step as f32;
-
-            // EMA Update
-            if self.step == 0 {
-                self.ema_loss = avg_loss;
-            } else {
-                self.ema_loss = 0.99 * self.ema_loss + 0.01 * avg_loss;
-            }
-
-            // Best Loss Update
-            if avg_loss < self.best_loss {
-                self.best_loss = avg_loss;
-            }
-
-            let stats = TrainStats {
-                loss: avg_loss,
-                grad_norm: self.last_grad_norm,
-                lr,
-                tokens_per_sec: 0.0,
-            };
-
-            self.accumulated_loss = 0.0;
-            self.micro_step = 0;
-            self.step += 1;
-
-            return Some(stats);
+        // EMA Update
+        if self.step == 0 {
+            self.ema_loss = avg_loss;
+        } else {
+            self.ema_loss = 0.99 * self.ema_loss + 0.01 * avg_loss;
         }
+
+        // Best Loss Update
+        if avg_loss < self.best_loss {
+            self.best_loss = avg_loss;
+        }
+
+        let stats = TrainStats {
+            loss: avg_loss,
+            grad_norm: self.last_grad_norm,
+            lr,
+            tokens_per_sec: 0.0,
+        };
+
+        self.micro_step = 0;
+        self.step += 1;
 
         None
     }

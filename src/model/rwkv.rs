@@ -392,74 +392,30 @@ impl<B: Backend> TimeMixing<B> {
 
     /// WKV paralelo - usa atenção linear para melhor performance com Autodiff
     /// Esta versão computa todos os tokens em paralelo usando operações de matriz
+    /// WKV Otimizado (Linear Attention Exact)
+    /// Usa o kernel `wkv_linear` do módulo otimizado
     fn wkv_stable(
         &self,
         k: Tensor<B, 3>,
         v: Tensor<B, 3>,
-        b: usize,
-        t: usize,
-        c: usize,
-        device: &B::Device,
+        _b: usize,
+        _t: usize,
+        _c: usize,
+        _device: &B::Device,
     ) -> Tensor<B, 3> {
-        // Para treino, usamos uma aproximação linear que é mais eficiente com Autodiff
-        
-        // u: [C] -> [1, 1, C]
+        use crate::model::wkv_optimized::{wkv_linear, WKVConfig};
+
+        // Extrai parâmetros
         let u = self.time_first.val();
-        let u_broadcast = u.reshape([1, 1, c]);
-        
-        // Calcula taxa de decay baseada na média dos canais
-        let w = self.time_decay.val();
-        let w_mean = w.clone().mean(); // [1]
-        // Clamp para evitar valores extremos: decay deve ser pequeno
-        let decay_rate = (-w_mean).exp().clamp(0.001, 0.1); // [1]
-        
-        // exp(k) para pesos de atenção
-        let k_max = k.clone().max_dim(2).reshape([b, t, 1]);
-        let k_stable = k.clone() - k_max;
-        let k_exp = k_stable.clone().exp(); // [B, T, C]
-        
-        // Weighted values: exp(k) * v
-        let weighted_v = k_exp.clone() * v.clone(); // [B, T, C]
-        
-        // Cria pesos de decay baseados na posição
-        // arange retorna Int, convertemos para Float
-        let indices = Tensor::<B, 1, Int>::arange(0..(t as i64), device).float(); // [T]
-        let t_float = t.max(1) as f32;
-        let positions = indices / t_float; // [T]
-        
-        // Broadcast
-        let positions = positions.reshape([1, t, 1]);
-        let decay_rate = decay_rate.reshape([1, 1, 1]);
-        
-        let pos_tensor = positions * decay_rate * 10.0; // [1, T, 1]
-        
-        // decay_weights: softmax-like normalization
-        let pos_max = pos_tensor.clone().max_dim(1); // [1, 1, 1]
-        let decay_weights = (pos_tensor - pos_max).exp(); 
-        let decay_sum = decay_weights.clone().sum_dim(1); // [1, 1, 1]
-        let decay_weights_norm = decay_weights / (decay_sum + NUMERIC_EPS);
-        
-        // Aplica pesos
-        let weighted_v_decayed = weighted_v * decay_weights_norm.clone();
-        let k_exp_decayed = k_exp.clone() * decay_weights_norm; // REUSE k_exp
-        
-        // Soma ponderada global
-        let sum_weighted_v = weighted_v_decayed.sum_dim(1).reshape([b, 1, c]); 
-        let sum_k_exp = k_exp_decayed.sum_dim(1).reshape([b, 1, c]) + NUMERIC_EPS;
-        
-        // Output base é a média global ponderada
-        let global_avg = sum_weighted_v / sum_k_exp; // [B, 1, C]
-        
-        // Adiciona influência local (token atual tem bonus u)
-        // u_broadcast já está em escala razoável, usar diretamente
-        let u_exp = u_broadcast.exp();
-        // REMOVIDO k_exp_local redundante, reusando k_stable.exp() que é k_exp
-        let local_contrib = u_exp.clone() * k_exp.clone() * v;
-        let local_norm = u_exp * k_exp + NUMERIC_EPS;
-        let local_output = local_contrib / local_norm; // [B, T, C]
-        
-        // Mix entre global e local: output = alpha * local + (1-alpha) * global
-        local_output * 0.7 + global_avg * 0.3
+        let w = self.time_decay.val(); // Passamos raw params, wkv_linear converte
+
+        let config = WKVConfig {
+            chunk_size: 32, // Otimizado para GPU
+            use_float64_accumulator: true,
+            parallel_heads: true,
+        };
+
+        wkv_linear(k, v, w, u, &config)
     }
 }
 

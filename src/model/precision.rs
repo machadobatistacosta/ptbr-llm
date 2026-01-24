@@ -1,3 +1,4 @@
+#![allow(dead_code)]
 // src/model/precision.rs
 //! Configuração de precisão numérica
 

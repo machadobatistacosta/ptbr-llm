@@ -1,3 +1,5 @@
+#![allow(unused)]
+#![allow(dead_code)]
 
 mod data;
 mod model;
@@ -27,8 +29,8 @@ mod backend_impl {
     pub use burn::backend::cuda_jit::{Cuda, CudaDevice};
     pub type MyBackend = Cuda;
     
-    pub fn get_device() -> CudaDevice {
-        CudaDevice::new(0)
+    pub fn get_device(index: usize) -> CudaDevice {
+        CudaDevice::new(index)
     }
 }
 
@@ -737,10 +739,18 @@ fn train_tokenizer(corpus: &PathBuf, output: &PathBuf, vocab_size: usize, specia
         all_texts
     };
 
-    println!("  Total de linhas: {}", format_number(texts.len()));
+    println!("  Total de linhas raw: {}", format_number(texts.len()));
+    println!("  🔥 MODO TOTAL: Normalizando TODAS as linhas...");
+    
+    let normalizer = PTBRNormalizer::new();
+    let normalized_texts: Vec<String> = texts
+        .par_iter()
+        .map(|text| normalizer.normalize(text))
+        .collect();
+    println!("  Normalização concluída ({} linhas).", normalized_texts.len());
     println!();
 
-    let vocab = trainer.train(texts.into_iter());
+    let vocab = trainer.train(normalized_texts.into_iter());
     let tokenizer = BPETokenizer::from_vocab(vocab);
 
     std::fs::create_dir_all(output).expect("Erro criando diretório");

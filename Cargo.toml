@@ -14,7 +14,7 @@ cuda = ["burn/cuda-jit"]
 torch = ["burn/tch"]
 
 [dependencies]
-burn = { version = "0.14", default-features = false, features = ["autodiff", "train"] }
+burn = { version = "0.14", default-features = false, features = ["autodiff", "train", "ndarray"] }
 bincode = { version = "2.0.0-rc.3", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
@@ -41,3 +41,15 @@ strip = true
 
 [profile.dev]
 opt-level = 1
+
+[[bin]]
+name = "audit"
+path = "src/utils/data_audit.rs"
+
+[[bin]]
+name = "purge"
+path = "src/utils/data_purge.rs"
+
+[[bin]]
+name = "vocab_pilot"
+path = "src/utils/vocab_pilot.rs"

@@ -44,6 +44,9 @@ struct CleanerPatterns {
     multi_space: Regex,
     multi_newline: Regex,
     pipe_cleanup: Regex,
+    
+    // V14
+    ocr_hyphen: Regex,
 }
 
 impl CleanerPatterns {
@@ -89,6 +92,11 @@ impl CleanerPatterns {
             multi_space: Regex::new(r"[ \t]+").unwrap(),
             multi_newline: Regex::new(r"\n{3,}").unwrap(),
             pipe_cleanup: Regex::new(r"\|+").unwrap(),
+            
+            // V14: OCR Hyphen Fix (lookaround substitute)
+            // Regex crate doesn't support lookaround, so we use capture groups:
+            // ([a-zà-ú])-\s+([a-zà-ú]) -> $1$2
+            ocr_hyphen: Regex::new(r"([a-zà-ú])-\s+([a-zà-ú])").unwrap(),
         }
     }
 }
@@ -96,6 +104,120 @@ impl CleanerPatterns {
 /// Cleaner principal para texto Wikipedia
 pub struct WikiCleaner {
     garbage_markers: HashSet<&'static str>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DirtySample {
+    pub line: String,
+    pub score: f32,
+    pub reason: String,
+}
+
+impl WikiCleaner {
+    /// Calcula pontuação de "sujeira" (0.0 = limpo, 1.0 = lixo total)
+    pub fn audit_line(line: &str) -> Option<DirtySample> {
+        let mut score = 0.0;
+        let mut reasons = Vec::new();
+
+        let len = line.len();
+        if len == 0 { return None; }
+
+        let chars: Vec<char> = line.chars().collect();
+        let total = chars.len() as f32;
+
+        // 1. DENSIDADE ASCII vs UNICODE
+        // Em PT-BR, a maioria é ASCII (a-z, A-Z, 0-9, pontuação).
+        // Unicode esperado: á, é, í, ó, ú, â, ê, ô, ã, õ, ç, À, etc.
+        // Símbolos matemáticos, emojis, ou outros scripts são suspeitos.
+        let mut _ascii_count = 0;
+        let mut _valid_pt_unicode = 0;
+        let mut symbol_count = 0;
+        let mut uppercase_count = 0;
+
+        for c in &chars {
+            if c.is_ascii() {
+                _ascii_count += 1;
+                if c.is_ascii_uppercase() {
+                    uppercase_count += 1;
+                }
+                if !c.is_alphanumeric() && !c.is_whitespace() {
+                     // Pontuação ASCII comum é OK, mas se for excessiva...
+                     if !".,;?!-()\"' ".contains(*c) {
+                         symbol_count += 1;
+                     }
+                }
+            } else {
+                // Lista branca de Unicode PT-BR
+                if "áéíóúÁÉÍÓÚâêîôûÂÊÎÔÛãõÃÕçÇàÀüÜ".contains(*c) {
+                    _valid_pt_unicode += 1;
+                } else if "–—…°ªº§".contains(*c) {
+                    // Pontuação estendida aceitável
+                } else {
+                    symbol_count += 3; // Penalidade maior para unicode estranho
+                }
+            }
+        }
+
+        // HEURÍSTICA 1: Excesso de Símbolos
+        let symbol_ratio = symbol_count as f32 / total;
+        if symbol_ratio > 0.15 {
+            score += symbol_ratio * 3.0; // Boost no score
+            reasons.push(format!("High Symbol Density: {:.1}%", symbol_ratio * 100.0));
+        }
+
+        // HEURÍSTICA 2: Uppercase Shout (Caps lock)
+        let upper_ratio = uppercase_count as f32 / total;
+        if upper_ratio > 0.6 && len > 50 {
+             score += 0.5;
+             reasons.push(format!("Caps Lock Abuse: {:.1}%", upper_ratio * 100.0));
+        }
+
+        // HEURÍSTICA 3: Encoding Fantasma (BOM ou escapes)
+        if line.contains('\u{FEFF}') || line.contains('\u{FFFD}') {
+            score += 1.0;
+            reasons.push("Ghost BOM / Replacement Char Detected".to_string());
+        }
+        
+        // Malformed Escapes detecção (ex: \x00, \u0000 literais)
+        if line.contains("\\x") || line.contains("\\u") {
+             // Pode ser código fonte escapado
+             score += 0.4;
+             reasons.push("Potential Malformed Escape Sequence".to_string());
+        }
+
+        // HEURÍSTICA 4: Palavras Impossíveis (4 consoantes raras seguidas)
+        // Consoantes: bcdfghjklmnpqrstvwxyz (removemos vogais e 'ç')
+        // Vamos ser estritos: Sequências que não ocorrem em PT-BR.
+        // Tentei ser 'estatístico', mas checker simples de cluster funciona bem.
+        // Clusters comuns: trans, const, nstr, bstr (abstrato) -> max 4 consoantes.
+        // Se tiver 5, é muito provável erro ou estrangeiro/sigla ruim.
+        let mut cons_streak = 0;
+        let mut max_streak = 0;
+        for c in &chars {
+            if "bcdfghjklmnpqrstvwxyzBCDFGHJKLMNPQRSTVWXYZ".contains(*c) {
+                cons_streak += 1;
+            } else {
+                if cons_streak > max_streak { max_streak = cons_streak; }
+                cons_streak = 0;
+            }
+        }
+        if cons_streak > max_streak { max_streak = cons_streak; }
+
+        if max_streak >= 5 {
+             score += 0.8;
+             reasons.push(format!("Impossible Consonant Cluster (len={})", max_streak));
+        }
+
+        if score > 0.5 {
+            Some(DirtySample {
+                line: line.to_string(),
+                score,
+                reason: reasons.join(" | "),
+            })
+        } else {
+            None
+        }
+    }
 }
 
 impl WikiCleaner {
@@ -138,9 +260,28 @@ impl WikiCleaner {
         Self { garbage_markers }
     }
 
+    pub fn fix_planalto(&self, text: &str) -> String {
+        // Mapa de correção de caracteres corrompidos do Planalto
+        // 'ę': 'ê', 'ş': 'º', 'ŕ': 'à', 'ă': 'ã', 'č': 'è', 'ľ': 'ç', 'î': 'í', 'đ': 'ð'
+        text.replace('ę', "ê")
+            .replace('ş', "º")
+            .replace('ŕ', "à")
+            .replace('ă', "ã")
+            .replace('č', "è")
+            .replace('ľ', "ç")
+            .replace('î', "í")
+            .replace('đ', "ð")
+    }
+
     /// Limpa texto de marcação Wikipedia
     pub fn clean(&self, text: &str) -> String {
-        let mut result = text.to_string();
+        // 0. Planalto Fix (Correção de Mojibake específico)
+        let mut result = self.fix_planalto(text);
+
+        // 0.5 HTML Unescape (usando quick_xml ou match básico se falhar)
+        if let Ok(unescaped) = quick_xml::escape::unescape(&result) {
+            result = unescaped.to_string();
+        }
 
         // 1. Remove comentários HTML
         result = PATTERNS.html_comment.replace_all(&result, "").to_string();
@@ -218,6 +359,12 @@ impl WikiCleaner {
         result = PATTERNS
             .year_stuck
             .replace_all(&result, "$1 $2$3")
+            .to_string();
+
+        // 13.5 OCR Hyphen Fix ("cons- tituição" -> "constituição")
+        result = PATTERNS
+            .ocr_hyphen
+            .replace_all(&result, "$1$2")
             .to_string();
 
         // 14. Normaliza espaços

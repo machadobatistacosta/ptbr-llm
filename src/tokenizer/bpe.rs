@@ -192,7 +192,7 @@ impl BPETokenizer {
                         current.clear();
                     }
                     if let Some(&next) = chars.peek() {
-                        if next.is_alphabetic() {
+                        if !next.is_whitespace() {
                             current.push('Ġ');
                         }
                     }

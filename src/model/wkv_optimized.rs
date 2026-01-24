@@ -43,7 +43,8 @@ pub fn wkv_linear<B: Backend>(
     let chunk_size = config.chunk_size;
 
     // Expande w e u para broadcast
-    let w_exp = w.clone().exp().neg(); // e^{-w}
+    // w é o parâmetro time_decay. O decay real em log-space é -exp(w).
+    let w_log = w.clone().exp().neg(); // -e^w
     
     // Estados iniciais (log-space para estabilidade)
     let mut aa = Tensor::<B, 2>::zeros([b, c], &device);
@@ -80,7 +81,8 @@ pub fn wkv_linear<B: Backend>(
             outputs.push(wkv.reshape([b, 1, c]));
 
             // Atualiza estados para próximo timestep
-            let ww2 = w_exp.clone().reshape([1, c]).log() + pp.clone(); // log(e^{-w} * e^p) = -w + p
+            // w_log já é o valor em log-space (-exp(w)), então somamos diretamento
+            let ww2 = w_log.clone().reshape([1, c]) + pp.clone(); 
             let p2 = ww2.clone().max_pair(kt.clone());
             let e1_2 = (ww2 - p2.clone()).exp();
             let e2_2 = (kt - p2.clone()).exp();
