@@ -61,6 +61,7 @@ impl<B: AutodiffBackend> Trainer<B> {
             ema_loss: 10.0, // Começa alto
             best_loss: f32::MAX,
             device,
+            loss_accumulator: None,
         }
     }
 
@@ -84,49 +85,65 @@ impl<B: AutodiffBackend> Trainer<B> {
             panic!("Training diverged - loss became NaN/Inf");
         }
 
+        // Acumula Loss para Stats (sem afetar grafo)
         self.accumulated_loss += loss_value;
         self.micro_step += 1;
 
-        // Backward
-        let grads = loss.backward();
-        let grad_params = GradientsParams::from_grads(grads, &self.model);
+        // Normalização do Loss antes de acumular no grafo
+        let accum_steps = self.config.gradient_accumulation_steps as f32;
+        let normalized_loss = loss / accum_steps;
 
-        // Burn 0.14: Optimizer consumes gradients immediately.
-        // To avoid complexity with manual accumulation, we step every iteration.
-        // Effective Batch Size = Batch Size (Accumulation handled by simple averaging if needed later)
-        
-        let lr = self.get_learning_rate();
-        
-        // Log -1.0 only to indicate "managed by optimizer"
-        self.last_grad_norm = -1.0;
-
-        self.model = self.optimizer.step(lr, self.model.clone(), grad_params);
-
-        // Metrics
-        // self.accumulated_loss is just loss_value now since we step every time
-        let avg_loss = loss_value;
-
-        // EMA Update
-        if self.step == 0 {
-            self.ema_loss = avg_loss;
+        // Acumulação do Grafo (Graph Accumulation)
+        if let Some(current_accum) = self.loss_accumulator.take() {
+            self.loss_accumulator = Some(current_accum + normalized_loss);
         } else {
-            self.ema_loss = 0.99 * self.ema_loss + 0.01 * avg_loss;
+            self.loss_accumulator = Some(normalized_loss);
         }
 
-        // Best Loss Update
-        if avg_loss < self.best_loss {
-            self.best_loss = avg_loss;
+        // Se completou os passos de acumulação, executa Step
+        if self.micro_step % self.config.gradient_accumulation_steps == 0 {
+            let final_loss = self.loss_accumulator.take().unwrap();
+            
+            // Backward na soma dos losses
+            let grads = final_loss.backward();
+            let grad_params = GradientsParams::from_grads(grads, &self.model);
+            
+            let lr = self.get_learning_rate();
+            
+            // Optimizer Step
+            self.model = self.optimizer.step(lr, self.model.clone(), grad_params);
+            
+            // Log -1.0 only to indicate "managed by optimizer"
+            self.last_grad_norm = -1.0;
+
+            // Metrics Update
+            // self.accumulated_loss contém a soma dos N losses. Média = sum / N
+            let avg_loss = self.accumulated_loss / accum_steps;
+            
+            // Reset acumuladores de stats
+            self.accumulated_loss = 0.0;
+            self.micro_step = 0;
+            self.step += 1;
+
+            // EMA Update
+            if self.step == 1 { // Primeiro step real
+                self.ema_loss = avg_loss;
+            } else {
+                self.ema_loss = 0.99 * self.ema_loss + 0.01 * avg_loss;
+            }
+
+            // Best Loss Update
+            if avg_loss < self.best_loss {
+                self.best_loss = avg_loss;
+            }
+
+            return Some(TrainStats {
+                loss: avg_loss,
+                grad_norm: self.last_grad_norm,
+                lr,
+                tokens_per_sec: 0.0,
+            });
         }
-
-        let stats = TrainStats {
-            loss: avg_loss,
-            grad_norm: self.last_grad_norm,
-            lr,
-            tokens_per_sec: 0.0,
-        };
-
-        self.micro_step = 0;
-        self.step += 1;
 
         None
     }
