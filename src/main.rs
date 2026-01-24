@@ -29,8 +29,8 @@ mod backend_impl {
     pub use burn::backend::cuda_jit::{Cuda, CudaDevice};
     pub type MyBackend = Cuda;
     
-    pub fn get_device(index: usize) -> CudaDevice {
-        CudaDevice::new(index)
+    pub fn get_device() -> CudaDevice {
+        CudaDevice::new(0)
     }
 }
 
