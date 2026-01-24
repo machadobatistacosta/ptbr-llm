@@ -6,9 +6,8 @@ use burn::{
         Dropout, DropoutConfig, Embedding, EmbeddingConfig, LayerNorm, LayerNormConfig, Linear,
         LinearConfig,
     },
-    tensor::{activation, backend::Backend, Int, Tensor},
+    tensor::{activation, backend::Backend, Int, Tensor, checkpoint},
 };
-use std::io::Write;
 
 /// Epsilon para estabilidade numérica
 const NUMERIC_EPS: f32 = 1e-7;
@@ -92,24 +91,15 @@ impl<B: Backend> RWKV<B> {
     }
 
     pub fn forward(&self, input_ids: Tensor<B, 2, Int>) -> Tensor<B, 3> {
-        println!("DEBUG: RWKV - Embedding forward...");
-        std::io::stdout().flush().unwrap();
         let mut x = self.embedding.forward(input_ids);
-        
-        println!("DEBUG: RWKV - LayerNorm Pre forward...");
-        std::io::stdout().flush().unwrap();
         x = self.ln_pre.forward(x);
 
-        for (i, block) in self.blocks.iter().enumerate() {
-            println!("DEBUG: RWKV Layer {} start", i);
-            std::io::stdout().flush().unwrap();
-            x = block.forward(x);
-            println!("DEBUG: RWKV Layer {} end", i);
-            std::io::stdout().flush().unwrap();
+        for block in self.blocks.iter() {
+            // Gradient Checkpointing to save memory and avoid stack overflow in deep graph
+            let block = block.clone();
+            x = checkpoint(move |x| block.forward(x), x);
         }
         
-        println!("DEBUG: RWKV all layers done. Final LayerNorm...");
-        std::io::stdout().flush().unwrap();
         x = self.ln_out.forward(x);
         self.head.forward(x)
     }
@@ -303,32 +293,22 @@ impl<B: Backend> TimeMixing<B> {
         let device = x.device();
 
         // Token shift
-        // println!("DEBUG: TimeMixing - Token Shift");
-        // std::io::stdout().flush().unwrap();
         let x_prev = self.token_shift(x.clone(), b, t, c);
 
         // Mix - reuse x_prev reference
-        // println!("DEBUG: TimeMixing - Mix");
-        // std::io::stdout().flush().unwrap();
         let xk = self.mix(x.clone(), x_prev.clone(), self.time_mix_k.val(), c);
         let xv = self.mix(x.clone(), x_prev.clone(), self.time_mix_v.val(), c);
         let xr = self.mix(x, x_prev, self.time_mix_r.val(), c);
 
         // Projections
-        // println!("DEBUG: TimeMixing - Projections");
-        // std::io::stdout().flush().unwrap();
         let r = activation::sigmoid(self.receptance.forward(xr));
         let k = self.key.forward(xk);
         let v = self.value.forward(xv);
 
         // WKV
-        println!("DEBUG: TimeMixing - WKV Stable");
-        std::io::stdout().flush().unwrap();
         let wkv = self.wkv_stable(k, v, b, t, c, &device);
 
         // Output
-        println!("DEBUG: TimeMixing - Output");
-        std::io::stdout().flush().unwrap();
         self.output.forward(r * wkv)
     }
 

@@ -1155,10 +1155,8 @@ fn run_training_loop(
             }
             
             // Cria tensores
-            println!("DEBUG: Creating tensors...");
             let input_tensor = create_batch_tensor::<TrainBackend>(&inputs, device);
             let target_tensor = create_batch_tensor::<TrainBackend>(&targets, device);
-            println!("DEBUG: Tensors created. Starting train_step...");
 
             // Train step
             if let Some(stats) = trainer.train_step(input_tensor, target_tensor) {
