@@ -6,7 +6,7 @@ use burn::{
         Dropout, DropoutConfig, Embedding, EmbeddingConfig, LayerNorm, LayerNormConfig, Linear,
         LinearConfig,
     },
-    tensor::{activation, backend::Backend, Int, Tensor, checkpoint},
+    tensor::{activation, backend::Backend, Int, Tensor},
 };
 
 /// Epsilon para estabilidade numérica
@@ -95,9 +95,7 @@ impl<B: Backend> RWKV<B> {
         x = self.ln_pre.forward(x);
 
         for block in self.blocks.iter() {
-            // Gradient Checkpointing to save memory and avoid stack overflow in deep graph
-            let block = block.clone();
-            x = checkpoint(move |x| block.forward(x), x);
+            x = block.forward(x);
         }
         
         x = self.ln_out.forward(x);
@@ -180,21 +178,11 @@ impl<B: Backend> RWKVBlock<B> {
 
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
         // Pre-norm architecture com residual
-        println!("DEBUG: Block - LN1");
-        std::io::stdout().flush().unwrap();
         let ln1_out = self.ln1.forward(x.clone());
-        
-        println!("DEBUG: Block - TimeMixing");
-        std::io::stdout().flush().unwrap();
         let tm = self.time_mixing.forward(ln1_out);
         let x = x + self.dropout.forward(tm);
 
-        println!("DEBUG: Block - LN2");
-        std::io::stdout().flush().unwrap();
         let ln2_out = self.ln2.forward(x.clone());
-        
-        println!("DEBUG: Block - ChannelMixing");
-        std::io::stdout().flush().unwrap();
         let cm = self.channel_mixing.forward(ln2_out);
         x + self.dropout.forward(cm)
     }
