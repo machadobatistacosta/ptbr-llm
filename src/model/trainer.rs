@@ -36,6 +36,7 @@ pub struct Trainer<B: AutodiffBackend> {
     best_loss: f32,
 
     device: B::Device,
+    loss_accumulator: Option<Tensor<B, 1>>,
 }
 
 impl<B: AutodiffBackend> Trainer<B> {
