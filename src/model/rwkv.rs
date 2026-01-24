@@ -98,7 +98,7 @@ impl<B: Backend> RWKV<B> {
         for block in self.blocks.iter() {
             // Gradient Checkpointing para reduzir uso de memória e stack
             let block = block.clone();
-            x = checkpoint(move |x| block.forward(x), x);
+            x = checkpoint::checkpoint(move |x| block.forward(x), x);
         }
         
         x = self.ln_out.forward(x);
