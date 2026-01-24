@@ -273,7 +273,7 @@ impl Validator {
                 Tensor::<B, 1, Int>::from_ints(input_vec.as_slice(), device).reshape([1, seq_len]);
 
             let logits = model.forward_inference(input);
-            let [_, v] = logits.dims();
+            let [_, _v] = logits.dims();
             let logits_data: Vec<f32> = logits.into_data().iter::<f32>().collect();
 
             // Greedy

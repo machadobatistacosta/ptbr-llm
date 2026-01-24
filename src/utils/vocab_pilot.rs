@@ -22,7 +22,7 @@ fn main() {
     println!("  Sampling {} lines from {} files...", sample_size, paths.len());
     let mut rng = rand::thread_rng();
     let mut sampled_lines = Vec::with_capacity(sample_size);
-    let mut total_files_used = 0;
+    // total_files_used removed
 
     let cleaner = WikiCleaner::new();
     let normalizer = PTBRNormalizer::new();
@@ -51,7 +51,7 @@ fn main() {
             }
             if sampled_lines.len() >= sample_size { break; }
         }
-        total_files_used += 1;
+        // total_files_used increment removed
     }
 
     println!("  Collected {} lines.", sampled_lines.len());
