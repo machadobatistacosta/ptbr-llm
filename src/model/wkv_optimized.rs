@@ -51,17 +51,21 @@ pub fn wkv_linear<B: Backend>(
     let mut bb = Tensor::<B, 2>::zeros([b, c], &device);
     let mut pp = Tensor::<B, 2>::zeros([b, c], &device) - 1e30;
 
-    let mut outputs = Vec::with_capacity(t);
     let num_chunks = (t + chunk_size - 1) / chunk_size;
+    let mut chunk_outputs = Vec::with_capacity(num_chunks);
 
     for chunk_idx in 0..num_chunks {
         let start = chunk_idx * chunk_size;
         let end = (start + chunk_size).min(t);
+        let current_chunk_size = end - start;
 
         let k_chunk = k.clone().slice([0..b, start..end, 0..c]);
         let v_chunk = v.clone().slice([0..b, start..end, 0..c]);
+        
+        // Coleta outputs DESTE chunk
+        let mut step_outputs = Vec::with_capacity(current_chunk_size);
 
-        for i in 0..(end - start) {
+        for i in 0..current_chunk_size {
             let kt = k_chunk.clone().slice([0..b, i..i + 1, 0..c]).reshape([b, c]);
             let vt = v_chunk.clone().slice([0..b, i..i + 1, 0..c]).reshape([b, c]);
 
@@ -78,10 +82,9 @@ pub fn wkv_linear<B: Backend>(
             let denominator = e1.clone() * bb.clone() + e2.clone() + 1e-7;
             let wkv = numerator / denominator;
 
-            outputs.push(wkv.reshape([b, 1, c]));
+            step_outputs.push(wkv.reshape([b, 1, c]));
 
             // Atualiza estados para próximo timestep
-            // w_log já é o valor em log-space (-exp(w)), então somamos diretamento
             let ww2 = w_log.clone().reshape([1, c]) + pp.clone(); 
             let p2 = ww2.clone().max_pair(kt.clone());
             let e1_2 = (ww2 - p2.clone()).exp();
@@ -91,9 +94,12 @@ pub fn wkv_linear<B: Backend>(
             bb = e1_2 * bb + e2_2;
             pp = p2;
         }
+        
+        // Concatena logo este chunk para evitar crescimento excessivo do grafo de Cat
+        chunk_outputs.push(Tensor::cat(step_outputs, 1));
     }
 
-    Tensor::cat(outputs, 1)
+    Tensor::cat(chunk_outputs, 1)
 }
 
 /// WKV com Parallel Scan (mais rápido para GPU)
