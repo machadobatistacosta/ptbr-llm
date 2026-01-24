@@ -190,17 +190,21 @@ impl<B: Backend> RWKVBlock<B> {
 
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
         // Pre-norm architecture com residual
-        // println!("DEBUG: Block - LN1");
+        println!("DEBUG: Block - LN1");
+        std::io::stdout().flush().unwrap();
         let ln1_out = self.ln1.forward(x.clone());
         
-        // println!("DEBUG: Block - TimeMixing");
+        println!("DEBUG: Block - TimeMixing");
+        std::io::stdout().flush().unwrap();
         let tm = self.time_mixing.forward(ln1_out);
         let x = x + self.dropout.forward(tm);
 
-        // println!("DEBUG: Block - LN2");
+        println!("DEBUG: Block - LN2");
+        std::io::stdout().flush().unwrap();
         let ln2_out = self.ln2.forward(x.clone());
         
-        // println!("DEBUG: Block - ChannelMixing");
+        println!("DEBUG: Block - ChannelMixing");
+        std::io::stdout().flush().unwrap();
         let cm = self.channel_mixing.forward(ln2_out);
         x + self.dropout.forward(cm)
     }
