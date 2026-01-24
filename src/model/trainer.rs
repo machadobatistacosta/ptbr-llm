@@ -74,16 +74,11 @@ impl<B: AutodiffBackend> Trainer<B> {
     ) -> Option<TrainStats> {
         
         // Forward
-        println!("DEBUG: Trainer - calling model.forward");
         let logits = self.model.forward(input_ids);
-        println!("DEBUG: Trainer - model.forward returned");
 
         // Cross-entropy loss
-        println!("DEBUG: Trainer - calculating loss");
         let loss = self.cross_entropy_loss(logits, target_ids);
-        println!("DEBUG: Trainer - loss calculated. Converting to scalar...");
         let loss_value: f32 = loss.clone().into_scalar().elem();
-        println!("DEBUG: Trainer - loss scalar: {}", loss_value);
 
         // Verifica divergência
         if !loss_value.is_finite() {
