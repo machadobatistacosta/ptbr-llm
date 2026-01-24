@@ -2085,12 +2085,12 @@ fn create_batch_tensor<B: Backend>(data: &[Vec<u16>], device: &B::Device) -> Ten
     let batch_size = data.len();
     let seq_len = data[0].len();
 
-    // Convert u16 -> i32 (Safe common denominator)
-    let flat: Vec<i32> = data.iter().flatten().map(|&x| x as i32).collect();
+    // Convert u16 -> i64 (Safe for Torch/Burn Int tensors which are usually i64)
+    let flat: Vec<i64> = data.iter().flatten().map(|&x| x as i64).collect();
 
-    // Use TensorData struct for safe conversion to Backend::IntElem (i32 or i64)
+    // Use TensorData struct for safe conversion
     let data = burn::tensor::TensorData::from(flat.as_slice());
-    let tensor = Tensor::from_data(data, device);
+    let tensor: Tensor<B, 1, Int> = Tensor::from_data(data, device);
     
     tensor.reshape([batch_size, seq_len])
 }
