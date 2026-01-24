@@ -8,6 +8,7 @@ use burn::{
     },
     tensor::{activation, backend::Backend, Int, Tensor},
 };
+use std::io::Write;
 
 /// Epsilon para estabilidade numérica
 const NUMERIC_EPS: f32 = 1e-7;
