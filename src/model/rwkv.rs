@@ -94,10 +94,12 @@ impl<B: Backend> RWKV<B> {
         let mut x = self.embedding.forward(input_ids);
         x = self.ln_pre.forward(x);
 
-        for block in self.blocks.iter() {
+        for (i, block) in self.blocks.iter().enumerate() {
+            // println!("DEBUG: RWKV Layer {}", i);
             x = block.forward(x);
         }
         
+        println!("DEBUG: RWKV all layers done. Final LayerNorm...");
         x = self.ln_out.forward(x);
         self.head.forward(x)
     }
