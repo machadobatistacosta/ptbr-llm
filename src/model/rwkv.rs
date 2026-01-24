@@ -7,6 +7,7 @@ use burn::{
         LinearConfig,
     },
     tensor::{activation, backend::Backend, Int, Tensor},
+    train::checkpoint,
 };
 
 /// Epsilon para estabilidade numérica
@@ -95,7 +96,9 @@ impl<B: Backend> RWKV<B> {
         x = self.ln_pre.forward(x);
 
         for block in self.blocks.iter() {
-            x = block.forward(x);
+            // Gradient Checkpointing para reduzir uso de memória e stack
+            let block = block.clone();
+            x = checkpoint(move |x| block.forward(x), x);
         }
         
         x = self.ln_out.forward(x);
