@@ -25,7 +25,7 @@ pub struct WKVConfig {
 impl Default for WKVConfig {
     fn default() -> Self {
         Self {
-            chunk_size: 16, // Reduzido de 32->16 para evitar OOM (4x menos memória temporária)
+            chunk_size: 64, // Otimizado: 64 evita overhead de loops pequenos e cabe na memória (16MB/camada)
             use_float64_accumulator: true,
             parallel_heads: true,
         }
