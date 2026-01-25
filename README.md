@@ -68,7 +68,7 @@ curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
 
 ```bash
 cargo run --release -- train-tokenizer \
-  --corpus data/corpus.txt \
+  --corpus data/tokenizer_full_input_cleaned \
   --output data/tokenizer \
   --vocab-size 32000
 ```
@@ -78,7 +78,7 @@ cargo run --release -- train-tokenizer \
 ```bash
 cargo run --release -- build-dataset \
   --tokenizer data/tokenizer/tokenizer.json \
-  --output data/train.bin \
+  --output data/tokenizer/train.bin \
   --source data/tokenizer_full_input_cleaned \
   --clean
 ```
@@ -89,7 +89,7 @@ cargo run --release -- build-dataset \
 
 ```bash
 cargo run --release -- train \
-  --data data/train.bin \
+  --data data/tokenizer \
   --tokenizer data/tokenizer/tokenizer.json \
   --output checkpoints \
   --model-size 85m \
@@ -103,7 +103,7 @@ cargo run --release -- train \
 
 ```bash
 ./target/release/ptbr-llm train \
-  --data /kaggle/input/dataset/train.bin \
+  --data /kaggle/input/dataset/tokenizer/train.bin \
   --tokenizer /kaggle/input/dataset/tokenizer.json \
   --output /kaggle/working/checkpoints \
   --model-size 400m \

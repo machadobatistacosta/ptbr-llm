@@ -1,7 +1,10 @@
 // src/model/wkv_optimized.rs
-//! WKV otimizado com chunking e paralelização
+//! WKV otimizado - O(T) sequential scan para evitar memory explosion
 
 use burn::tensor::{backend::Backend, Tensor};
+
+/// Epsilon para estabilidade numérica
+const EPS: f32 = 1e-7;
 
 /// Configuração do WKV
 #[derive(Debug, Clone)]
@@ -21,85 +24,79 @@ impl Default for WKVConfig {
     }
 }
 
-/// WKV com Linear Complexity O(T) em vez de O(T²)
+/// WKV com Linear Complexity O(T) usando scan sequencial
 /// 
-/// Fórmula:
+/// Fórmula RWKV:
 /// wkv_t = (Σ_{i<t} e^{-(t-i-1)w + k_i} * v_i + e^{u+k_t} * v_t) /
 ///         (Σ_{i<t} e^{-(t-i-1)w + k_i} + e^{u+k_t})
 ///
-/// Com estados recorrentes:
-/// a_{t+1} = e^{-w} * a_t + e^{k_t} * v_t
-/// b_{t+1} = e^{-w} * b_t + e^{k_t}
-/// p_{t+1} = max(p_t - w, k_t)  # para estabilidade numérica
+/// Estados recorrentes (log-space para estabilidade):
+/// aa = weighted value accumulator
+/// bb = weight accumulator  
+/// pp = max exponent tracker (log-sum-exp)
 pub fn wkv_linear<B: Backend>(
     k: Tensor<B, 3>,      // [B, T, C]
     v: Tensor<B, 3>,      // [B, T, C]
-    w: Tensor<B, 1>,      // [C] - time decay
+    w: Tensor<B, 1>,      // [C] - time decay (raw param, typically negative)
     u: Tensor<B, 1>,      // [C] - time first bonus
-    config: &WKVConfig,
+    _config: &WKVConfig,
 ) -> Tensor<B, 3> {
     let [b, t, c] = k.dims();
     let device = k.device();
-    let chunk_size = config.chunk_size;
 
-    // Expande w e u para broadcast
-    // w é o parâmetro time_decay. O decay real em log-space é -exp(w).
-    let w_log = w.clone().exp().neg(); // -e^w
-    
-    // Estados iniciais (log-space para estabilidade)
+    // Decay factor: w_log = -exp(w)
+    // For w=-5, exp(-5)≈0.007, so w_log≈-0.007
+    // This makes decay ≈ exp(-0.007) ≈ 0.993 per step
+    let w_log = w.clone().exp().neg(); // [C]
+
+    // Initialize states [B, C]
     let mut aa = Tensor::<B, 2>::zeros([b, c], &device);
     let mut bb = Tensor::<B, 2>::zeros([b, c], &device);
-    let mut pp = Tensor::<B, 2>::zeros([b, c], &device) - 1e30;
+    let mut pp = Tensor::<B, 2>::zeros([b, c], &device) - 1e30; // Start at -inf for log-sum-exp
 
-    let num_chunks = (t + chunk_size - 1) / chunk_size;
-    let mut chunk_outputs = Vec::with_capacity(num_chunks);
+    // Collect outputs
+    let mut outputs: Vec<Tensor<B, 2>> = Vec::with_capacity(t);
 
-    for chunk_idx in 0..num_chunks {
-        let start = chunk_idx * chunk_size;
-        let end = (start + chunk_size).min(t);
-        let current_chunk_size = end - start;
+    for t_idx in 0..t {
+        // Extract k_t, v_t: [B, C]
+        let k_t = k.clone().slice([0..b, t_idx..t_idx+1, 0..c]).reshape([b, c]);
+        let v_t = v.clone().slice([0..b, t_idx..t_idx+1, 0..c]).reshape([b, c]);
 
-        let k_chunk = k.clone().slice([0..b, start..end, 0..c]);
-        let v_chunk = v.clone().slice([0..b, start..end, 0..c]);
+        // Current token weight: ww = u + k_t
+        let ww = u.clone().reshape([1, c]) + k_t.clone(); // [B, C]
+
+        // Log-sum-exp for numerical stability
+        // p = max(pp, ww) for stable exp computation
+        let p = pp.clone().max_pair(ww.clone());
         
-        // Coleta outputs DESTE chunk
-        let mut step_outputs = Vec::with_capacity(current_chunk_size);
+        // e1 = exp(pp - p): contribution from history
+        // e2 = exp(ww - p): contribution from current token
+        let e1 = (pp.clone() - p.clone()).exp();
+        let e2 = (ww.clone() - p.clone()).exp();
 
-        for i in 0..current_chunk_size {
-            let kt = k_chunk.clone().slice([0..b, i..i + 1, 0..c]).reshape([b, c]);
-            let vt = v_chunk.clone().slice([0..b, i..i + 1, 0..c]).reshape([b, c]);
+        // WKV output: (e1 * aa + e2 * v_t) / (e1 * bb + e2)
+        let denom = e1.clone() * bb.clone() + e2.clone() + EPS;
+        let wkv_t = (e1.clone() * aa.clone() + e2.clone() * v_t.clone()) / denom;
 
-            // ww = u + k_t (bonus para token atual)
-            let ww = u.clone().reshape([1, c]) + kt.clone();
+        outputs.push(wkv_t);
 
-            // Log-sum-exp trick
-            let p = pp.clone().max_pair(ww.clone());
-            let e1 = (pp.clone() - p.clone()).exp();
-            let e2 = (ww - p.clone()).exp();
-
-            // Output com estabilidade numérica
-            let numerator = e1.clone() * aa.clone() + e2.clone() * vt.clone();
-            let denominator = e1.clone() * bb.clone() + e2.clone() + 1e-7;
-            let wkv = numerator / denominator;
-
-            step_outputs.push(wkv.reshape([b, 1, c]));
-
-            // Atualiza estados para próximo timestep
-            let ww2 = w_log.clone().reshape([1, c]) + pp.clone(); 
-            let p2 = ww2.clone().max_pair(kt.clone());
-            let e1_2 = (ww2 - p2.clone()).exp();
-            let e2_2 = (kt - p2.clone()).exp();
-
-            aa = e1_2.clone() * aa + e2_2.clone() * vt;
-            bb = e1_2 * bb + e2_2;
-            pp = p2;
-        }
+        // Update states for next iteration
+        // ww2 = w_log + pp (decay applied to history)
+        let ww2 = w_log.clone().reshape([1, c]) + pp.clone();
         
-        // Concatena logo este chunk para evitar crescimento excessivo do grafo de Cat
-        chunk_outputs.push(Tensor::cat(step_outputs, 1));
+        // p2 = max(ww2, k_t) for stable update
+        let p2 = ww2.clone().max_pair(k_t.clone());
+        let e1_2 = (ww2 - p2.clone()).exp();
+        let e2_2 = (k_t - p2.clone()).exp();
+
+        // Update accumulators
+        aa = e1_2.clone() * aa + e2_2.clone() * v_t;
+        bb = e1_2 * bb + e2_2;
+        pp = p2;
     }
 
-    Tensor::cat(chunk_outputs, 1)
+    // Stack outputs: Vec<[B, C]> -> [B, T, C]
+    Tensor::stack(outputs, 1)
 }
 
 /// WKV com Parallel Scan (mais rápido para GPU)

@@ -1,0 +1,18 @@
+[model]
+n_layers = 24
+d_model = 1024
+d_ffn = 4096
+vocab_size = 65536
+ctx_len = 1024
+layer_norm_eps = 1e-5
+dropout = 0.0
+
+[training]
+batch_size = 8 # Ajustar conforme GPU (Kaggle P100 aguenta 8~16)
+learning_rate = 3e-4
+min_learning_rate = 1e-5
+weight_decay = 0.1
+warmup_steps = 100
+max_steps = 100000
+accumulate_grad_batches = 4
+checkpoint_dir = "checkpoints/400m"

@@ -2134,6 +2134,7 @@ version = "1.0.0"
 dependencies = [
  "bincode",
  "burn",
+ "burn-cuda",
  "bzip2",
  "clap",
  "crossbeam-channel",
