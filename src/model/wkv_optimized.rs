@@ -25,7 +25,7 @@ pub struct WKVConfig {
 impl Default for WKVConfig {
     fn default() -> Self {
         Self {
-            chunk_size: 32, // Tamanho ideal para GPU (warp alignment)
+            chunk_size: 16, // Reduzido de 32->16 para evitar OOM (4x menos memória temporária)
             use_float64_accumulator: true,
             parallel_heads: true,
         }
