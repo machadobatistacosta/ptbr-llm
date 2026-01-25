@@ -230,13 +230,13 @@ fn wkv_kernel_matrix<B: Backend>(
     
     // Decay matrix [T, T, C]
     // dist [T, T] -> [T, T, 1]
-    let dist_past_3d = dist_past.unsqueeze::<3>(); 
+    let dist_past_3d = dist_past.reshape([t, t, 1]); 
     // [T, T, 1] * [1, 1, C] -> [T, T, C]
     let decay_log = dist_past_3d * w_log; 
     
     // Prepara para broadcast com Batch
     // decay_log: [T, T, C] -> [1, T, T, C]
-    let decay_log_broad = decay_log.unsqueeze::<4>(); 
+    let decay_log_broad = decay_log.reshape([1, t, t, c]); 
     
     // 3. Matrix K [B, T, C] -> [B, 1, T, C]
     // Precisamos somar decay[t,s,c] + k[b,s,c]
