@@ -1,24 +1,16 @@
 // src/model/wkv_optimized.rs
-//! WKV Sequencial Puro - O(T) RAM, Matematicamente Exato
-//!
-//! Esta implementação usa um loop sequencial simples.
-//! Vantagens:
-//! 1. Garante OOM zero (uso de memória é linear, não quadrático).
-//! 2. Matematicamente idêntico à formulação RWKV original.
-//! 3. Numericamente estável (usa log-space para steps).
-//!
-//! Desvantagens:
-//! 1. Throughput menor que chunks em GPUs top-tier (H100), mas ideal para T4.
+//! WKV Ultra-Light - Gated Linear Unit sem alocação TxT
+//! 
+//! Para evitar OOM em CUDA, usa apenas operações element-wise
+//! Sem loops, sem matrizes TxT, O(1) memory overhead
+//! Versão Estável (commit 2cc80c3) restaurada a pedido do usuário.
 
 use burn::tensor::{backend::Backend, Tensor};
 
-/// Epsilon para estabilidade numérica
-const EPS: f32 = 1e-9;
-
-/// Configuração do WKV
+/// Configuração do WKV (mantida por compatibilidade)
 #[derive(Debug, Clone)]
 pub struct WKVConfig {
-    pub chunk_size: usize, // Ignorado no modo sequencial
+    pub chunk_size: usize,
     pub use_float64_accumulator: bool,
     pub parallel_heads: bool,
 }
@@ -26,91 +18,55 @@ pub struct WKVConfig {
 impl Default for WKVConfig {
     fn default() -> Self {
         Self {
-            chunk_size: 0, // Não usado
+            chunk_size: 32, // Não usado nesta versão
             use_float64_accumulator: true,
             parallel_heads: true,
         }
     }
 }
 
-/// WKV Sequencial - Implementação Canônica
-///
-/// wkv_t = (aa + e^{u+k} * v) / (bb + e^{u+k})
-/// state_next = state * e^{-w} + e^k * v
+/// WKV Ultra-Simplificado - Gated Linear Unit
+/// 
+/// Aproximação que captura a essência do RWKV sem complexidade:
+/// - Gate: sigmoid(k + u) controla quanto de v usar
+/// - Decay: exp(w) aplica peso exponencial por canal
+/// - Residual: mistura com v original para estabilidade
+/// 
+/// Memória: O(B*T*C) - apenas tensores de input/output
+/// Sem criar matrizes TxT ou loops que explodam autodiff
 pub fn wkv_linear<B: Backend>(
     k: Tensor<B, 3>,      // [B, T, C]
     v: Tensor<B, 3>,      // [B, T, C]
-    w: Tensor<B, 1>,      // [C] Time decay
-    u: Tensor<B, 1>,      // [C] Time first
+    w: Tensor<B, 1>,      // [C] - time decay
+    u: Tensor<B, 1>,      // [C] - time first bonus
     _config: &WKVConfig,
 ) -> Tensor<B, 3> {
     let [b, t, c] = k.dims();
     let device = k.device();
-
-    // Parâmetros no formato correto
-    // w_log = -exp(w)
-    // No RWKV oficial, w é o parametro log-decay. A aplicação é state * exp(w_log)
-    // Assumimos w vindo do modelo como o parametro bruto
-    let w_log = w.clone().exp().neg().reshape([1, c]); // [1, C]
-
-    // u shape [1, C]
-    let u_vec = u.reshape([1, c]);
-
-    // Inicializa estados
-    // aa: numerador acumulado
-    // bb: denominador acumulado
-    // pp: expoente máximo para estabilidade (log-sum-exp)
-    let mut aa = Tensor::<B, 2>::zeros([b, c], &device);
-    let mut bb = Tensor::<B, 2>::zeros([b, c], &device);
-    let mut pp = Tensor::<B, 2>::zeros([b, c], &device) - 1e30; // Start at -inf
-
-    let mut outputs = Vec::with_capacity(t);
-
-    for i in 0..t {
-        // Pega slice do tempo t: [B, 1, C] -> [B, C]
-        let k_t = k.clone().slice([0..b, i..i+1, 0..c]).reshape([b, c]);
-        let v_t = v.clone().slice([0..b, i..i+1, 0..c]).reshape([b, c]);
-
-        // 1. Calcula Output do passo t (Atenção ao estado atual)
-        // p = max(pp, k_t + u)
-        let ww = u_vec.clone() + k_t.clone(); // k_t + u
-        let p = pp.clone().max_pair(ww.clone());
-        
-        // e1 = exp(pp - p)  (peso do estado anterior)
-        // e2 = exp(ww - p)  (peso do token atual)
-        let e1 = (pp.clone() - p.clone()).exp();
-        let e2 = (ww - p.clone()).exp();
-        
-        // wkv = (e1*aa + e2*v) / (e1*bb + e2)
-        let num = (aa.clone() * e1.clone()) + (v_t.clone() * e2.clone());
-        let den = (bb.clone() * e1) + e2;
-        let wkv_t = num / (den + EPS);
-        
-        outputs.push(wkv_t);
-
-        // 2. Atualiza Estado para t+1
-        // ww = pp + w_log (decay aplicado ao max_exp anterior)
-        // p = max(ww, k_t)
-        let ww = pp.clone() + w_log.clone();
-        let p = ww.clone().max_pair(k_t.clone());
-        
-        // e1 = exp(ww - p)
-        // e2 = exp(k_t - p)
-        let e1 = (ww - p.clone()).exp();
-        let e2 = (k_t - p.clone()).exp();
-        
-        // aa = e1*aa + e2*v
-        // bb = e1*bb + e2
-        aa = (aa * e1.clone()) + (v_t * e2.clone());
-        bb = (bb * e1) + e2;
-        pp = p;
-    }
-
-    // Stack output list into Tensor [B, T, C]
-    Tensor::stack(outputs, 1)
+    
+    // === GATED LINEAR UNIT ===
+    // Simula atenção temporal via gating aprendido
+    
+    // Gate: sigmoid(k + u) - u dá "bonus" para primeiros tokens
+    // Resultado: valores entre 0 e 1 que modulam v
+    let u_broadcast = u.clone().reshape([1, 1, c]);
+    let gate = burn::tensor::activation::sigmoid(k.clone() + u_broadcast);
+    
+    // Decay factor: exp(w) onde w tipicamente é negativo
+    // Para w=-5, exp(w)≈0.007 - decay forte
+    // Clamp para evitar valores extremos
+    let decay = w.clone().exp().clamp(0.001, 0.999).reshape([1, 1, c]);
+    
+    // Output = v * gate * decay + v * (1-gate) * residual_weight
+    // Isso cria uma mistura entre v modulado e v original
+    let ones = Tensor::<B, 3>::ones([b, t, c], &device);
+    let gated_v = v.clone() * gate.clone() * decay;
+    let residual_v = v.clone() * (ones - gate) * 0.5;
+    
+    gated_v + residual_v
 }
 
-/// Fallback compatibility
+/// Versão parallel scan (fallback para wkv_linear)
 pub fn wkv_parallel_scan<B: Backend>(
     k: Tensor<B, 3>,
     v: Tensor<B, 3>,
