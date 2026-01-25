@@ -217,72 +217,76 @@ fn wkv_kernel_matrix<B: Backend>(
     // 1. Time Indices [T, T]
     // Cria matriz de distâncias relativas
     let range = Tensor::<B, 1, Int>::arange(0..t as i64, device);
-    let i = range.clone().reshape([t, 1]);
-    let j = range.reshape([1, t]);
-    let dist = (i - j).float(); // dist > 0 para j < i (futuro - passado)
+    let i = range.clone().reshape([t, 1]); // [T, 1]
+    let j = range.reshape([1, t]);         // [1, T]
+    let dist = (i - j).float();            // [T, T]
 
-    // 2. Máscara Causal (i >= j)
-    // No RWKV, atendemos tokens passados (j < i) com decay w 
-    // E o token atual (j == i) com bonus u
-    // Vamos tratar j < i e j == i separadamente para clareza
-    
-    // 3. Log Weights para Passado (j < i)
-    // weight = w * (i - j - 1)? Não, RWKV v4/5/6 usa w * (i-j) ou variações
-    // Padrão: decay = -(i-j) * w_param
-    // w_param é positivo no código? Vamos assumir w_log = -exp(w) como input?
-    // No trainer, w é passado como parâmetro bruto. w_log = -exp(w)
+    // 2. Weights e Decay
+    // w_log = -exp(w)
     let w_log = w.clone().exp().neg().reshape([1, 1, c]); // [1, 1, C]
     
     // Distância para decay: i - j - 1 (para i > j)
-    let dist_past = dist.clone() - 1.0;
+    let dist_past = dist.clone() - 1.0; // [T, T]
     
-    // W_matrix: [T, T, C]
-    // W[i,j] = (i - j - 1) * w_log
-    // T x T x 1 * 1 x 1 x C -> T x T x C
-    let dist_past_3d = dist_past.unsqueeze::<3>(); // [T, T, 1] (via reshape)
-    let decay_log = dist_past_3d.reshape([t, t, 1]) * w_log.clone();
+    // Decay matrix [T, T, C]
+    // dist [T, T] -> [T, T, 1]
+    let dist_past_3d = dist_past.unsqueeze::<3>(); 
+    // [T, T, 1] * [1, 1, C] -> [T, T, C]
+    let decay_log = dist_past_3d * w_log; 
     
-    // 4. Matrix K broadcast [B, 1, T, C]
+    // Prepara para broadcast com Batch
+    // decay_log: [T, T, C] -> [1, T, T, C]
+    let decay_log_broad = decay_log.unsqueeze::<4>(); 
+    
+    // 3. Matrix K [B, T, C] -> [B, 1, T, C]
+    // Precisamos somar decay[t,s,c] + k[b,s,c]
+    // Onde 's' (source/past) é a dimensão compartilhada
+    // decay: [1, Target=T, Source=T, C]
+    // k:     [B, 1,        Source=T, C]
     let k_broad = k.clone().reshape([b, 1, t, c]);
     
-    // 5. Logits = Decay + K_j
-    // Tentamos criar [B, T, T, C]. Para T=32, isso é ok (32*32*1024*4 = 4MB).
-    // Para T=256, seria 256MB.
-    // Burn precisa de ajuda com broadcast
-    let logits = decay_log.unsqueeze::<4>().permute([3, 0, 1, 2]) + k_broad; // [1, T, T, C] + [B, 1, T, C]
+    // logits: [B, T, T, C]
+    let logits = decay_log_broad + k_broad; 
     
-    // Separa Termos
-    //   Termos passados (i > j): exp(logits)
-    //   Termo atual (i == j): exp(k + u)
+    // 4. Máscara Causal
+    // mask: i > j
+    let mask_past = dist.clone().greater_elem(0.0)
+        .unsqueeze::<3>().reshape([1, t, t, 1]); // [1, T, T, 1]
     
-    // Máscara para passado (i > j)
-    let mask_past = dist.clone().greater_elem(0.0).unsqueeze::<3>().reshape([1, t, t, 1]);
-    
-    // Aplica máscara (-inf onde não é passado)
+    // Aplica máscara (-inf onde dist <= 0)
     let neg_inf = Tensor::zeros_like(&logits) - 1e30;
     let logits_past = logits.mask_where(mask_past, neg_inf);
-    let weights_past = logits_past.exp(); // [B, T, T, C]
     
-    // Termo Diagonal (i == j)
-    // Bonus u
+    // weights_past: [B, T, T, C]
+    let weights_past = logits_past.exp(); 
+    
+    // 5. Termo Diagonal (i == j) -> Bonus u
+    // u: [C] -> [1, 1, 1, C]
     let u_broad = u.reshape([1, 1, 1, c]);
-    let k_diag = k.clone().reshape([b, t, 1, c]); // [B, T, 1, C] treated as diagonal elements
-    let weight_diag = (k_diag + u_broad).exp();   // [B, T, 1, C]
     
-    // 7. Soma Ponderada (Denominator)
-    // sum_j (weights_past) + weight_diag
+    // k: [B, T, C] -> [B, T, 1, C]
+    let k_diag = k.clone().reshape([b, t, 1, c]);
+    
+    // weight_diag = exp(k + u)
+    let weight_diag = (k_diag + u_broad).exp(); // [B, T, 1, C]
+    
+    // 6. Soma (Denominador)
+    // sum over 'source' dimension (dim 2)
+    // sum(weights_past) + weight_diag
     let sum_weights = weights_past.clone().sum_dim(2) + weight_diag.clone(); // [B, T, 1, C]
     
-    // 8. Soma Valores (Numerator)
-    // sum_j (weights_past * v_j) + weight_diag * v_i
+    // 7. Soma Ponderada (Numerador)
+    // weights_past * v_broad
+    // v: [B, 1, T, C] broadcast para [B, Target=T, Source=T, C]
     let v_broad = v.clone().reshape([b, 1, t, c]);
     let weighted_v = weights_past * v_broad; // [B, T, T, C]
     let sum_weighted_v = weighted_v.sum_dim(2); // [B, T, 1, C]
     
+    // Adiciona diagonal
     let v_diag = v.clone().reshape([b, t, 1, c]);
     let numerator = sum_weighted_v + (weight_diag * v_diag);
     
-    // 9. Resultado
+    // 8. Resultado Final
     let output = numerator / (sum_weights + EPS);
     
     output.reshape([b, t, c])
