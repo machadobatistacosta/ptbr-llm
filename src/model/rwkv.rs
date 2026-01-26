@@ -307,11 +307,13 @@ impl<B: Backend> TimeMixing<B> {
         // Token shift
         let x_prev = self.token_shift(&x, b, t, c);
 
-        // ✨ OTIMIZAÇÃO: mix SEM Tensor::ones()
-        // x * m + x_prev * (1-m) = x_prev + m * (x - x_prev)
-        let xk = x_prev.clone() + mix_k * (x.clone() - x_prev.clone());
-        let xv = x_prev.clone() + mix_v * (x.clone() - x_prev.clone());
-        let xr = x_prev + mix_r * (x - x_prev.clone());
+        // ✨ FIX: Calcula diff UMA vez para evitar moves múltiplos
+        let x_diff = x - x_prev.clone();
+
+        // Mix otimizado: x_prev + m * (x - x_prev) = x_prev + m * x_diff
+        let xk = x_prev.clone() + mix_k * x_diff.clone();
+        let xv = x_prev.clone() + mix_v * x_diff.clone();
+        let xr = x_prev + mix_r * x_diff;  // x_prev consumido aqui (último uso)
 
         let r = activation::sigmoid(self.receptance.forward(xr));
         let k = self.key.forward(xk);
@@ -447,9 +449,11 @@ impl<B: Backend> ChannelMixing<B> {
 
         let x_prev = self.token_shift(&x, b, t, c);
 
-        // ✨ Mix otimizado
-        let xk = x_prev.clone() + mix_k * (x.clone() - x_prev.clone());
-        let xr = x_prev.clone() + mix_r * (x - x_prev);
+        // ✨ FIX: Calcula diff UMA vez
+        let x_diff = x - x_prev.clone();
+
+        let xk = x_prev.clone() + mix_k * x_diff.clone();
+        let xr = x_prev + mix_r * x_diff;
 
         let r = activation::sigmoid(self.receptance.forward(xr));
         let k = activation::relu(self.key.forward(xk));
