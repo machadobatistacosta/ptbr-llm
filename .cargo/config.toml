@@ -1,0 +1,7 @@
+# .cargo/config.toml
+[build]
+# ✨ SIMD nativo para máxima performance
+rustflags = ["-C", "target-cpu=native"]
+
+[target.x86_64-unknown-linux-gnu]
+rustflags = ["-C", "target-cpu=native", "-C", "target-feature=+avx2,+fma"]

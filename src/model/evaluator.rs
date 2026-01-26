@@ -1,10 +1,10 @@
-//! Avaliador para calcular métricas durante treino
+// src/model/evaluator.rs
+//! Avaliador OTIMIZADO - Batch evaluation sem fragmentação de VRAM
 
 use burn::tensor::{backend::Backend, activation, ElementConversion, Int, Tensor};
 use crate::model::RWKV;
 use crate::data::MmapDataset;
 
-/// Métricas de avaliação
 #[derive(Debug, Clone, Default)]
 pub struct EvalMetrics {
     pub loss: f32,
@@ -14,22 +14,34 @@ pub struct EvalMetrics {
 
 impl std::fmt::Display for EvalMetrics {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        write!(f, "Loss: {:.4} | PPL: {:.2} | Tokens: {}", 
-            self.loss, self.perplexity, self.tokens_evaluated)
+        write!(
+            f,
+            "Loss: {:.4} | PPL: {:.2} | Tokens: {}",
+            self.loss, self.perplexity, self.tokens_evaluated
+        )
     }
 }
 
-/// Avaliador de modelo
 pub struct Evaluator {
     num_samples: usize,
+    // ✨ NOVO: Batch size para eval (reduz chamadas de kernel)
+    batch_size: usize,
 }
 
 impl Evaluator {
     pub fn new(num_samples: usize) -> Self {
-        Self { num_samples }
+        Self {
+            num_samples,
+            batch_size: 4,  // Processa 4 samples de cada vez
+        }
     }
 
-    /// Avalia modelo em subset do dataset
+    pub fn with_batch_size(mut self, batch_size: usize) -> Self {
+        self.batch_size = batch_size;
+        self
+    }
+
+    /// ✨ Avaliação em batch (muito mais eficiente)
     pub fn evaluate<B: Backend>(
         &self,
         model: &RWKV<B>,
@@ -39,95 +51,84 @@ impl Evaluator {
         let mut total_loss = 0.0f64;
         let mut total_tokens = 0usize;
 
-        // Pega últimos N samples como validation
+        let seq_len = dataset.seq_len();
         let start_idx = dataset.len().saturating_sub(self.num_samples);
-        
-        for idx in start_idx..dataset.len() {
-            if let Some((input, target)) = dataset.get(idx) {
-                let seq_len = input.len();
-                let input_tensor = self.create_tensor::<B>(&input, seq_len, device);
-                let target_tensor = self.create_tensor::<B>(&target, seq_len, device);
+        let end_idx = dataset.len();
 
-                // Forward sem gradientes
-                let logits = model.forward(input_tensor);
-                let loss = self.cross_entropy::<B>(logits, target_tensor);
-                
-                total_loss += loss as f64 * seq_len as f64;
-                total_tokens += seq_len;
+        // ✨ Processa em batches
+        let mut idx = start_idx;
+        while idx < end_idx {
+            let batch_end = (idx + self.batch_size).min(end_idx);
+            let actual_batch = batch_end - idx;
+
+            // Coleta batch
+            let mut inputs_flat: Vec<i32> = Vec::with_capacity(actual_batch * seq_len);
+            let mut targets_flat: Vec<i32> = Vec::with_capacity(actual_batch * seq_len);
+            let mut valid_count = 0;
+
+            for i in idx..batch_end {
+                if let Some((input, target)) = dataset.get(i) {
+                    inputs_flat.extend(input.iter().map(|&x| x as i32));
+                    targets_flat.extend(target.iter().map(|&x| x as i32));
+                    valid_count += 1;
+                }
             }
+
+            if valid_count == 0 {
+                idx = batch_end;
+                continue;
+            }
+
+            // Cria tensores do batch
+            let input_tensor: Tensor<B, 2, Int> = {
+                let data = burn::tensor::TensorData::from(inputs_flat.as_slice());
+                let t: Tensor<B, 1, Int> = Tensor::from_data(data, device);
+                t.reshape([valid_count, seq_len])
+            };
+
+            let target_tensor: Tensor<B, 2, Int> = {
+                let data = burn::tensor::TensorData::from(targets_flat.as_slice());
+                let t: Tensor<B, 1, Int> = Tensor::from_data(data, device);
+                t.reshape([valid_count, seq_len])
+            };
+
+            // Forward
+            let logits = model.forward(input_tensor);
+            let loss = self.cross_entropy::<B>(logits, target_tensor);
+
+            total_loss += loss as f64 * (valid_count * seq_len) as f64;
+            total_tokens += valid_count * seq_len;
+
+            idx = batch_end;
         }
 
         let avg_loss = if total_tokens > 0 {
             total_loss / total_tokens as f64
         } else {
-            0.0
+            f64::MAX
         };
-        
-        let perplexity = avg_loss.exp();
 
         EvalMetrics {
             loss: avg_loss as f32,
-            perplexity: perplexity as f32,
+            perplexity: avg_loss.exp().min(f64::MAX) as f32,
             tokens_evaluated: total_tokens,
         }
     }
 
-    fn create_tensor<B: Backend>(
-        &self, 
-        data: &[u16], 
-        seq_len: usize,
-        device: &B::Device
-    ) -> Tensor<B, 2, Int> {
-        let data_i32: Vec<i32> = data.iter().map(|&x| x as i32).collect();
-        // Cria tensor 1D primeiro, depois reshape
-        let tensor: Tensor<B, 1, Int> = Tensor::from_ints(data_i32.as_slice(), device);
-        tensor.reshape([1, seq_len])
-    }
-
     fn cross_entropy<B: Backend>(
-        &self, 
-        logits: Tensor<B, 3>, 
-        targets: Tensor<B, 2, Int>
+        &self,
+        logits: Tensor<B, 3>,
+        targets: Tensor<B, 2, Int>,
     ) -> f32 {
         let [batch_size, seq_len, vocab_size] = logits.dims();
-        
+
         let logits_flat = logits.reshape([batch_size * seq_len, vocab_size]);
         let targets_flat = targets.reshape([batch_size * seq_len]);
-        
+
         let log_probs = activation::log_softmax(logits_flat, 1);
-        
-        // GPU/CUDA: usar gather (rápido)
-        #[cfg(any(feature = "cuda", feature = "gpu"))]
-        {
-            let targets_idx = targets_flat.unsqueeze_dim(1);
-            let selected = log_probs.gather(1, targets_idx);
-            let loss_scalar = selected.mean().neg().into_scalar();
-            return loss_scalar.elem::<f32>();
-        }
+        let targets_idx = targets_flat.unsqueeze_dim(1);
+        let selected = log_probs.gather(1, targets_idx);
 
-        // CPU (ndarray): selecionado apenas se não houver GPU
-        #[cfg(all(feature = "cpu", not(feature = "cuda"), not(feature = "gpu")))]
-        {
-            let targets_data: Vec<i64> = targets_flat.to_data().as_slice().unwrap().to_vec();
-            let n = targets_data.len();
-            
-            let mut sum_loss = 0.0f32;
-            for (i, &target_idx) in targets_data.iter().enumerate() {
-                let row = log_probs.clone().slice([i..i+1, target_idx as usize..target_idx as usize + 1]);
-                let val: f32 = row.into_scalar().elem();
-                sum_loss += val;
-            }
-            
-            return -sum_loss / n as f32;
-        }
-
-        // Fallback
-        #[cfg(not(any(feature = "cuda", feature = "gpu", feature = "cpu")))]
-        {
-            let targets_idx = targets_flat.unsqueeze_dim(1);
-            let selected = log_probs.gather(1, targets_idx);
-            let loss_scalar = selected.mean().neg().into_scalar();
-            loss_scalar.elem::<f32>()
-        }
+        selected.mean().neg().into_scalar().elem()
     }
 }

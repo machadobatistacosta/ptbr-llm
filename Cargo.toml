@@ -1,57 +1,93 @@
 [package]
 name = "ptbr-llm"
-version = "1.0.0"
+version = "1.1.0"
 edition = "2021"
 authors = ["Caike Machado Batista Costa"]
 description = "RWKV Language Model para Português Brasileiro"
 
 [features]
-# IMPORTANTE: default vazio para evitar conflitos
+# ✨ CRÍTICO: default vazio para evitar conflitos de backend
 default = []
+
+# Backends mutuamente exclusivos
 cpu = ["burn/ndarray"]
 gpu = ["burn/wgpu"]
 cuda = ["burn/cuda-jit"]
 torch = ["burn/tch"]
 
 [dependencies]
-burn = { version = "0.14", default-features = false, features = ["autodiff", "train", "ndarray"] }
-burn-cuda = { version = "0.14", default-features = false }
+# ✨ OTIMIZAÇÃO: Burn SEM ndarray por default
+burn = { version = "0.14", default-features = false, features = ["autodiff", "train"] }
 
+# Serialização
 bincode = { version = "2.0.0-rc.3", features = ["serde"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
+
+# I/O e Data
 memmap2 = "0.9"
 quick-xml = "0.31"
 bzip2 = "0.4"
+
+# Text processing
 regex = "1.10"
 once_cell = "1.19"
 unicode-normalization = "0.1"
+
+# Parallelism
 crossbeam-channel = "0.5"
 rayon = "1.10"
 parking_lot = "0.12"
+
+# Random
 rand = "0.8"
 rand_chacha = "0.3"
+
+# CLI
 clap = { version = "4.5", features = ["derive"] }
+
+# Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 
+# ✨ RELEASE OTIMIZADO PARA PERFORMANCE
 [profile.release]
-lto = true
-codegen-units = 1
 opt-level = 3
-strip = true
+lto = "fat"           # Link-Time Optimization MÁXIMA
+codegen-units = 1     # Melhor otimização
+panic = "abort"       # Remove overhead de unwinding
+strip = true          # Remove símbolos debug
+debug = false
+overflow-checks = false
+incremental = false
 
+[profile.release.build-override]
+opt-level = 3
+
+# Dev com alguma otimização para testes mais rápidos
 [profile.dev]
 opt-level = 1
+debug = true
+
+# Profile para benchmarks
+[profile.bench]
+inherits = "release"
+
+[[bin]]
+name = "ptbr-llm"
+path = "src/main.rs"
 
 [[bin]]
 name = "audit"
 path = "src/utils/data_audit.rs"
+required-features = []
 
 [[bin]]
 name = "purge"
 path = "src/utils/data_purge.rs"
+required-features = []
 
 [[bin]]
 name = "vocab_pilot"
 path = "src/utils/vocab_pilot.rs"
+required-features = []
