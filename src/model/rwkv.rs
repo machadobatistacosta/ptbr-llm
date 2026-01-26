@@ -407,13 +407,10 @@ impl<B: Backend> TimeMixing<B> {
 
         // Extrai parâmetros
         let u = self.time_first.val();
-        let w = self.time_decay.val(); // Passamos raw params, wkv_linear converte
+        let w = self.time_decay.val(); 
 
-        let config = WKVConfig {
-            chunk_size: 32, // Otimizado para GPU
-            use_float64_accumulator: true,
-            parallel_heads: true,
-        };
+        // CRITICAL FIX: Use optimized config for T4
+        let config = WKVConfig::for_t4();
 
         wkv_linear(k, v, w, u, &config)
     }
