@@ -96,7 +96,7 @@ impl<B: Backend> RWKV<B> {
         };
 
         let emb_scale = (config.d_model as f32).powf(-0.5);
-        let logit_scale = (config.d_model as f32).powf(-0.5);
+        let logit_scale = 0.5 * (config.d_model as f32).powf(-0.5);  // Metade da escala
 
         Self {
             embedding,
