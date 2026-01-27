@@ -1,12 +1,11 @@
 // src/model/rwkv.rs
-//! RWKV Model - Ultra Memory Optimized for T4 16GB
-//!
-//! Otimizações:
-//! 1. Weight tying (embedding == head) - economiza ~130MB
-//! 2. Broadcast tensors cacheados em vez de recriados
-//! 3. mix() sem Tensor::ones()
-//! 4. token_shift() otimizado
-//! 5. .val() chamado uma vez por forward
+//! RWKV Model - Corrigido para Loss Inicial ~11
+//! 
+//! Correções aplicadas:
+//! 1. Inicialização controlada (Normal ao invés de Uniform)
+//! 2. Escala de embedding e logits
+//! 3. WKV estável sem detach
+//! 4. Clamp para evitar overflow numérico
 
 use super::config::RWKVConfig;
 use burn::{
@@ -15,12 +14,50 @@ use burn::{
         Dropout, DropoutConfig, Embedding, EmbeddingConfig, LayerNorm, LayerNormConfig, Linear,
         LinearConfig,
     },
-    tensor::{activation, backend::Backend, Int, Tensor},
+    tensor::{activation, backend::Backend, Distribution, Int, Tensor},
 };
 
-const NUMERIC_EPS: f32 = 1e-7;
+// ============================================================
+// FUNÇÕES DE INICIALIZAÇÃO CUSTOMIZADA
+// ============================================================
 
-/// Estado do RWKV para inferência incremental
+/// Inicialização para embeddings: Normal(0, 0.02)
+fn init_embedding<B: Backend>(vocab_size: usize, d_model: usize, device: &B::Device) -> Embedding<B> {
+    let weight = Tensor::random(
+        [vocab_size, d_model],
+        Distribution::Normal(0.0, 0.02),
+        device,
+    );
+    
+    Embedding {
+        weight: Param::from_tensor(weight),
+    }
+}
+
+/// Inicialização para Linear: Normal(0, scale/sqrt(fan_in))
+fn init_linear<B: Backend>(
+    in_features: usize, 
+    out_features: usize, 
+    device: &B::Device,
+    scale: f64,
+) -> Linear<B> {
+    let std = scale / (in_features as f64).sqrt();
+    let weight = Tensor::random(
+        [out_features, in_features],
+        Distribution::Normal(0.0, std),
+        device,
+    );
+    
+    Linear {
+        weight: Param::from_tensor(weight),
+        bias: None,
+    }
+}
+
+// ============================================================
+// ESTADO PARA INFERÊNCIA
+// ============================================================
+
 #[derive(Clone, Debug)]
 pub struct RWKVState<B: Backend> {
     pub time_state: Vec<(Tensor<B, 2>, Tensor<B, 2>, Tensor<B, 2>)>,
@@ -36,7 +73,7 @@ impl<B: Backend> RWKVState<B> {
                     (
                         Tensor::zeros([batch_size, d_model], device),
                         Tensor::zeros([batch_size, d_model], device),
-                        Tensor::full([batch_size, d_model], -1e30, device),
+                        Tensor::full([batch_size, d_model], -30.0, device),
                     )
                 })
                 .collect(),
@@ -50,13 +87,16 @@ impl<B: Backend> RWKVState<B> {
     }
 }
 
+// ============================================================
+// RWKV PRINCIPAL
+// ============================================================
+
 #[derive(Module, Debug)]
 pub struct RWKV<B: Backend> {
     embedding: Embedding<B>,
     ln_pre: LayerNorm<B>,
     blocks: Vec<RWKVBlock<B>>,
     ln_out: LayerNorm<B>,
-    // Head só existe se weight_tying == false
     head: Option<Linear<B>>,
     #[module(skip)]
     vocab_size: usize,
@@ -66,34 +106,41 @@ pub struct RWKV<B: Backend> {
     n_layers: usize,
     #[module(skip)]
     use_weight_tying: bool,
+    #[module(skip)]
+    emb_scale: f32,
+    #[module(skip)]
+    logit_scale: f32,
 }
 
 impl<B: Backend> RWKV<B> {
     pub fn new(config: &RWKVConfig, device: &B::Device) -> Self {
-        let embedding = EmbeddingConfig::new(config.vocab_size, config.d_model).init(device);
+        // ✨ Embedding com inicialização controlada
+        let embedding = init_embedding(config.vocab_size, config.d_model, device);
 
         let ln_pre = LayerNormConfig::new(config.d_model)
             .with_epsilon(config.layer_norm_eps)
             .init(device);
 
+        // ✨ Escala por layer para estabilidade
+        let layer_scale = 1.0 / (config.n_layers as f64).sqrt();
+        
         let blocks: Vec<RWKVBlock<B>> = (0..config.n_layers)
-            .map(|layer_id| RWKVBlock::new(config, layer_id, device))
+            .map(|layer_id| RWKVBlock::new(config, layer_id, device, layer_scale))
             .collect();
 
         let ln_out = LayerNormConfig::new(config.d_model)
             .with_epsilon(config.layer_norm_eps)
             .init(device);
 
-        // ✨ WEIGHT TYING: Head só aloca se NÃO usar weight tying
         let head = if config.weight_tying {
-            None  // Economiza vocab_size × d_model × 4 bytes
+            None
         } else {
-            Some(
-                LinearConfig::new(config.d_model, config.vocab_size)
-                    .with_bias(false)
-                    .init(device),
-            )
+            Some(init_linear(config.d_model, config.vocab_size, device, 0.5))
         };
+
+        // ✨ Escalas para estabilidade numérica
+        let emb_scale = 1.0 / (config.d_model as f32).sqrt();
+        let logit_scale = 1.0 / (config.d_model as f32).sqrt();
 
         Self {
             embedding,
@@ -105,12 +152,17 @@ impl<B: Backend> RWKV<B> {
             d_model: config.d_model,
             n_layers: config.n_layers,
             use_weight_tying: config.weight_tying,
+            emb_scale,
+            logit_scale,
         }
     }
 
     pub fn forward(&self, input_ids: Tensor<B, 2, Int>) -> Tensor<B, 3> {
-        // Embedding + Pre-norm
+        // Embedding + escala
         let mut x = self.embedding.forward(input_ids);
+        x = x * self.emb_scale;
+        
+        // Pre-norm
         x = self.ln_pre.forward(x);
 
         // Blocos RWKV
@@ -121,15 +173,15 @@ impl<B: Backend> RWKV<B> {
         // Output norm
         x = self.ln_out.forward(x);
 
-        // ✨ Head com weight tying
+        // ✨ Head com weight tying + escala
         if self.use_weight_tying {
             let [b, t, d] = x.dims();
-            let emb_weight = self.embedding.weight.val();  // [V, D]
+            let emb_weight = self.embedding.weight.val();
             let x_flat = x.reshape([b * t, d]);
-            let logits_flat = x_flat.matmul(emb_weight.transpose());
+            let logits_flat = x_flat.matmul(emb_weight.transpose()) * self.logit_scale;
             logits_flat.reshape([b, t, self.vocab_size])
         } else {
-            self.head.as_ref().unwrap().forward(x)
+            self.head.as_ref().unwrap().forward(x) * self.logit_scale
         }
     }
 
@@ -146,7 +198,7 @@ impl<B: Backend> RWKV<B> {
     ) -> Tensor<B, 2> {
         let [b, _] = token_id.dims();
 
-        let x = self.embedding.forward(token_id);
+        let x = self.embedding.forward(token_id) * self.emb_scale;
         let x = self.ln_pre.forward(x);
         let mut x = x.reshape([b, self.d_model]);
 
@@ -167,9 +219,9 @@ impl<B: Backend> RWKV<B> {
         if self.use_weight_tying {
             let x_flat = x.reshape([b, self.d_model]);
             let emb_weight = self.embedding.weight.val();
-            x_flat.matmul(emb_weight.transpose())
+            x_flat.matmul(emb_weight.transpose()) * self.logit_scale
         } else {
-            self.head.as_ref().unwrap().forward(x).reshape([b, self.vocab_size])
+            self.head.as_ref().unwrap().forward(x).reshape([b, self.vocab_size]) * self.logit_scale
         }
     }
 
@@ -178,6 +230,10 @@ impl<B: Backend> RWKV<B> {
     pub fn n_layers(&self) -> usize { self.n_layers }
 }
 
+// ============================================================
+// RWKV BLOCK
+// ============================================================
+
 #[derive(Module, Debug)]
 pub struct RWKVBlock<B: Backend> {
     ln1: LayerNorm<B>,
@@ -185,15 +241,17 @@ pub struct RWKVBlock<B: Backend> {
     ln2: LayerNorm<B>,
     channel_mixing: ChannelMixing<B>,
     dropout: Dropout,
+    #[module(skip)]
+    layer_scale: f32,
 }
 
 impl<B: Backend> RWKVBlock<B> {
-    pub fn new(config: &RWKVConfig, layer_id: usize, device: &B::Device) -> Self {
+    pub fn new(config: &RWKVConfig, layer_id: usize, device: &B::Device, layer_scale: f64) -> Self {
         Self {
             ln1: LayerNormConfig::new(config.d_model)
                 .with_epsilon(config.layer_norm_eps)
                 .init(device),
-            time_mixing: TimeMixing::new(config.d_model, layer_id, config.n_layers, device),
+            time_mixing: TimeMixing::new(config.d_model, layer_id, config.n_layers, device, layer_scale),
             ln2: LayerNormConfig::new(config.d_model)
                 .with_epsilon(config.layer_norm_eps)
                 .init(device),
@@ -203,19 +261,20 @@ impl<B: Backend> RWKVBlock<B> {
                 layer_id,
                 config.n_layers,
                 device,
+                layer_scale,
             ),
             dropout: DropoutConfig::new(config.dropout).init(),
+            layer_scale: layer_scale as f32,
         }
     }
 
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
-        // ✨ Residual sem clone extra (x é consumido e recriado)
         let ln1_out = self.ln1.forward(x.clone());
-        let tm = self.time_mixing.forward(ln1_out);
+        let tm = self.time_mixing.forward(ln1_out) * self.layer_scale;
         let x = x + self.dropout.forward(tm);
 
         let ln2_out = self.ln2.forward(x.clone());
-        let cm = self.channel_mixing.forward(ln2_out);
+        let cm = self.channel_mixing.forward(ln2_out) * self.layer_scale;
         x + self.dropout.forward(cm)
     }
 
@@ -230,14 +289,18 @@ impl<B: Backend> RWKVBlock<B> {
 
         let x_3d = x.clone().reshape([b, 1, c]);
         let ln1_out = self.ln1.forward(x_3d).reshape([b, c]);
-        let tm = self.time_mixing.forward_step(ln1_out, time_state, prev_embedding);
+        let tm = self.time_mixing.forward_step(ln1_out, time_state, prev_embedding) * self.layer_scale;
         let x = x + tm;
 
         let ln2_out = self.ln2.forward(x.clone().reshape([b, 1, c])).reshape([b, c]);
-        let cm = self.channel_mixing.forward_step(ln2_out, channel_state);
+        let cm = self.channel_mixing.forward_step(ln2_out, channel_state) * self.layer_scale;
         x + cm
     }
 }
+
+// ============================================================
+// TIME MIXING - Com WKV estável inline
+// ============================================================
 
 #[derive(Module, Debug)]
 pub struct TimeMixing<B: Backend> {
@@ -255,23 +318,33 @@ pub struct TimeMixing<B: Backend> {
 }
 
 impl<B: Backend> TimeMixing<B> {
-    pub fn new(d_model: usize, layer_id: usize, n_layers: usize, device: &B::Device) -> Self {
-        let linear = LinearConfig::new(d_model, d_model).with_bias(false);
+    pub fn new(
+        d_model: usize, 
+        layer_id: usize, 
+        n_layers: usize, 
+        device: &B::Device,
+        scale: f64,
+    ) -> Self {
+        let receptance = init_linear(d_model, d_model, device, scale);
+        let key = init_linear(d_model, d_model, device, scale);
+        let value = init_linear(d_model, d_model, device, scale);
+        let output = init_linear(d_model, d_model, device, scale * 0.5);
 
         let ratio_0_to_1 = layer_id as f64 / (n_layers.max(1) - 1).max(1) as f64;
         let ratio_1_to_almost_0 = 1.0 - ratio_0_to_1;
 
+        // ✨ Time decay mais conservador e estável
         let decay_values: Vec<f32> = (0..d_model)
             .map(|i| {
                 let channel_ratio = i as f64 / (d_model.max(1) - 1).max(1) as f64;
-                (-5.0 - 2.0 * ratio_0_to_1 + 0.5 * channel_ratio) as f32
+                ((-5.0 - 1.0 * ratio_0_to_1 + 0.3 * channel_ratio) as f32).clamp(-8.0, -2.0)
             })
             .collect();
 
         let first_values: Vec<f32> = (0..d_model)
             .map(|i| {
                 let channel_ratio = i as f64 / (d_model.max(1) - 1).max(1) as f64;
-                ((1.0 - channel_ratio) * 0.8 + channel_ratio * 0.4) as f32
+                ((1.0 - channel_ratio) * 0.5 + channel_ratio * 0.2) as f32
             })
             .collect();
 
@@ -283,10 +356,10 @@ impl<B: Backend> TimeMixing<B> {
             .collect();
 
         Self {
-            receptance: linear.clone().init(device),
-            key: linear.clone().init(device),
-            value: linear.clone().init(device),
-            output: linear.init(device),
+            receptance,
+            key,
+            value,
+            output,
             time_decay: Param::from_tensor(Tensor::from_floats(decay_values.as_slice(), device)),
             time_first: Param::from_tensor(Tensor::from_floats(first_values.as_slice(), device)),
             time_mix_k: Param::from_tensor(Tensor::from_floats(mix_values.as_slice(), device)),
@@ -299,27 +372,23 @@ impl<B: Backend> TimeMixing<B> {
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
         let [b, t, c] = x.dims();
 
-        // ✨ OTIMIZAÇÃO: .val() chamado UMA vez
         let mix_k = self.time_mix_k.val().reshape([1, 1, c]);
         let mix_v = self.time_mix_v.val().reshape([1, 1, c]);
         let mix_r = self.time_mix_r.val().reshape([1, 1, c]);
 
-        // Token shift
         let x_prev = self.token_shift(&x, b, t, c);
+        let x_diff = x.clone() - x_prev.clone();
 
-        // ✨ FIX: Calcula diff UMA vez para evitar moves múltiplos
-        let x_diff = x - x_prev.clone();
-
-        // Mix otimizado: x_prev + m * (x - x_prev) = x_prev + m * x_diff
         let xk = x_prev.clone() + mix_k * x_diff.clone();
         let xv = x_prev.clone() + mix_v * x_diff.clone();
-        let xr = x_prev + mix_r * x_diff;  // x_prev consumido aqui (último uso)
+        let xr = x_prev + mix_r * x_diff;
 
         let r = activation::sigmoid(self.receptance.forward(xr));
         let k = self.key.forward(xk);
         let v = self.value.forward(xv);
 
         let wkv = self.wkv_stable(k, v);
+        
         self.output.forward(r * wkv)
     }
 
@@ -335,7 +404,6 @@ impl<B: Backend> TimeMixing<B> {
         let mix_v = self.time_mix_v.val().reshape([1, c]);
         let mix_r = self.time_mix_r.val().reshape([1, c]);
 
-        // ✨ Mix otimizado
         let xk = prev_embedding.clone() + mix_k * (x.clone() - prev_embedding.clone());
         let xv = prev_embedding.clone() + mix_v * (x.clone() - prev_embedding.clone());
         let xr = prev_embedding.clone() + mix_r * (x.clone() - prev_embedding);
@@ -357,23 +425,24 @@ impl<B: Backend> TimeMixing<B> {
         state: &mut (Tensor<B, 2>, Tensor<B, 2>, Tensor<B, 2>),
     ) -> Tensor<B, 2> {
         let [_b, c] = k.dims();
-        let w = self.time_decay.val().exp().neg();
-        let u = self.time_first.val();
+        let w = self.time_decay.val().clamp(-10.0, 0.0).exp().neg();
+        let u = self.time_first.val().clamp(-5.0, 5.0);
 
         let (aa, bb, pp) = state;
 
-        let ww = u.clone().reshape([1, c]) + k.clone();
+        let k_clamped = k.clone().clamp(-30.0, 30.0);
+        let ww = u.clone().reshape([1, c]) + k_clamped.clone();
         let p = pp.clone().max_pair(ww.clone());
         let e1 = (pp.clone() - p.clone()).exp();
         let e2 = (ww - p.clone()).exp();
 
-        let denom = e1.clone() * bb.clone() + e2.clone() + NUMERIC_EPS;
+        let denom = e1.clone() * bb.clone() + e2.clone() + 1e-9;
         let wkv = (e1.clone() * aa.clone() + e2.clone() * v.clone()) / denom;
 
         let ww2 = w.reshape([1, c]) + pp.clone();
-        let p2 = ww2.clone().max_pair(k.clone());
+        let p2 = ww2.clone().max_pair(k_clamped.clone());
         let e1_2 = (ww2 - p2.clone()).exp();
-        let e2_2 = (k - p2.clone()).exp();
+        let e2_2 = (k_clamped - p2.clone()).exp();
 
         *aa = e1_2.clone() * aa.clone() + e2_2.clone() * v;
         *bb = e1_2 * bb.clone() + e2_2;
@@ -382,24 +451,69 @@ impl<B: Backend> TimeMixing<B> {
         wkv
     }
 
-    // ✨ OTIMIZAÇÃO: Token shift mais eficiente
     fn token_shift(&self, x: &Tensor<B, 3>, b: usize, t: usize, c: usize) -> Tensor<B, 3> {
         if t <= 1 {
             return Tensor::zeros([b, t, c], &x.device());
         }
-        // Evita concat: usa pad + slice
         let zeros = Tensor::zeros([b, 1, c], &x.device());
         let shifted = x.clone().slice([0..b, 0..t - 1, 0..c]);
         Tensor::cat(vec![zeros, shifted], 1)
     }
 
+    /// ✨ WKV estável - SEM detach, COM clamp
     fn wkv_stable(&self, k: Tensor<B, 3>, v: Tensor<B, 3>) -> Tensor<B, 3> {
-        use crate::model::wkv_optimized::{wkv_linear, WKVConfig};
-        let u = self.time_first.val();
-        let w = self.time_decay.val();
-        wkv_linear(k, v, w, u, &WKVConfig::for_t4())
+        let [batch_size, seq_len, channels] = k.dims();
+        let device = k.device();
+
+        let w = self.time_decay.val().clamp(-10.0, 0.0);
+        let u = self.time_first.val().clamp(-5.0, 5.0);
+
+        let neg_w = w.neg().reshape([1, 1, channels]);
+        let u_broad = u.reshape([1, 1, channels]);
+
+        let mut aa = Tensor::<B, 3>::zeros([batch_size, 1, channels], &device);
+        let mut bb = Tensor::<B, 3>::zeros([batch_size, 1, channels], &device);
+        let mut pp = Tensor::<B, 3>::full([batch_size, 1, channels], -30.0, &device);
+
+        let mut outputs: Vec<Tensor<B, 3>> = Vec::with_capacity(seq_len);
+
+        for t in 0..seq_len {
+            let kt = k.clone().slice([0..batch_size, t..t + 1, 0..channels]);
+            let vt = v.clone().slice([0..batch_size, t..t + 1, 0..channels]);
+
+            // ✨ Clamp para evitar overflow
+            let kt_clamped = kt.clamp(-30.0, 30.0);
+
+            let ww = u_broad.clone() + kt_clamped.clone();
+            let qq = pp.clone().max_pair(ww.clone());
+            
+            let e1 = (pp.clone() - qq.clone()).exp();
+            let e2 = (ww - qq.clone()).exp();
+
+            let num = e1.clone() * aa.clone() + e2.clone() * vt.clone();
+            let den = e1.clone() * bb.clone() + e2.clone() + 1e-9;
+            let yt = num / den;
+
+            outputs.push(yt);
+
+            // Update state - ✨ SEM detach!
+            let pp_decayed = pp.clone() + neg_w.clone();
+            let qq_next = pp_decayed.clone().max_pair(kt_clamped.clone());
+            let e1_next = (pp_decayed - qq_next.clone()).exp();
+            let e2_next = (kt_clamped - qq_next.clone()).exp();
+
+            aa = e1_next.clone() * aa + e2_next.clone() * vt;
+            bb = e1_next * bb + e2_next;
+            pp = qq_next;
+        }
+
+        Tensor::cat(outputs, 1)
     }
 }
+
+// ============================================================
+// CHANNEL MIXING
+// ============================================================
 
 #[derive(Module, Debug)]
 pub struct ChannelMixing<B: Backend> {
@@ -419,6 +533,7 @@ impl<B: Backend> ChannelMixing<B> {
         layer_id: usize,
         n_layers: usize,
         device: &B::Device,
+        scale: f64,
     ) -> Self {
         let ratio_1_to_almost_0 = 1.0 - (layer_id as f64 / (n_layers.max(1) - 1).max(1) as f64);
 
@@ -430,11 +545,9 @@ impl<B: Backend> ChannelMixing<B> {
             .collect();
 
         Self {
-            receptance: LinearConfig::new(d_model, d_model)
-                .with_bias(false)
-                .init(device),
-            key: LinearConfig::new(d_model, d_ffn).with_bias(false).init(device),
-            value: LinearConfig::new(d_ffn, d_model).with_bias(false).init(device),
+            receptance: init_linear(d_model, d_model, device, scale),
+            key: init_linear(d_model, d_ffn, device, scale),
+            value: init_linear(d_ffn, d_model, device, scale * 0.5),
             time_mix_k: Param::from_tensor(Tensor::from_floats(mix_values.as_slice(), device)),
             time_mix_r: Param::from_tensor(Tensor::from_floats(mix_values.as_slice(), device)),
             d_model,
@@ -448,17 +561,13 @@ impl<B: Backend> ChannelMixing<B> {
         let mix_r = self.time_mix_r.val().reshape([1, 1, c]);
 
         let x_prev = self.token_shift(&x, b, t, c);
-
-        // ✨ FIX: Calcula diff UMA vez
-        let x_diff = x - x_prev.clone();
+        let x_diff = x.clone() - x_prev.clone();
 
         let xk = x_prev.clone() + mix_k * x_diff.clone();
         let xr = x_prev + mix_r * x_diff;
 
         let r = activation::sigmoid(self.receptance.forward(xr));
         let k = activation::relu(self.key.forward(xk));
-
-        // ✨ Squared ReLU otimizado
         let k_sq = k.powf_scalar(2.0);
 
         r * self.value.forward(k_sq)
