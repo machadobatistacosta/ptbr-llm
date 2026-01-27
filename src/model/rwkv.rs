@@ -410,8 +410,11 @@ impl<B: Backend> TimeMixing<B> {
         // Clamp k para estabilidade
         let k = k.clamp(-30.0, 30.0);
 
+        // ✨ FIX: Extrair médias ANTES de consumir w e u
+        let w_mean: f32 = w.clone().mean().into_scalar().elem();
+        let u_mean: f32 = u.clone().mean().into_scalar().elem();
+
         // Criar máscara de posição causal: [T, T]
-        // mask[i,j] = decay^(i-j) se j <= i, senão 0
         let positions: Vec<f32> = (0..seq_len as i32)
             .flat_map(|i| (0..seq_len as i32).map(move |j| {
                 if j <= i { (i - j) as f32 } else { -1e9 }
@@ -424,27 +427,18 @@ impl<B: Backend> TimeMixing<B> {
         ).reshape([seq_len, seq_len]);
 
         // decay_matrix[i,j] = exp(w * (i-j)) para j <= i
-        // w é negativo, então exp(w * dist) < 1 para dist > 0
-        let w_broad = w.reshape([1, 1, channels]);  // [1, 1, C]
-        
-        // Para cada canal, calcular matriz de decay
-        // Simplificação: usar decay médio
-        let w_mean: f32 = w.clone().mean().into_scalar().elem();
         let decay_matrix = (pos_matrix.clone() * w_mean).exp();  // [T, T]
         
         // Adicionar bonus u para diagonal (posição atual)
-        let u_mean: f32 = u.clone().mean().into_scalar().elem();
         let identity = Tensor::<B, 2>::eye(seq_len, &device);
         let bonus_matrix = identity * (u_mean.exp() - 1.0);  // Bonus na diagonal
         let weights = decay_matrix + bonus_matrix;  // [T, T]
         
-        // Normalizar por linha (softmax-like, mas sem exp adicional)
+        // Normalizar por linha
         let weights_sum = weights.clone().sum_dim(1).clamp_min(1e-9);  // [T, 1]
         let weights_norm = weights / weights_sum;  // [T, T]
 
         // Aplicar atenção: output[b, i, c] = sum_j(weights[i,j] * v[b, j, c])
-        // Reshape para batch matmul
-        // v: [B, T, C] -> precisamos [B, T, T] @ [B, T, C]
         let weights_expanded = weights_norm
             .unsqueeze::<3>()  // [1, T, T]
             .repeat(&[batch_size, 1, 1]);  // [B, T, T]
@@ -452,12 +446,11 @@ impl<B: Backend> TimeMixing<B> {
         // output = weights @ v
         let output = weights_expanded.matmul(v);  // [B, T, C]
 
-        // Modular pelo key (similar ao original RWKV)
-        // Isso adiciona dependência do k de forma differentiable
-        let k_sigmoid = activation::sigmoid(k * 0.1);  // Suaviza influência do k
+        // Modular pelo key
+        let k_sigmoid = activation::sigmoid(k * 0.1);
         
         output * k_sigmoid
-    }
+}
 }
 
 // ============================================================
