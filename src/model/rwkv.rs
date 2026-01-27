@@ -1,4 +1,4 @@
-// src/model/rwkv.rs - Versão simplificada que FUNCIONA
+// src/model/rwkv.rs - VERSÃO CORRIGIDA COM WKV HÍBRIDO
 
 use super::config::RWKVConfig;
 use burn::{
@@ -11,7 +11,7 @@ use burn::{
 };
 
 // ============================================================
-// RWKV PRINCIPAL - Usando inicialização padrão do Burn
+// ESTADO PARA INFERÊNCIA
 // ============================================================
 
 #[derive(Clone, Debug)]
@@ -43,6 +43,10 @@ impl<B: Backend> RWKVState<B> {
     }
 }
 
+// ============================================================
+// RWKV PRINCIPAL
+// ============================================================
+
 #[derive(Module, Debug)]
 pub struct RWKV<B: Backend> {
     embedding: Embedding<B>,
@@ -66,7 +70,6 @@ pub struct RWKV<B: Backend> {
 
 impl<B: Backend> RWKV<B> {
     pub fn new(config: &RWKVConfig, device: &B::Device) -> Self {
-        // ✨ Usar inicialização padrão do Burn
         let embedding = EmbeddingConfig::new(config.vocab_size, config.d_model).init(device);
 
         let ln_pre = LayerNormConfig::new(config.d_model)
@@ -91,7 +94,6 @@ impl<B: Backend> RWKV<B> {
             )
         };
 
-        // ✨ Escalas para estabilidade numérica
         let emb_scale = (config.d_model as f32).powf(-0.5);
         let logit_scale = (config.d_model as f32).powf(-0.5);
 
@@ -111,22 +113,16 @@ impl<B: Backend> RWKV<B> {
     }
 
     pub fn forward(&self, input_ids: Tensor<B, 2, Int>) -> Tensor<B, 3> {
-        // Embedding + escala
         let mut x = self.embedding.forward(input_ids);
         x = x * self.emb_scale;
-        
-        // Pre-norm
         x = self.ln_pre.forward(x);
 
-        // Blocos RWKV
         for block in self.blocks.iter() {
             x = block.forward(x);
         }
 
-        // Output norm
         x = self.ln_out.forward(x);
 
-        // Head com weight tying + escala
         if self.use_weight_tying {
             let [b, t, d] = x.dims();
             let emb_weight = self.embedding.weight.val();
@@ -248,7 +244,7 @@ impl<B: Backend> RWKVBlock<B> {
 }
 
 // ============================================================
-// TIME MIXING
+// TIME MIXING - COM WKV CHUNKED HÍBRIDO
 // ============================================================
 
 #[derive(Module, Debug)]
@@ -268,7 +264,6 @@ pub struct TimeMixing<B: Backend> {
 
 impl<B: Backend> TimeMixing<B> {
     pub fn new(d_model: usize, layer_id: usize, n_layers: usize, device: &B::Device) -> Self {
-        // ✨ Usar LinearConfig padrão
         let linear_config = LinearConfig::new(d_model, d_model).with_bias(false);
 
         let ratio_0_to_1 = layer_id as f64 / (n_layers.max(1) - 1).max(1) as f64;
@@ -327,7 +322,8 @@ impl<B: Backend> TimeMixing<B> {
         let k = self.key.forward(xk);
         let v = self.value.forward(xv);
 
-        let wkv = self.wkv_stable(k, v);
+        // ✨ WKV CHUNKED - Processa em chunks de 16 com gradientes
+        let wkv = self.wkv_chunked(k, v, 16);
         
         self.output.forward(r * wkv)
     }
@@ -400,7 +396,9 @@ impl<B: Backend> TimeMixing<B> {
         Tensor::cat(vec![zeros, shifted], 1)
     }
 
-    fn wkv_stable(&self, k: Tensor<B, 3>, v: Tensor<B, 3>) -> Tensor<B, 3> {
+    /// ✨ WKV CHUNKED - Processa em chunks para evitar stack overflow
+    /// Mantém gradientes dentro do chunk, detach entre chunks
+    fn wkv_chunked(&self, k: Tensor<B, 3>, v: Tensor<B, 3>, chunk_size: usize) -> Tensor<B, 3> {
         let [batch_size, seq_len, channels] = k.dims();
         let device = k.device();
 
@@ -410,41 +408,62 @@ impl<B: Backend> TimeMixing<B> {
         let neg_w = w.neg().reshape([1, 1, channels]);
         let u_broad = u.reshape([1, 1, channels]);
 
+        // Estado inicial
         let mut aa = Tensor::<B, 3>::zeros([batch_size, 1, channels], &device);
         let mut bb = Tensor::<B, 3>::zeros([batch_size, 1, channels], &device);
         let mut pp = Tensor::<B, 3>::full([batch_size, 1, channels], -30.0, &device);
 
-        let mut outputs: Vec<Tensor<B, 3>> = Vec::with_capacity(seq_len);
+        let num_chunks = (seq_len + chunk_size - 1) / chunk_size;
+        let mut all_outputs: Vec<Tensor<B, 3>> = Vec::with_capacity(num_chunks);
 
-        for t in 0..seq_len {
-            let kt = k.clone().slice([0..batch_size, t..t + 1, 0..channels]);
-            let vt = v.clone().slice([0..batch_size, t..t + 1, 0..channels]);
-
-            let kt_clamped = kt.clamp(-30.0, 30.0);
-
-            let ww = u_broad.clone() + kt_clamped.clone();
-            let qq = pp.clone().max_pair(ww.clone());
+        for chunk_idx in 0..num_chunks {
+            let start = chunk_idx * chunk_size;
+            let end = (start + chunk_size).min(seq_len);
             
-            let e1 = (pp.clone() - qq.clone()).exp();
-            let e2 = (ww - qq.clone()).exp();
+            // Processa chunk mantendo gradientes
+            let mut chunk_outputs: Vec<Tensor<B, 3>> = Vec::with_capacity(end - start);
+            
+            for t in start..end {
+                let kt = k.clone().slice([0..batch_size, t..t + 1, 0..channels]);
+                let vt = v.clone().slice([0..batch_size, t..t + 1, 0..channels]);
 
-            let num = e1.clone() * aa.clone() + e2.clone() * vt.clone();
-            let den = e1.clone() * bb.clone() + e2.clone() + 1e-9;
-            let yt = num / den;
+                let kt_clamped = kt.clamp(-30.0, 30.0);
 
-            outputs.push(yt);
+                let ww = u_broad.clone() + kt_clamped.clone();
+                let qq = pp.clone().max_pair(ww.clone());
+                
+                let e1 = (pp.clone() - qq.clone()).exp();
+                let e2 = (ww - qq.clone()).exp();
 
-            let pp_decayed = pp.clone() + neg_w.clone();
-            let qq_next = pp_decayed.clone().max_pair(kt_clamped.clone());
-            let e1_next = (pp_decayed - qq_next.clone()).exp();
-            let e2_next = (kt_clamped - qq_next.clone()).exp();
+                let num = e1.clone() * aa.clone() + e2.clone() * vt.clone();
+                let den = e1.clone() * bb.clone() + e2.clone() + 1e-9;
+                let yt = num / den;
 
-            aa = e1_next.clone() * aa + e2_next.clone() * vt;
-            bb = e1_next * bb + e2_next;
-            pp = qq_next;
+                chunk_outputs.push(yt);
+
+                // Update state
+                let pp_decayed = pp.clone() + neg_w.clone();
+                let qq_next = pp_decayed.clone().max_pair(kt_clamped.clone());
+                let e1_next = (pp_decayed - qq_next.clone()).exp();
+                let e2_next = (kt_clamped - qq_next.clone()).exp();
+
+                aa = e1_next.clone() * aa + e2_next.clone() * vt;
+                bb = e1_next * bb + e2_next;
+                pp = qq_next;
+            }
+            
+            // Concatena outputs do chunk
+            if !chunk_outputs.is_empty() {
+                all_outputs.push(Tensor::cat(chunk_outputs, 1));
+            }
+            
+            // ✨ CRÍTICO: Detach estado entre chunks para limitar grafo
+            aa = aa.detach();
+            bb = bb.detach();
+            pp = pp.detach();
         }
 
-        Tensor::cat(outputs, 1)
+        Tensor::cat(all_outputs, 1)
     }
 }
 
@@ -481,7 +500,6 @@ impl<B: Backend> ChannelMixing<B> {
             .collect();
 
         Self {
-            // ✨ Usar LinearConfig padrão - CRÍTICO!
             receptance: LinearConfig::new(d_model, d_model).with_bias(false).init(device),
             key: LinearConfig::new(d_model, d_ffn).with_bias(false).init(device),
             value: LinearConfig::new(d_ffn, d_model).with_bias(false).init(device),
