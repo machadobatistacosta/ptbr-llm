@@ -1,11 +1,4 @@
-// src/model/rwkv.rs
-//! RWKV Model - Corrigido para Loss Inicial ~11
-//! 
-//! Correções aplicadas:
-//! 1. Inicialização controlada (Normal ao invés de Uniform)
-//! 2. Escala de embedding e logits
-//! 3. WKV estável sem detach
-//! 4. Clamp para evitar overflow numérico
+// src/model/rwkv.rs - Versão simplificada que FUNCIONA
 
 use super::config::RWKVConfig;
 use burn::{
@@ -14,48 +7,11 @@ use burn::{
         Dropout, DropoutConfig, Embedding, EmbeddingConfig, LayerNorm, LayerNormConfig, Linear,
         LinearConfig,
     },
-    tensor::{activation, backend::Backend, Distribution, Int, Tensor},
+    tensor::{activation, backend::Backend, Int, Tensor},
 };
 
 // ============================================================
-// FUNÇÕES DE INICIALIZAÇÃO CUSTOMIZADA
-// ============================================================
-
-/// Inicialização para embeddings: Normal(0, 0.02)
-fn init_embedding<B: Backend>(vocab_size: usize, d_model: usize, device: &B::Device) -> Embedding<B> {
-    let weight = Tensor::random(
-        [vocab_size, d_model],
-        Distribution::Normal(0.0, 0.02),
-        device,
-    );
-    
-    Embedding {
-        weight: Param::from_tensor(weight),
-    }
-}
-
-/// Inicialização para Linear: Normal(0, scale/sqrt(fan_in))
-fn init_linear<B: Backend>(
-    in_features: usize, 
-    out_features: usize, 
-    device: &B::Device,
-    scale: f64,
-) -> Linear<B> {
-    let std = scale / (in_features as f64).sqrt();
-    let weight = Tensor::random(
-        [out_features, in_features],
-        Distribution::Normal(0.0, std),
-        device,
-    );
-    
-    Linear {
-        weight: Param::from_tensor(weight),
-        bias: None,
-    }
-}
-
-// ============================================================
-// ESTADO PARA INFERÊNCIA
+// RWKV PRINCIPAL - Usando inicialização padrão do Burn
 // ============================================================
 
 #[derive(Clone, Debug)]
@@ -87,10 +43,6 @@ impl<B: Backend> RWKVState<B> {
     }
 }
 
-// ============================================================
-// RWKV PRINCIPAL
-// ============================================================
-
 #[derive(Module, Debug)]
 pub struct RWKV<B: Backend> {
     embedding: Embedding<B>,
@@ -114,18 +66,15 @@ pub struct RWKV<B: Backend> {
 
 impl<B: Backend> RWKV<B> {
     pub fn new(config: &RWKVConfig, device: &B::Device) -> Self {
-        // ✨ Embedding com inicialização controlada
-        let embedding = init_embedding(config.vocab_size, config.d_model, device);
+        // ✨ Usar inicialização padrão do Burn
+        let embedding = EmbeddingConfig::new(config.vocab_size, config.d_model).init(device);
 
         let ln_pre = LayerNormConfig::new(config.d_model)
             .with_epsilon(config.layer_norm_eps)
             .init(device);
 
-        // ✨ Escala por layer para estabilidade
-        let layer_scale = 1.0 / (config.n_layers as f64).sqrt();
-        
         let blocks: Vec<RWKVBlock<B>> = (0..config.n_layers)
-            .map(|layer_id| RWKVBlock::new(config, layer_id, device, layer_scale))
+            .map(|layer_id| RWKVBlock::new(config, layer_id, device))
             .collect();
 
         let ln_out = LayerNormConfig::new(config.d_model)
@@ -135,12 +84,16 @@ impl<B: Backend> RWKV<B> {
         let head = if config.weight_tying {
             None
         } else {
-            Some(init_linear(config.d_model, config.vocab_size, device, 0.5))
+            Some(
+                LinearConfig::new(config.d_model, config.vocab_size)
+                    .with_bias(false)
+                    .init(device),
+            )
         };
 
         // ✨ Escalas para estabilidade numérica
-        let emb_scale = 1.0 / (config.d_model as f32).sqrt();
-        let logit_scale = 1.0 / (config.d_model as f32).sqrt();
+        let emb_scale = (config.d_model as f32).powf(-0.5);
+        let logit_scale = (config.d_model as f32).powf(-0.5);
 
         Self {
             embedding,
@@ -173,7 +126,7 @@ impl<B: Backend> RWKV<B> {
         // Output norm
         x = self.ln_out.forward(x);
 
-        // ✨ Head com weight tying + escala
+        // Head com weight tying + escala
         if self.use_weight_tying {
             let [b, t, d] = x.dims();
             let emb_weight = self.embedding.weight.val();
@@ -241,17 +194,15 @@ pub struct RWKVBlock<B: Backend> {
     ln2: LayerNorm<B>,
     channel_mixing: ChannelMixing<B>,
     dropout: Dropout,
-    #[module(skip)]
-    layer_scale: f32,
 }
 
 impl<B: Backend> RWKVBlock<B> {
-    pub fn new(config: &RWKVConfig, layer_id: usize, device: &B::Device, layer_scale: f64) -> Self {
+    pub fn new(config: &RWKVConfig, layer_id: usize, device: &B::Device) -> Self {
         Self {
             ln1: LayerNormConfig::new(config.d_model)
                 .with_epsilon(config.layer_norm_eps)
                 .init(device),
-            time_mixing: TimeMixing::new(config.d_model, layer_id, config.n_layers, device, layer_scale),
+            time_mixing: TimeMixing::new(config.d_model, layer_id, config.n_layers, device),
             ln2: LayerNormConfig::new(config.d_model)
                 .with_epsilon(config.layer_norm_eps)
                 .init(device),
@@ -261,20 +212,18 @@ impl<B: Backend> RWKVBlock<B> {
                 layer_id,
                 config.n_layers,
                 device,
-                layer_scale,
             ),
             dropout: DropoutConfig::new(config.dropout).init(),
-            layer_scale: layer_scale as f32,
         }
     }
 
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
         let ln1_out = self.ln1.forward(x.clone());
-        let tm = self.time_mixing.forward(ln1_out) * self.layer_scale;
+        let tm = self.time_mixing.forward(ln1_out);
         let x = x + self.dropout.forward(tm);
 
         let ln2_out = self.ln2.forward(x.clone());
-        let cm = self.channel_mixing.forward(ln2_out) * self.layer_scale;
+        let cm = self.channel_mixing.forward(ln2_out);
         x + self.dropout.forward(cm)
     }
 
@@ -289,17 +238,17 @@ impl<B: Backend> RWKVBlock<B> {
 
         let x_3d = x.clone().reshape([b, 1, c]);
         let ln1_out = self.ln1.forward(x_3d).reshape([b, c]);
-        let tm = self.time_mixing.forward_step(ln1_out, time_state, prev_embedding) * self.layer_scale;
+        let tm = self.time_mixing.forward_step(ln1_out, time_state, prev_embedding);
         let x = x + tm;
 
         let ln2_out = self.ln2.forward(x.clone().reshape([b, 1, c])).reshape([b, c]);
-        let cm = self.channel_mixing.forward_step(ln2_out, channel_state) * self.layer_scale;
+        let cm = self.channel_mixing.forward_step(ln2_out, channel_state);
         x + cm
     }
 }
 
 // ============================================================
-// TIME MIXING - Com WKV estável inline
+// TIME MIXING
 // ============================================================
 
 #[derive(Module, Debug)]
@@ -318,22 +267,13 @@ pub struct TimeMixing<B: Backend> {
 }
 
 impl<B: Backend> TimeMixing<B> {
-    pub fn new(
-        d_model: usize, 
-        layer_id: usize, 
-        n_layers: usize, 
-        device: &B::Device,
-        scale: f64,
-    ) -> Self {
-        let receptance = init_linear(d_model, d_model, device, scale);
-        let key = init_linear(d_model, d_model, device, scale);
-        let value = init_linear(d_model, d_model, device, scale);
-        let output = init_linear(d_model, d_model, device, scale * 0.5);
+    pub fn new(d_model: usize, layer_id: usize, n_layers: usize, device: &B::Device) -> Self {
+        // ✨ Usar LinearConfig padrão
+        let linear_config = LinearConfig::new(d_model, d_model).with_bias(false);
 
         let ratio_0_to_1 = layer_id as f64 / (n_layers.max(1) - 1).max(1) as f64;
         let ratio_1_to_almost_0 = 1.0 - ratio_0_to_1;
 
-        // ✨ Time decay mais conservador e estável
         let decay_values: Vec<f32> = (0..d_model)
             .map(|i| {
                 let channel_ratio = i as f64 / (d_model.max(1) - 1).max(1) as f64;
@@ -356,10 +296,10 @@ impl<B: Backend> TimeMixing<B> {
             .collect();
 
         Self {
-            receptance,
-            key,
-            value,
-            output,
+            receptance: linear_config.clone().init(device),
+            key: linear_config.clone().init(device),
+            value: linear_config.clone().init(device),
+            output: linear_config.init(device),
             time_decay: Param::from_tensor(Tensor::from_floats(decay_values.as_slice(), device)),
             time_first: Param::from_tensor(Tensor::from_floats(first_values.as_slice(), device)),
             time_mix_k: Param::from_tensor(Tensor::from_floats(mix_values.as_slice(), device)),
@@ -460,7 +400,6 @@ impl<B: Backend> TimeMixing<B> {
         Tensor::cat(vec![zeros, shifted], 1)
     }
 
-    /// ✨ WKV estável - SEM detach, COM clamp
     fn wkv_stable(&self, k: Tensor<B, 3>, v: Tensor<B, 3>) -> Tensor<B, 3> {
         let [batch_size, seq_len, channels] = k.dims();
         let device = k.device();
@@ -481,7 +420,6 @@ impl<B: Backend> TimeMixing<B> {
             let kt = k.clone().slice([0..batch_size, t..t + 1, 0..channels]);
             let vt = v.clone().slice([0..batch_size, t..t + 1, 0..channels]);
 
-            // ✨ Clamp para evitar overflow
             let kt_clamped = kt.clamp(-30.0, 30.0);
 
             let ww = u_broad.clone() + kt_clamped.clone();
@@ -496,7 +434,6 @@ impl<B: Backend> TimeMixing<B> {
 
             outputs.push(yt);
 
-            // Update state - ✨ SEM detach!
             let pp_decayed = pp.clone() + neg_w.clone();
             let qq_next = pp_decayed.clone().max_pair(kt_clamped.clone());
             let e1_next = (pp_decayed - qq_next.clone()).exp();
@@ -533,7 +470,6 @@ impl<B: Backend> ChannelMixing<B> {
         layer_id: usize,
         n_layers: usize,
         device: &B::Device,
-        scale: f64,
     ) -> Self {
         let ratio_1_to_almost_0 = 1.0 - (layer_id as f64 / (n_layers.max(1) - 1).max(1) as f64);
 
@@ -545,9 +481,10 @@ impl<B: Backend> ChannelMixing<B> {
             .collect();
 
         Self {
-            receptance: init_linear(d_model, d_model, device, scale),
-            key: init_linear(d_model, d_ffn, device, scale),
-            value: init_linear(d_ffn, d_model, device, scale * 0.5),
+            // ✨ Usar LinearConfig padrão - CRÍTICO!
+            receptance: LinearConfig::new(d_model, d_model).with_bias(false).init(device),
+            key: LinearConfig::new(d_model, d_ffn).with_bias(false).init(device),
+            value: LinearConfig::new(d_ffn, d_model).with_bias(false).init(device),
             time_mix_k: Param::from_tensor(Tensor::from_floats(mix_values.as_slice(), device)),
             time_mix_r: Param::from_tensor(Tensor::from_floats(mix_values.as_slice(), device)),
             d_model,
