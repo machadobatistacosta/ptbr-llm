@@ -2130,11 +2130,10 @@ checksum = "3eb8486b569e12e2c32ad3e204dbaba5e4b5b216e9367044f25f1dba42341773"
 
 [[package]]
 name = "ptbr-llm"
-version = "1.0.0"
+version = "1.1.0"
 dependencies = [
  "bincode",
  "burn",
- "burn-cuda",
  "bzip2",
  "clap",
  "crossbeam-channel",

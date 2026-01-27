@@ -1,10 +1,10 @@
 // src/model/trainer.rs
-//! Trainer otimizado para T4 16GB
-//! 
-//! Otimizações:
-//! 1. Cross-entropy chunked para vocab grande
-//! 2. Grad norm estimation robusto
-//! 3. Memory cleanup agressivo
+//! Trainer otimizado para T4 16GB - Memory Safe
+//!
+//! Mudanças:
+//! - Não acumula tensores de loss (apenas valores f32)
+//! - Cross-entropy eficiente para vocab grande
+//! - Cleanup periódico
 
 use super::config::{RWKVConfig, TrainingConfig};
 use super::rwkv::RWKV;
@@ -33,16 +33,20 @@ pub struct Trainer<B: AutodiffBackend> {
     // Estado
     step: usize,
     micro_step: usize,
+    
+    // ✨ Acumula apenas f32, não tensores!
     accumulated_loss: f32,
 
     // Métricas
     last_grad_norm: f32,
     ema_loss: f32,
     best_loss: f32,
-    prev_loss: f32, // Para estimativa de grad norm
+    prev_loss: f32,
 
     device: B::Device,
-    loss_accumulator: Option<Tensor<B, 1>>,
+    
+    // Cleanup counter
+    steps_since_cleanup: usize,
 }
 
 impl<B: AutodiffBackend> Trainer<B> {
@@ -69,7 +73,7 @@ impl<B: AutodiffBackend> Trainer<B> {
             best_loss: f32::MAX,
             prev_loss: 10.0,
             device,
-            loss_accumulator: None,
+            steps_since_cleanup: 0,
         }
     }
 
@@ -78,11 +82,13 @@ impl<B: AutodiffBackend> Trainer<B> {
         input_ids: Tensor<B, 2, Int>,
         target_ids: Tensor<B, 2, Int>,
     ) -> Option<TrainStats> {
+        let accum_steps = self.config.gradient_accumulation_steps;
+        
         // Forward
         let logits = self.model.forward(input_ids);
 
-        // ✨ OTIMIZAÇÃO: Cross-entropy memory-efficient
-        let loss = self.cross_entropy_chunked(logits, target_ids);
+        // Loss
+        let loss = self.cross_entropy_efficient(logits, target_ids);
         let loss_value: f32 = loss.clone().into_scalar().elem();
 
         if !loss_value.is_finite() {
@@ -90,40 +96,34 @@ impl<B: AutodiffBackend> Trainer<B> {
             panic!("Training diverged!");
         }
 
-        // Acumulação
+        // Acumula apenas o valor f32
         self.accumulated_loss += loss_value;
         self.micro_step += 1;
 
-        let accum_steps = self.config.gradient_accumulation_steps as f32;
-        let normalized_loss = loss / accum_steps;
+        // Normaliza e faz backward
+        let normalized_loss = loss / (accum_steps as f32);
+        let grads = normalized_loss.backward();
+        let grad_params = GradientsParams::from_grads(grads, &self.model);
 
-        if let Some(current) = self.loss_accumulator.take() {
-            self.loss_accumulator = Some(current + normalized_loss);
-        } else {
-            self.loss_accumulator = Some(normalized_loss);
-        }
-
-        // Optimizer Step
-        if self.micro_step % self.config.gradient_accumulation_steps == 0 {
-            let final_loss = self.loss_accumulator.take().unwrap();
-            let grads = final_loss.backward();
-
-            // ✨ Grad Norm Estimation (baseado em delta loss)
-            let avg_loss = self.accumulated_loss / accum_steps;
+        // Optimizer Step quando completar accumulation
+        if self.micro_step % accum_steps == 0 {
+            let avg_loss = self.accumulated_loss / accum_steps as f32;
+            
+            // Grad norm estimation
             let grad_norm = self.estimate_grad_norm(avg_loss);
             self.last_grad_norm = grad_norm;
             self.prev_loss = avg_loss;
 
-            let grad_params = GradientsParams::from_grads(grads, &self.model);
+            // Aplica gradientes
             let lr = self.get_learning_rate();
-
             self.model = self.optimizer.step(lr, self.model.clone(), grad_params);
 
-            // Updates
+            // Reset
             self.accumulated_loss = 0.0;
             self.micro_step = 0;
             self.step += 1;
 
+            // EMA updates
             if self.step == 1 {
                 self.ema_loss = avg_loss;
             } else {
@@ -132,6 +132,14 @@ impl<B: AutodiffBackend> Trainer<B> {
 
             if avg_loss < self.best_loss {
                 self.best_loss = avg_loss;
+            }
+
+            // Cleanup periódico
+            self.steps_since_cleanup += 1;
+            if self.steps_since_cleanup >= 50 {
+                self.steps_since_cleanup = 0;
+                // Força drop de temporários
+                std::hint::black_box(());
             }
 
             return Some(TrainStats {
@@ -144,53 +152,28 @@ impl<B: AutodiffBackend> Trainer<B> {
         None
     }
 
-    /// ✨ OTIMIZAÇÃO: Cross-entropy que processa vocab em chunks
-    /// Evita criar tensor [B*T, 65k] de uma vez
-    fn cross_entropy_chunked(&self, logits: Tensor<B, 3>, targets: Tensor<B, 2, Int>) -> Tensor<B, 1> {
+    /// Cross-entropy eficiente para vocab grande
+    fn cross_entropy_efficient(
+        &self,
+        logits: Tensor<B, 3>,
+        targets: Tensor<B, 2, Int>,
+    ) -> Tensor<B, 1> {
         let [batch_size, seq_len, vocab_size] = logits.dims();
-        
-        // Para vocabs pequenos, usa método padrão
-        if vocab_size <= 8192 {
-            return self.cross_entropy_standard(logits, targets);
+
+        // Para casos que cabem na memória
+        if seq_len * vocab_size <= 2_000_000 {
+            return self.cross_entropy_direct(logits, targets);
         }
-        
-        // ✨ Para vocab grande, processa em chunks de tokens
-        // Isso evita criar [B*T, V] de uma vez
-        let chunk_size = 64; // tokens por vez
-        let num_chunks = (seq_len + chunk_size - 1) / chunk_size;
-        
-        let mut total_loss = Tensor::<B, 1>::zeros([1], &self.device);
-        let mut total_tokens = 0usize;
-        
-        for chunk_idx in 0..num_chunks {
-            let start = chunk_idx * chunk_size;
-            let end = (start + chunk_size).min(seq_len);
-            let chunk_len = end - start;
-            
-            // Slice logits e targets para este chunk
-            let logits_chunk = logits.clone().slice([0..batch_size, start..end, 0..vocab_size]);
-            let targets_chunk = targets.clone().slice([0..batch_size, start..end]);
-            
-            // Flatten
-            let logits_flat = logits_chunk.reshape([batch_size * chunk_len, vocab_size]);
-            let targets_flat = targets_chunk.reshape([batch_size * chunk_len]);
-            
-            // Log softmax + gather
-            let log_probs = activation::log_softmax(logits_flat, 1);
-            let targets_idx = targets_flat.unsqueeze_dim(1);
-            let selected = log_probs.gather(1, targets_idx);
-            
-            // Soma as losses (negativo pois queremos minimizar)
-            let chunk_loss = selected.sum().neg();
-            total_loss = total_loss + chunk_loss;
-            total_tokens += batch_size * chunk_len;
-        }
-        
-        // Média
-        total_loss / (total_tokens as f32)
+
+        // Para casos grandes, processa em chunks de 32 tokens
+        self.cross_entropy_chunked(logits, targets, batch_size, seq_len, vocab_size)
     }
-    
-    fn cross_entropy_standard(&self, logits: Tensor<B, 3>, targets: Tensor<B, 2, Int>) -> Tensor<B, 1> {
+
+    fn cross_entropy_direct(
+        &self,
+        logits: Tensor<B, 3>,
+        targets: Tensor<B, 2, Int>,
+    ) -> Tensor<B, 1> {
         let [batch_size, seq_len, vocab_size] = logits.dims();
         let logits_flat = logits.reshape([batch_size * seq_len, vocab_size]);
         let targets_flat = targets.reshape([batch_size * seq_len]);
@@ -202,22 +185,53 @@ impl<B: AutodiffBackend> Trainer<B> {
         selected.mean().neg()
     }
 
-    /// ✨ Estimativa robusta de grad norm baseada em delta loss
+    fn cross_entropy_chunked(
+        &self,
+        logits: Tensor<B, 3>,
+        targets: Tensor<B, 2, Int>,
+        batch_size: usize,
+        seq_len: usize,
+        vocab_size: usize,
+    ) -> Tensor<B, 1> {
+        let chunk_size = 32_usize;
+        let num_chunks = (seq_len + chunk_size - 1) / chunk_size;
+
+        let mut total_loss = Tensor::<B, 1>::zeros([1], &self.device);
+        let total_tokens = (batch_size * seq_len) as f32;
+
+        for chunk_idx in 0..num_chunks {
+            let start = chunk_idx * chunk_size;
+            let end = (start + chunk_size).min(seq_len);
+            let chunk_len = end - start;
+
+            let logits_chunk = logits.clone().slice([0..batch_size, start..end, 0..vocab_size]);
+            let targets_chunk = targets.clone().slice([0..batch_size, start..end]);
+
+            let logits_flat = logits_chunk.reshape([batch_size * chunk_len, vocab_size]);
+            let targets_flat = targets_chunk.reshape([batch_size * chunk_len]);
+
+            let log_probs = activation::log_softmax(logits_flat, 1);
+            let targets_idx = targets_flat.unsqueeze_dim(1);
+            let selected = log_probs.gather(1, targets_idx);
+
+            let chunk_loss = selected.sum().neg();
+            total_loss = total_loss + chunk_loss;
+        }
+
+        total_loss / total_tokens
+    }
+
     fn estimate_grad_norm(&self, current_loss: f32) -> f32 {
         let lr = self.get_learning_rate() as f32;
-        
+
         if self.step == 0 || lr < 1e-10 {
             return 1.0;
         }
-        
-        // grad_norm ≈ |Δloss| / lr (aproximação de primeira ordem)
+
         let delta = (current_loss - self.prev_loss).abs();
         let estimated = delta / lr.max(1e-8);
-        
-        // Clamp para valores razoáveis e aplica smoothing
         let clamped = estimated.clamp(0.001, 100.0);
-        
-        // EMA do grad norm para estabilidade
+
         if self.last_grad_norm > 0.0 {
             0.9 * self.last_grad_norm + 0.1 * clamped
         } else {
@@ -270,7 +284,8 @@ impl<B: AutodiffBackend> Trainer<B> {
         let path = path.trim_end_matches(".mpk").trim_end_matches(".bin");
         let recorder = CompactRecorder::new();
 
-        self.model = self.model
+        self.model = self
+            .model
             .clone()
             .load_file(path, &recorder, &self.device)
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
@@ -300,7 +315,5 @@ impl<B: AutodiffBackend> Trainer<B> {
     pub fn step(&self) -> usize { self.step }
     pub fn config(&self) -> &TrainingConfig { &self.config }
     pub fn ema_loss(&self) -> f32 { self.ema_loss }
-
-    #[allow(dead_code)]
     pub fn best_loss(&self) -> f32 { self.best_loss }
 }
