@@ -404,15 +404,15 @@ impl<B: Backend> TimeMixing<B> {
         let device = k.device();
 
         // Parâmetros
-        let w = self.time_decay.val().clamp(-10.0, -0.1);  // Decay (negativo)
-        let u = self.time_first.val().clamp(-5.0, 5.0);    // Bonus
+        let w = self.time_decay.val().clamp(-10.0, -0.1);
+        let u = self.time_first.val().clamp(-5.0, 5.0);
+
+        // Extrair médias PRIMEIRO
+        let w_mean: f32 = w.clone().mean().into_scalar().elem();
+        let u_mean: f32 = u.clone().mean().into_scalar().elem();
 
         // Clamp k para estabilidade
         let k = k.clamp(-30.0, 30.0);
-
-        // ✨ FIX: Extrair médias ANTES de consumir w e u
-        let w_mean: f32 = w.clone().mean().into_scalar().elem();
-        let u_mean: f32 = u.clone().mean().into_scalar().elem();
 
         // Criar máscara de posição causal: [T, T]
         let positions: Vec<f32> = (0..seq_len as i32)
@@ -421,30 +421,29 @@ impl<B: Backend> TimeMixing<B> {
             }))
             .collect();
         
-        let pos_matrix = Tensor::<B, 2>::from_floats(
-            positions.as_slice(),
-            &device,
-        ).reshape([seq_len, seq_len]);
+        // ✨ FIX: Criar como 1D primeiro, depois reshape
+        let pos_tensor = Tensor::<B, 1>::from_floats(positions.as_slice(), &device);
+        let pos_matrix = pos_tensor.reshape([seq_len, seq_len]);
 
         // decay_matrix[i,j] = exp(w * (i-j)) para j <= i
-        let decay_matrix = (pos_matrix.clone() * w_mean).exp();  // [T, T]
+        let decay_matrix = (pos_matrix * w_mean).exp();
         
-        // Adicionar bonus u para diagonal (posição atual)
+        // Adicionar bonus u para diagonal
         let identity = Tensor::<B, 2>::eye(seq_len, &device);
-        let bonus_matrix = identity * (u_mean.exp() - 1.0);  // Bonus na diagonal
-        let weights = decay_matrix + bonus_matrix;  // [T, T]
+        let bonus_matrix = identity * (u_mean.exp() - 1.0);
+        let weights = decay_matrix + bonus_matrix;
         
         // Normalizar por linha
-        let weights_sum = weights.clone().sum_dim(1).clamp_min(1e-9);  // [T, 1]
-        let weights_norm = weights / weights_sum;  // [T, T]
+        let weights_sum = weights.clone().sum_dim(1).clamp_min(1e-9);
+        let weights_norm = weights / weights_sum;
 
-        // Aplicar atenção: output[b, i, c] = sum_j(weights[i,j] * v[b, j, c])
+        // Expandir para batch
         let weights_expanded = weights_norm
-            .unsqueeze::<3>()  // [1, T, T]
-            .repeat(&[batch_size, 1, 1]);  // [B, T, T]
+            .unsqueeze::<3>()
+            .repeat(&[batch_size, 1, 1]);
         
         // output = weights @ v
-        let output = weights_expanded.matmul(v);  // [B, T, C]
+        let output = weights_expanded.matmul(v);
 
         // Modular pelo key
         let k_sigmoid = activation::sigmoid(k * 0.1);
