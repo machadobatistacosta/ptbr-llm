@@ -3,7 +3,7 @@
 
 use burn::config::Config;
 
-#[derive(Config, Debug, Clone)]
+#[derive(Config, Debug)]  // ✅ Removido Clone (já incluído em Config)
 pub struct RWKVConfig {
     #[config(default = "65536")]
     pub vocab_size: usize,
@@ -149,7 +149,7 @@ impl RWKVConfig {
     }
 }
 
-#[derive(Config, Debug, Clone)]
+#[derive(Config, Debug)]  // ✅ Removido Clone
 pub struct TrainingConfig {
     #[config(default = "3e-4")]
     pub learning_rate: f64,
