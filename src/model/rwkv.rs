@@ -408,39 +408,37 @@ impl<B: Backend> TimeMixing<B> {
         let w = self.time_decay.val().clamp(-10.0, -0.1);
         let u = self.time_first.val().clamp(-5.0, 5.0);
 
-        // Extrair médias PRIMEIRO
+        // Extrair médias
         let w_mean: f32 = w.clone().mean().into_scalar().elem();
         let u_mean: f32 = u.clone().mean().into_scalar().elem();
 
         // Clamp k para estabilidade
-        let k = k.clamp(-30.0, 30.0);
+        let k_clamped = k.clamp(-30.0, 30.0);
 
-        // Criar matriz de distâncias: distance[i,j] = i - j
+        // ✨ FIX: Distâncias SEMPRE >= 0 (ou usar valor grande negativo para futuro)
         let distances: Vec<f32> = (0..seq_len as i32)
             .flat_map(|i| (0..seq_len as i32).map(move |j| {
-                (i - j) as f32
+                if j <= i { 
+                    (i - j) as f32  // Distância positiva: 0, 1, 2, ...
+                } else { 
+                    1000.0  // Valor grande para que exp(w * 1000) ≈ 0
+                }
             }))
             .collect();
         
         let dist_tensor = Tensor::<B, 1>::from_floats(distances.as_slice(), &device);
         let dist_matrix = dist_tensor.reshape([seq_len, seq_len]);
 
-        // Máscara causal: 1 se j <= i, 0 caso contrário
-        let causal_mask: Vec<f32> = (0..seq_len as i32)
-            .flat_map(|i| (0..seq_len as i32).map(move |j| {
-                if j <= i { 1.0 } else { 0.0 }
-            }))
-            .collect();
+        // ✨ FIX: Clamp o expoente ANTES do exp
+        // w_mean é negativo, então w_mean * dist_positivo = negativo
+        // exp(negativo) é sempre < 1 e finito
+        let exponent = (dist_matrix * w_mean).clamp(-50.0, 0.0);  // Clamp para evitar underflow
+        let decay_matrix = exponent.exp();
         
-        let mask_tensor = Tensor::<B, 1>::from_floats(causal_mask.as_slice(), &device);
-        let mask = mask_tensor.reshape([seq_len, seq_len]);
-
-        // decay_matrix = exp(w * dist) * mask
-        let decay_matrix = (dist_matrix * w_mean).exp() * mask.clone();
-        
-        // Bonus na diagonal
+        // Bonus na diagonal (clamped)
+        let u_exp = u_mean.exp().min(10.0);  // Clamp bonus
         let identity = Tensor::<B, 2>::eye(seq_len, &device);
-        let bonus_matrix = identity * (u_mean.exp() - 1.0);
+        let bonus_matrix = identity * (u_exp - 1.0);
         let weights = decay_matrix + bonus_matrix;
         
         // Normalizar por linha
@@ -455,8 +453,8 @@ impl<B: Backend> TimeMixing<B> {
         // output = weights @ v
         let output = weights_expanded.matmul(v);
 
-        // Modular pelo key
-        let k_sigmoid = activation::sigmoid(k * 0.1);
+        // Modular pelo key (suavizado)
+        let k_sigmoid = activation::sigmoid(k_clamped * 0.1);
         
         output * k_sigmoid
 }
