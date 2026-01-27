@@ -399,6 +399,7 @@ impl<B: Backend> TimeMixing<B> {
 
     /// ✨ WKV PARALELO - Aproximação linear sem loop temporal
     /// Usa exponential moving average ponderado, totalmente vetorizado
+    /// ✨ WKV PARALELO - Aproximação linear sem loop temporal
     fn wkv_parallel(&self, k: Tensor<B, 3>, v: Tensor<B, 3>) -> Tensor<B, 3> {
         let [batch_size, seq_len, channels] = k.dims();
         let device = k.device();
@@ -414,21 +415,30 @@ impl<B: Backend> TimeMixing<B> {
         // Clamp k para estabilidade
         let k = k.clamp(-30.0, 30.0);
 
-        // Criar máscara de posição causal: [T, T]
-        let positions: Vec<f32> = (0..seq_len as i32)
+        // Criar matriz de distâncias: distance[i,j] = i - j
+        let distances: Vec<f32> = (0..seq_len as i32)
             .flat_map(|i| (0..seq_len as i32).map(move |j| {
-                if j <= i { (i - j) as f32 } else { -1e9 }
+                (i - j) as f32
             }))
             .collect();
         
-        // ✨ FIX: Criar como 1D primeiro, depois reshape
-        let pos_tensor = Tensor::<B, 1>::from_floats(positions.as_slice(), &device);
-        let pos_matrix = pos_tensor.reshape([seq_len, seq_len]);
+        let dist_tensor = Tensor::<B, 1>::from_floats(distances.as_slice(), &device);
+        let dist_matrix = dist_tensor.reshape([seq_len, seq_len]);
 
-        // decay_matrix[i,j] = exp(w * (i-j)) para j <= i
-        let decay_matrix = (pos_matrix * w_mean).exp();
+        // Máscara causal: 1 se j <= i, 0 caso contrário
+        let causal_mask: Vec<f32> = (0..seq_len as i32)
+            .flat_map(|i| (0..seq_len as i32).map(move |j| {
+                if j <= i { 1.0 } else { 0.0 }
+            }))
+            .collect();
         
-        // Adicionar bonus u para diagonal
+        let mask_tensor = Tensor::<B, 1>::from_floats(causal_mask.as_slice(), &device);
+        let mask = mask_tensor.reshape([seq_len, seq_len]);
+
+        // decay_matrix = exp(w * dist) * mask
+        let decay_matrix = (dist_matrix * w_mean).exp() * mask.clone();
+        
+        // Bonus na diagonal
         let identity = Tensor::<B, 2>::eye(seq_len, &device);
         let bonus_matrix = identity * (u_mean.exp() - 1.0);
         let weights = decay_matrix + bonus_matrix;
