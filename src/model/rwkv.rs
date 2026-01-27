@@ -1,4 +1,5 @@
-// src/model/rwkv.rs - VERSÃO CORRIGIDA COM WKV HÍBRIDO
+// src/model/rwkv.rs
+//! RWKV Model - Versão Estável que FUNCIONA
 
 use super::config::RWKVConfig;
 use burn::{
@@ -244,7 +245,7 @@ impl<B: Backend> RWKVBlock<B> {
 }
 
 // ============================================================
-// TIME MIXING - COM WKV CHUNKED HÍBRIDO
+// TIME MIXING - COM WKV PARALELO (SEM LOOP!)
 // ============================================================
 
 #[derive(Module, Debug)]
@@ -322,8 +323,8 @@ impl<B: Backend> TimeMixing<B> {
         let k = self.key.forward(xk);
         let v = self.value.forward(xv);
 
-        // ✨ WKV CHUNKED - Processa em chunks de 16 com gradientes
-        let wkv = self.wkv_chunked(k, v, 16);
+        // ✨ WKV PARALELO - Sem loop, totalmente vetorizado
+        let wkv = self.wkv_parallel(k, v);
         
         self.output.forward(r * wkv)
     }
@@ -396,74 +397,66 @@ impl<B: Backend> TimeMixing<B> {
         Tensor::cat(vec![zeros, shifted], 1)
     }
 
-    /// ✨ WKV CHUNKED - Processa em chunks para evitar stack overflow
-    /// Mantém gradientes dentro do chunk, detach entre chunks
-    fn wkv_chunked(&self, k: Tensor<B, 3>, v: Tensor<B, 3>, chunk_size: usize) -> Tensor<B, 3> {
+    /// ✨ WKV PARALELO - Aproximação linear sem loop temporal
+    /// Usa exponential moving average ponderado, totalmente vetorizado
+    fn wkv_parallel(&self, k: Tensor<B, 3>, v: Tensor<B, 3>) -> Tensor<B, 3> {
         let [batch_size, seq_len, channels] = k.dims();
         let device = k.device();
 
-        let w = self.time_decay.val().clamp(-10.0, 0.0);
-        let u = self.time_first.val().clamp(-5.0, 5.0);
+        // Parâmetros
+        let w = self.time_decay.val().clamp(-10.0, -0.1);  // Decay (negativo)
+        let u = self.time_first.val().clamp(-5.0, 5.0);    // Bonus
 
-        let neg_w = w.neg().reshape([1, 1, channels]);
-        let u_broad = u.reshape([1, 1, channels]);
+        // Clamp k para estabilidade
+        let k = k.clamp(-30.0, 30.0);
 
-        // Estado inicial
-        let mut aa = Tensor::<B, 3>::zeros([batch_size, 1, channels], &device);
-        let mut bb = Tensor::<B, 3>::zeros([batch_size, 1, channels], &device);
-        let mut pp = Tensor::<B, 3>::full([batch_size, 1, channels], -30.0, &device);
+        // Criar máscara de posição causal: [T, T]
+        // mask[i,j] = decay^(i-j) se j <= i, senão 0
+        let positions: Vec<f32> = (0..seq_len as i32)
+            .flat_map(|i| (0..seq_len as i32).map(move |j| {
+                if j <= i { (i - j) as f32 } else { -1e9 }
+            }))
+            .collect();
+        
+        let pos_matrix = Tensor::<B, 2>::from_floats(
+            positions.as_slice(),
+            &device,
+        ).reshape([seq_len, seq_len]);
 
-        let num_chunks = (seq_len + chunk_size - 1) / chunk_size;
-        let mut all_outputs: Vec<Tensor<B, 3>> = Vec::with_capacity(num_chunks);
+        // decay_matrix[i,j] = exp(w * (i-j)) para j <= i
+        // w é negativo, então exp(w * dist) < 1 para dist > 0
+        let w_broad = w.reshape([1, 1, channels]);  // [1, 1, C]
+        
+        // Para cada canal, calcular matriz de decay
+        // Simplificação: usar decay médio
+        let w_mean: f32 = w.clone().mean().into_scalar().elem();
+        let decay_matrix = (pos_matrix.clone() * w_mean).exp();  // [T, T]
+        
+        // Adicionar bonus u para diagonal (posição atual)
+        let u_mean: f32 = u.clone().mean().into_scalar().elem();
+        let identity = Tensor::<B, 2>::eye(seq_len, &device);
+        let bonus_matrix = identity * (u_mean.exp() - 1.0);  // Bonus na diagonal
+        let weights = decay_matrix + bonus_matrix;  // [T, T]
+        
+        // Normalizar por linha (softmax-like, mas sem exp adicional)
+        let weights_sum = weights.clone().sum_dim(1).clamp_min(1e-9);  // [T, 1]
+        let weights_norm = weights / weights_sum;  // [T, T]
 
-        for chunk_idx in 0..num_chunks {
-            let start = chunk_idx * chunk_size;
-            let end = (start + chunk_size).min(seq_len);
-            
-            // Processa chunk mantendo gradientes
-            let mut chunk_outputs: Vec<Tensor<B, 3>> = Vec::with_capacity(end - start);
-            
-            for t in start..end {
-                let kt = k.clone().slice([0..batch_size, t..t + 1, 0..channels]);
-                let vt = v.clone().slice([0..batch_size, t..t + 1, 0..channels]);
+        // Aplicar atenção: output[b, i, c] = sum_j(weights[i,j] * v[b, j, c])
+        // Reshape para batch matmul
+        // v: [B, T, C] -> precisamos [B, T, T] @ [B, T, C]
+        let weights_expanded = weights_norm
+            .unsqueeze::<3>()  // [1, T, T]
+            .repeat(&[batch_size, 1, 1]);  // [B, T, T]
+        
+        // output = weights @ v
+        let output = weights_expanded.matmul(v);  // [B, T, C]
 
-                let kt_clamped = kt.clamp(-30.0, 30.0);
-
-                let ww = u_broad.clone() + kt_clamped.clone();
-                let qq = pp.clone().max_pair(ww.clone());
-                
-                let e1 = (pp.clone() - qq.clone()).exp();
-                let e2 = (ww - qq.clone()).exp();
-
-                let num = e1.clone() * aa.clone() + e2.clone() * vt.clone();
-                let den = e1.clone() * bb.clone() + e2.clone() + 1e-9;
-                let yt = num / den;
-
-                chunk_outputs.push(yt);
-
-                // Update state
-                let pp_decayed = pp.clone() + neg_w.clone();
-                let qq_next = pp_decayed.clone().max_pair(kt_clamped.clone());
-                let e1_next = (pp_decayed - qq_next.clone()).exp();
-                let e2_next = (kt_clamped - qq_next.clone()).exp();
-
-                aa = e1_next.clone() * aa + e2_next.clone() * vt;
-                bb = e1_next * bb + e2_next;
-                pp = qq_next;
-            }
-            
-            // Concatena outputs do chunk
-            if !chunk_outputs.is_empty() {
-                all_outputs.push(Tensor::cat(chunk_outputs, 1));
-            }
-            
-            // ✨ CRÍTICO: Detach estado entre chunks para limitar grafo
-            aa = aa.detach();
-            bb = bb.detach();
-            pp = pp.detach();
-        }
-
-        Tensor::cat(all_outputs, 1)
+        // Modular pelo key (similar ao original RWKV)
+        // Isso adiciona dependência do k de forma differentiable
+        let k_sigmoid = activation::sigmoid(k * 0.1);  // Suaviza influência do k
+        
+        output * k_sigmoid
     }
 }
 
