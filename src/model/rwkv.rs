@@ -1,4 +1,4 @@
-//! RWKV Model - Versão Estável Corrigida
+//! RWKV Model - Com Inicialização Correta
 
 use super::config::RWKVConfig;
 use super::wkv_optimized::{wkv_linear, wkv_step, WKVConfig};
@@ -6,7 +6,7 @@ use burn::{
     module::{Module, Param},
     nn::{
         Dropout, DropoutConfig, Embedding, EmbeddingConfig, LayerNorm, LayerNormConfig, Linear,
-        LinearConfig,
+        LinearConfig, Initializer,
     },
     tensor::{activation, backend::Backend, Int, Tensor},
 };
@@ -82,7 +82,13 @@ pub struct RWKV<B: Backend> {
 
 impl<B: Backend> RWKV<B> {
     pub fn new(config: &RWKVConfig, device: &B::Device) -> Self {
-        let embedding = EmbeddingConfig::new(config.vocab_size, config.d_model).init(device);
+        // ✅ CRÍTICO: Inicialização pequena para embeddings
+        let embedding = EmbeddingConfig::new(config.vocab_size, config.d_model)
+            .with_initializer(Initializer::Normal { 
+                mean: 0.0, 
+                std: 0.02  // Escala pequena!
+            })
+            .init(device);
 
         let ln_pre = LayerNormConfig::new(config.d_model)
             .with_epsilon(config.layer_norm_eps)
@@ -99,9 +105,14 @@ impl<B: Backend> RWKV<B> {
         let head = if config.weight_tying {
             None
         } else {
+            // ✅ Head com inicialização pequena
             Some(
                 LinearConfig::new(config.d_model, config.vocab_size)
                     .with_bias(false)
+                    .with_initializer(Initializer::Normal { 
+                        mean: 0.0, 
+                        std: 0.02 / (2.0 * config.n_layers as f64).sqrt()
+                    })
                     .init(device),
             )
         };
@@ -250,7 +261,7 @@ impl<B: Backend> RWKVBlock<B> {
 }
 
 // ============================================================
-// TIME MIXING
+// TIME MIXING - Com Inicialização Correta
 // ============================================================
 
 #[derive(Module, Debug)]
@@ -273,12 +284,17 @@ pub struct TimeMixing<B: Backend> {
 
 impl<B: Backend> TimeMixing<B> {
     pub fn new(d_model: usize, layer_id: usize, n_layers: usize, device: &B::Device) -> Self {
-        let linear_config = LinearConfig::new(d_model, d_model).with_bias(false);
+        // ✅ Escala de inicialização baseada na profundidade
+        let init_std = 0.02 / (2.0 * n_layers as f64).sqrt();
+        
+        let linear_config = LinearConfig::new(d_model, d_model)
+            .with_bias(false)
+            .with_initializer(Initializer::Normal { mean: 0.0, std: init_std });
 
         let ratio_0_to_1 = layer_id as f64 / (n_layers.max(1) - 1).max(1) as f64;
         let ratio_1_to_almost_0 = 1.0 - ratio_0_to_1;
 
-        // time_decay: NEGATIVO, controla decay do histórico
+        // time_decay: NEGATIVO
         let decay_values: Vec<f32> = (0..d_model)
             .map(|i| {
                 let channel_ratio = i as f64 / (d_model - 1).max(1) as f64;
@@ -287,7 +303,7 @@ impl<B: Backend> TimeMixing<B> {
             })
             .collect();
 
-        // time_first: bonus para token atual
+        // time_first
         let first_values: Vec<f32> = (0..d_model)
             .map(|i| {
                 let channel_ratio = i as f64 / (d_model - 1).max(1) as f64;
@@ -301,7 +317,7 @@ impl<B: Backend> TimeMixing<B> {
             })
             .collect();
 
-        // time_mix: interpolação entre token atual e anterior
+        // time_mix
         let mix_values: Vec<f32> = (0..d_model)
             .map(|i| {
                 let channel_ratio = i as f64 / (d_model - 1).max(1) as f64;
@@ -395,7 +411,7 @@ impl<B: Backend> TimeMixing<B> {
 }
 
 // ============================================================
-// CHANNEL MIXING
+// CHANNEL MIXING - Com Inicialização Correta
 // ============================================================
 
 #[derive(Module, Debug)]
@@ -419,6 +435,9 @@ impl<B: Backend> ChannelMixing<B> {
     ) -> Self {
         let ratio_1_to_almost_0 = 1.0 - (layer_id as f64 / (n_layers.max(1) - 1).max(1) as f64);
 
+        // ✅ Inicialização com escala correta
+        let init_std = 0.02 / (2.0 * n_layers as f64).sqrt();
+        
         let mix_values: Vec<f32> = (0..d_model)
             .map(|i| {
                 let channel_ratio = i as f64 / (d_model.max(1) - 1).max(1) as f64;
@@ -427,9 +446,18 @@ impl<B: Backend> ChannelMixing<B> {
             .collect();
 
         Self {
-            receptance: LinearConfig::new(d_model, d_model).with_bias(false).init(device),
-            key: LinearConfig::new(d_model, d_ffn).with_bias(false).init(device),
-            value: LinearConfig::new(d_ffn, d_model).with_bias(false).init(device),
+            receptance: LinearConfig::new(d_model, d_model)
+                .with_bias(false)
+                .with_initializer(Initializer::Normal { mean: 0.0, std: init_std })
+                .init(device),
+            key: LinearConfig::new(d_model, d_ffn)
+                .with_bias(false)
+                .with_initializer(Initializer::Normal { mean: 0.0, std: init_std })
+                .init(device),
+            value: LinearConfig::new(d_ffn, d_model)
+                .with_bias(false)
+                .with_initializer(Initializer::Normal { mean: 0.0, std: init_std })
+                .init(device),
             time_mix_k: Param::from_tensor(Tensor::from_floats(mix_values.as_slice(), device)),
             time_mix_r: Param::from_tensor(Tensor::from_floats(mix_values.as_slice(), device)),
             d_model,
