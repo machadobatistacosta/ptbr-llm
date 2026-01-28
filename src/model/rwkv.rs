@@ -13,7 +13,7 @@ use burn::{
         Dropout, DropoutConfig, Embedding, EmbeddingConfig, LayerNorm, LayerNormConfig, Linear,
         LinearConfig,
     },
-    tensor::{activation, backend::Backend, Int, Tensor},
+    tensor::{activation, backend::Backend, ElementConversion, Int, Tensor},
 };
 
 // ============================================================
@@ -22,7 +22,7 @@ use burn::{
 
 #[derive(Clone, Debug)]
 pub struct RWKVState<B: Backend> {
-    /// (ema_sum, ema_weight, _unused) - compatível com EMA do treino
+    /// (ema_sum, ema_weight, step_count) - compatível com EMA do treino
     pub time_state: Vec<(Tensor<B, 2>, Tensor<B, 2>, Tensor<B, 2>)>,
     pub channel_state: Vec<Tensor<B, 2>>,
     pub prev_embedding: Vec<Tensor<B, 2>>,
@@ -35,8 +35,8 @@ impl<B: Backend> RWKVState<B> {
                 .map(|_| {
                     (
                         Tensor::zeros([batch_size, d_model], device),  // ema_sum
-                        Tensor::zeros([batch_size, d_model], device),  // ema_weight (scalar broadcast)
-                        Tensor::zeros([batch_size, d_model], device),  // unused (mantido para compatibilidade)
+                        Tensor::zeros([batch_size, d_model], device),  // ema_weight
+                        Tensor::zeros([batch_size, d_model], device),  // step_count
                     )
                 })
                 .collect(),
@@ -545,10 +545,6 @@ impl<B: Backend> TimeMixing<B> {
     }
 
     /// ✨ WKV EMA Step - Versão incremental compatível com wkv_ema do treino
-    /// 
-    /// state.0 = ema_sum (soma ponderada acumulada)
-    /// state.1 = ema_weight_tensor (peso acumulado, broadcast)
-    /// state.2 = step_count (contador de passos)
     fn wkv_ema_step(
         &self,
         k: Tensor<B, 2>,
@@ -580,7 +576,6 @@ impl<B: Backend> TimeMixing<B> {
         let output = new_sum.clone() / safe_weight;
         
         // Gate com k (mesmo do treino)
-        // Clamp para evitar overflow em sigmoid
         let k_clamped = k.clamp(-30.0, 30.0);
         let k_gate = activation::sigmoid(k_clamped * 0.1);
         let result = output * k_gate;
@@ -589,7 +584,7 @@ impl<B: Backend> TimeMixing<B> {
         *ema_sum = new_sum;
         *ema_weight_tensor = Tensor::full([b, c], new_weight, &device);
         
-        // Incrementa contador (para debug/monitoramento)
+        // Incrementa contador (para debug)
         let step_val: f32 = step_tensor.clone()
             .mean()
             .into_scalar()
