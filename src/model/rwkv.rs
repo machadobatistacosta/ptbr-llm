@@ -1,4 +1,4 @@
-//! RWKV Model - Versão com Escala Correta de Logits
+//! RWKV Model - Versão Estável
 
 use super::config::RWKVConfig;
 use super::wkv_optimized::{wkv_linear, wkv_step, WKVConfig};
@@ -120,9 +120,11 @@ impl<B: Backend> RWKV<B> {
     }
 
     pub fn forward(&self, input_ids: Tensor<B, 2, Int>) -> Tensor<B, 3> {
-        // ✅ Escala embedding para estabilidade
-        let emb_scale = 1.0 / (self.d_model as f32).sqrt();
-        let mut x = self.embedding.forward(input_ids) * emb_scale;
+        let mut x = self.embedding.forward(input_ids);
+        
+        // ✅ Escala simples inline
+        let scale = 0.03125_f32; // 1/32, valor fixo seguro
+        x = x * scale;
         
         x = self.ln_pre.forward(x);
 
@@ -142,9 +144,8 @@ impl<B: Backend> RWKV<B> {
             self.head.as_ref().unwrap().forward(x)
         };
         
-        // ✅ CRÍTICO: Escala logits para range correto
-        // Isso garante loss inicial ~11 (ln(vocab_size))
-        logits * emb_scale
+        // ✅ Escala logits
+        logits * scale
     }
 
     pub fn forward_inference(&self, input_ids: Tensor<B, 2, Int>) -> Tensor<B, 2> {
@@ -159,9 +160,9 @@ impl<B: Backend> RWKV<B> {
         state: &mut RWKVState<B>,
     ) -> Tensor<B, 2> {
         let [b, _] = token_id.dims();
-        let emb_scale = 1.0 / (self.d_model as f32).sqrt();
+        let scale = 0.03125_f32;
 
-        let x = self.embedding.forward(token_id) * emb_scale;
+        let x = self.embedding.forward(token_id) * scale;
         let x = self.ln_pre.forward(x);
         let mut x = x.reshape([b, self.d_model]);
 
@@ -187,7 +188,7 @@ impl<B: Backend> RWKV<B> {
             self.head.as_ref().unwrap().forward(x).reshape([b, self.vocab_size])
         };
         
-        logits * emb_scale
+        logits * scale
     }
 
     pub fn vocab_size(&self) -> usize { self.vocab_size }
@@ -196,7 +197,7 @@ impl<B: Backend> RWKV<B> {
 }
 
 // ============================================================
-// RWKV BLOCK
+// RWKV BLOCK - SEM layer_scale
 // ============================================================
 
 #[derive(Module, Debug)]
@@ -206,15 +207,10 @@ pub struct RWKVBlock<B: Backend> {
     ln2: LayerNorm<B>,
     channel_mixing: ChannelMixing<B>,
     dropout: Dropout,
-    #[module(skip)]
-    layer_scale: f32,
 }
 
 impl<B: Backend> RWKVBlock<B> {
     pub fn new(config: &RWKVConfig, layer_id: usize, device: &B::Device) -> Self {
-        // ✅ Escala residual por layer
-        let layer_scale = 1.0 / (config.n_layers as f32).sqrt();
-        
         Self {
             ln1: LayerNormConfig::new(config.d_model)
                 .with_epsilon(config.layer_norm_eps)
@@ -231,17 +227,16 @@ impl<B: Backend> RWKVBlock<B> {
                 device,
             ),
             dropout: DropoutConfig::new(config.dropout).init(),
-            layer_scale,
         }
     }
 
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
         let ln1_out = self.ln1.forward(x.clone());
-        let tm = self.time_mixing.forward(ln1_out) * self.layer_scale;
+        let tm = self.time_mixing.forward(ln1_out);
         let x = x + self.dropout.forward(tm);
 
         let ln2_out = self.ln2.forward(x.clone());
-        let cm = self.channel_mixing.forward(ln2_out) * self.layer_scale;
+        let cm = self.channel_mixing.forward(ln2_out);
         x + self.dropout.forward(cm)
     }
 
@@ -256,11 +251,11 @@ impl<B: Backend> RWKVBlock<B> {
 
         let x_3d = x.clone().reshape([b, 1, c]);
         let ln1_out = self.ln1.forward(x_3d).reshape([b, c]);
-        let tm = self.time_mixing.forward_step(ln1_out, time_state, prev_embedding) * self.layer_scale;
+        let tm = self.time_mixing.forward_step(ln1_out, time_state, prev_embedding);
         let x = x + tm;
 
         let ln2_out = self.ln2.forward(x.clone().reshape([b, 1, c])).reshape([b, c]);
-        let cm = self.channel_mixing.forward_step(ln2_out, channel_state) * self.layer_scale;
+        let cm = self.channel_mixing.forward_step(ln2_out, channel_state);
         x + cm
     }
 }
@@ -294,7 +289,6 @@ impl<B: Backend> TimeMixing<B> {
         let ratio_0_to_1 = layer_id as f64 / (n_layers.max(1) - 1).max(1) as f64;
         let ratio_1_to_almost_0 = 1.0 - ratio_0_to_1;
 
-        // time_decay: NEGATIVO
         let decay_values: Vec<f32> = (0..d_model)
             .map(|i| {
                 let channel_ratio = i as f64 / (d_model - 1).max(1) as f64;
@@ -303,7 +297,6 @@ impl<B: Backend> TimeMixing<B> {
             })
             .collect();
 
-        // time_first
         let first_values: Vec<f32> = (0..d_model)
             .map(|i| {
                 let channel_ratio = i as f64 / (d_model - 1).max(1) as f64;
@@ -317,7 +310,6 @@ impl<B: Backend> TimeMixing<B> {
             })
             .collect();
 
-        // time_mix
         let mix_values: Vec<f32> = (0..d_model)
             .map(|i| {
                 let channel_ratio = i as f64 / (d_model - 1).max(1) as f64;
