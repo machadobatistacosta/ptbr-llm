@@ -1,10 +1,11 @@
-// src/model/rwkv.rs
-//! RWKV Model - Memory Optimized para T4 16GB
+//! RWKV Model - Versão Corrigida com WKV Linear Attention
 //! 
-//! Mudanças principais:
-//! - WKV usa EMA em vez de matriz T×T
-//! - Memória O(T) em vez de O(T²)
-//! - forward_step usa wkv_ema_step (compatível com treino)
+//! Correções principais:
+//! - time_decay e time_first são USADOS (antes eram ignorados!)
+//! - WKV usa estabilização numérica com (aa, bb, pp)
+//! - Clamps em todos os pontos críticos
+//! - forward_step compatível com treino
+//! - tensor_max usando fórmula matemática (funciona em todos backends)
 
 use super::config::RWKVConfig;
 use burn::{
@@ -13,7 +14,7 @@ use burn::{
         Dropout, DropoutConfig, Embedding, EmbeddingConfig, LayerNorm, LayerNormConfig, Linear,
         LinearConfig,
     },
-    tensor::{activation, backend::Backend, ElementConversion, Int, Tensor},
+    tensor::{activation, backend::Backend, Int, Tensor},
 };
 
 // ============================================================
@@ -22,9 +23,11 @@ use burn::{
 
 #[derive(Clone, Debug)]
 pub struct RWKVState<B: Backend> {
-    /// (ema_sum, ema_weight, step_count) - compatível com EMA do treino
+    /// (aa, bb, pp) - numerador acumulado, denominador acumulado, max log para estabilidade
     pub time_state: Vec<(Tensor<B, 2>, Tensor<B, 2>, Tensor<B, 2>)>,
+    /// Estado do channel mixing (embedding anterior)
     pub channel_state: Vec<Tensor<B, 2>>,
+    /// Embedding anterior para token shift no time mixing
     pub prev_embedding: Vec<Tensor<B, 2>>,
 }
 
@@ -34,9 +37,9 @@ impl<B: Backend> RWKVState<B> {
             time_state: (0..n_layers)
                 .map(|_| {
                     (
-                        Tensor::zeros([batch_size, d_model], device),  // ema_sum
-                        Tensor::zeros([batch_size, d_model], device),  // ema_weight
-                        Tensor::zeros([batch_size, d_model], device),  // step_count
+                        Tensor::zeros([batch_size, d_model], device),           // aa (numerador)
+                        Tensor::zeros([batch_size, d_model], device),           // bb (denominador)  
+                        Tensor::full([batch_size, d_model], -1e30_f32, device), // pp (max para estabilidade)
                     )
                 })
                 .collect(),
@@ -46,6 +49,22 @@ impl<B: Backend> RWKVState<B> {
             prev_embedding: (0..n_layers)
                 .map(|_| Tensor::zeros([batch_size, d_model], device))
                 .collect(),
+        }
+    }
+    
+    /// Reset do estado (útil para novo documento)
+    pub fn reset(&mut self, device: &B::Device) {
+        let n_layers = self.time_state.len();
+        let [batch_size, d_model] = self.time_state[0].0.dims();
+        
+        for i in 0..n_layers {
+            self.time_state[i] = (
+                Tensor::zeros([batch_size, d_model], device),
+                Tensor::zeros([batch_size, d_model], device),
+                Tensor::full([batch_size, d_model], -1e30_f32, device),
+            );
+            self.channel_state[i] = Tensor::zeros([batch_size, d_model], device);
+            self.prev_embedding[i] = Tensor::zeros([batch_size, d_model], device);
         }
     }
 }
@@ -101,8 +120,9 @@ impl<B: Backend> RWKV<B> {
             )
         };
 
+        // Scaling factors para estabilidade
         let emb_scale = (config.d_model as f32).powf(-0.5);
-        let logit_scale = 0.5 * (config.d_model as f32).powf(-0.5);
+        let logit_scale = 0.5 * (config.vocab_size as f32).ln().recip();
 
         Self {
             embedding,
@@ -119,6 +139,7 @@ impl<B: Backend> RWKV<B> {
         }
     }
 
+    /// Forward completo para treino
     pub fn forward(&self, input_ids: Tensor<B, 2, Int>) -> Tensor<B, 3> {
         let mut x = self.embedding.forward(input_ids);
         x = x * self.emb_scale;
@@ -130,38 +151,44 @@ impl<B: Backend> RWKV<B> {
 
         x = self.ln_out.forward(x);
 
-        if self.use_weight_tying {
+        let logits = if self.use_weight_tying {
             let [b, t, d] = x.dims();
             let emb_weight = self.embedding.weight.val();
             let x_flat = x.reshape([b * t, d]);
-            let logits_flat = x_flat.matmul(emb_weight.transpose()) * self.logit_scale;
+            let logits_flat = x_flat.matmul(emb_weight.transpose());
             logits_flat.reshape([b, t, self.vocab_size])
         } else {
-            self.head.as_ref().unwrap().forward(x) * self.logit_scale
-        }
+            self.head.as_ref().unwrap().forward(x)
+        };
+        
+        logits * self.logit_scale
     }
 
+    /// Forward para inferência (retorna apenas último token)
     pub fn forward_inference(&self, input_ids: Tensor<B, 2, Int>) -> Tensor<B, 2> {
         let logits = self.forward(input_ids);
         let [b, s, v] = logits.dims();
         logits.slice([0..b, s - 1..s, 0..v]).reshape([b, v])
     }
 
+    /// Forward incremental com estado (para geração token-a-token)
     pub fn forward_step(
         &self,
-        token_id: Tensor<B, 2, Int>,
+        token_id: Tensor<B, 2, Int>,  // [batch, 1]
         state: &mut RWKVState<B>,
     ) -> Tensor<B, 2> {
         let [b, _] = token_id.dims();
 
+        // Embedding
         let x = self.embedding.forward(token_id) * self.emb_scale;
         let x = self.ln_pre.forward(x);
         let mut x = x.reshape([b, self.d_model]);
 
+        // Passa por cada bloco
         for (layer_idx, block) in self.blocks.iter().enumerate() {
             let prev_emb = state.prev_embedding[layer_idx].clone();
             x = block.forward_step(
-                x,
+                x.clone(),
                 &mut state.time_state[layer_idx],
                 &mut state.channel_state[layer_idx],
                 prev_emb,
@@ -169,18 +196,22 @@ impl<B: Backend> RWKV<B> {
             state.prev_embedding[layer_idx] = x.clone();
         }
 
+        // Output
         let x = x.reshape([b, 1, self.d_model]);
         let x = self.ln_out.forward(x);
 
-        if self.use_weight_tying {
+        let logits = if self.use_weight_tying {
             let x_flat = x.reshape([b, self.d_model]);
             let emb_weight = self.embedding.weight.val();
-            x_flat.matmul(emb_weight.transpose()) * self.logit_scale
+            x_flat.matmul(emb_weight.transpose())
         } else {
-            self.head.as_ref().unwrap().forward(x).reshape([b, self.vocab_size]) * self.logit_scale
-        }
+            self.head.as_ref().unwrap().forward(x).reshape([b, self.vocab_size])
+        };
+        
+        logits * self.logit_scale
     }
 
+    // Getters
     pub fn vocab_size(&self) -> usize { self.vocab_size }
     pub fn d_model(&self) -> usize { self.d_model }
     pub fn n_layers(&self) -> usize { self.n_layers }
@@ -221,10 +252,12 @@ impl<B: Backend> RWKVBlock<B> {
     }
 
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
+        // Time mixing com residual
         let ln1_out = self.ln1.forward(x.clone());
         let tm = self.time_mixing.forward(ln1_out);
         let x = x + self.dropout.forward(tm);
 
+        // Channel mixing com residual
         let ln2_out = self.ln2.forward(x.clone());
         let cm = self.channel_mixing.forward(ln2_out);
         x + self.dropout.forward(cm)
@@ -239,11 +272,13 @@ impl<B: Backend> RWKVBlock<B> {
     ) -> Tensor<B, 2> {
         let [b, c] = x.dims();
 
+        // Time mixing
         let x_3d = x.clone().reshape([b, 1, c]);
         let ln1_out = self.ln1.forward(x_3d).reshape([b, c]);
         let tm = self.time_mixing.forward_step(ln1_out, time_state, prev_embedding);
         let x = x + tm;
 
+        // Channel mixing
         let ln2_out = self.ln2.forward(x.clone().reshape([b, 1, c])).reshape([b, c]);
         let cm = self.channel_mixing.forward_step(ln2_out, channel_state);
         x + cm
@@ -251,49 +286,60 @@ impl<B: Backend> RWKVBlock<B> {
 }
 
 // ============================================================
-// TIME MIXING - MEMORY OPTIMIZED (EMA, sem matriz T×T)
+// TIME MIXING - COM WKV LINEAR ATTENTION CORRETO
 // ============================================================
 
 #[derive(Module, Debug)]
 pub struct TimeMixing<B: Backend> {
+    // Projeções lineares
     receptance: Linear<B>,
     key: Linear<B>,
     value: Linear<B>,
     output: Linear<B>,
-    time_decay: Param<Tensor<B, 1>>,
-    time_first: Param<Tensor<B, 1>>,
+    
+    // ✨ Parâmetros aprendíveis do WKV (AGORA SÃO USADOS!)
+    time_decay: Param<Tensor<B, 1>>,  // w - controla decay temporal
+    time_first: Param<Tensor<B, 1>>,  // u - bonus para token atual
+    
+    // Parâmetros de mixing
     time_mix_k: Param<Tensor<B, 1>>,
     time_mix_v: Param<Tensor<B, 1>>,
     time_mix_r: Param<Tensor<B, 1>>,
+    
     #[module(skip)]
     d_model: usize,
-    #[module(skip)]
-    layer_id: usize,
-    #[module(skip)]
-    n_layers: usize,
 }
 
 impl<B: Backend> TimeMixing<B> {
     pub fn new(d_model: usize, layer_id: usize, n_layers: usize, device: &B::Device) -> Self {
         let linear_config = LinearConfig::new(d_model, d_model).with_bias(false);
 
+        // Ratio para inicialização baseada na profundidade
         let ratio_0_to_1 = layer_id as f64 / (n_layers.max(1) - 1).max(1) as f64;
         let ratio_1_to_almost_0 = 1.0 - ratio_0_to_1;
 
+        // ✨ Inicialização do time_decay (w) - RWKV-4 style
+        // Layers mais profundas têm decay mais lento (valores menos negativos)
         let decay_values: Vec<f32> = (0..d_model)
             .map(|i| {
                 let channel_ratio = i as f64 / (d_model.max(1) - 1).max(1) as f64;
-                ((-5.0 - 1.0 * ratio_0_to_1 + 0.3 * channel_ratio) as f32).clamp(-8.0, -2.0)
+                let base = -5.0 + ratio_0_to_1 * 2.0;  // -5 a -3 conforme profundidade
+                let variation = channel_ratio * 1.5;   // Variação por canal
+                ((base + variation) as f32).clamp(-7.0, -0.5)
             })
             .collect();
 
+        // ✨ Inicialização do time_first (u)
+        // Bonus para o token atual, maior nas primeiras layers
         let first_values: Vec<f32> = (0..d_model)
             .map(|i| {
                 let channel_ratio = i as f64 / (d_model.max(1) - 1).max(1) as f64;
-                ((1.0 - channel_ratio) * 0.5 + channel_ratio * 0.2) as f32
+                let base = 1.0 - ratio_0_to_1 * 0.5;  // 1.0 a 0.5 conforme profundidade
+                ((base * (1.0 - channel_ratio * 0.3)) as f32).clamp(0.1, 2.0)
             })
             .collect();
 
+        // Inicialização do time_mix
         let mix_values: Vec<f32> = (0..d_model)
             .map(|i| {
                 let channel_ratio = i as f64 / (d_model.max(1) - 1).max(1) as f64;
@@ -312,19 +358,14 @@ impl<B: Backend> TimeMixing<B> {
             time_mix_v: Param::from_tensor(Tensor::from_floats(mix_values.as_slice(), device)),
             time_mix_r: Param::from_tensor(Tensor::from_floats(mix_values.as_slice(), device)),
             d_model,
-            layer_id,
-            n_layers,
         }
     }
 
-    /// Calcula decay para esta layer (usado em treino e inferência)
-    fn get_decay(&self) -> f32 {
-        0.90_f32 + 0.08 * (self.layer_id as f32 / self.n_layers.max(1) as f32)
-    }
-
+    /// Forward para treino (sequência completa)
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
         let [b, t, c] = x.dims();
 
+        // Token mixing
         let mix_k = self.time_mix_k.val().reshape([1, 1, c]);
         let mix_v = self.time_mix_v.val().reshape([1, 1, c]);
         let mix_r = self.time_mix_r.val().reshape([1, 1, c]);
@@ -336,264 +377,171 @@ impl<B: Backend> TimeMixing<B> {
         let xv = x_prev.clone() + mix_v * x_diff.clone();
         let xr = x_prev + mix_r * x_diff;
 
+        // Projeções
         let r = activation::sigmoid(self.receptance.forward(xr));
         let k = self.key.forward(xk);
         let v = self.value.forward(xv);
 
-        // ✨ WKV MEMORY-OPTIMIZED - EMA sem matriz T×T
-        let wkv = self.wkv_ema(k, v, t);
+        // ✨ WKV Linear Attention (agora usa time_decay e time_first!)
+        let wkv = self.wkv_linear_attention(k, v, b, t, c);
         
+        // Output
         self.output.forward(r * wkv)
     }
 
-    /// ✨ WKV via EMA - O(T) memória em vez de O(T²)
-    fn wkv_ema(&self, k: Tensor<B, 3>, v: Tensor<B, 3>, t: usize) -> Tensor<B, 3> {
-        let [b, _, c] = v.dims();
-        let decay = self.get_decay();
-        
-        // Para seq curtas (≤64), método direto é mais eficiente
-        if t <= 64 {
-            return self.wkv_direct(k, v, t, b, c, decay);
-        }
-        
-        // Para seq maiores, chunked EMA
-        self.wkv_chunked(k, v, t, b, c, decay)
-    }
-    
-    /// WKV direto para sequências pequenas
-    fn wkv_direct(
-        &self,
-        k: Tensor<B, 3>,
-        v: Tensor<B, 3>,
-        t: usize,
+    /// ✨ WKV Linear Attention - O coração do RWKV
+    fn wkv_linear_attention(
+        &self, 
+        k: Tensor<B, 3>,  // [b, t, c]
+        v: Tensor<B, 3>,  // [b, t, c]
         b: usize,
+        t: usize, 
         c: usize,
-        decay: f32,
     ) -> Tensor<B, 3> {
         let device = v.device();
         
-        // Escala por posição para cumsum ponderado
-        let positions: Vec<f32> = (0..t).map(|i| decay.powi(-(i as i32))).collect();
-        let pos_scale = Tensor::<B, 1>::from_floats(positions.as_slice(), &device)
-            .reshape([1, t, 1]);
+        // ✨ Obtém parâmetros aprendíveis com clamp para estabilidade
+        let w = self.time_decay.val().clamp(-7.0, -0.1);  // decay sempre negativo
+        let u = self.time_first.val().clamp(-3.0, 3.0);   // bonus limitado
         
-        let v_scaled = v.clone() * pos_scale;
-        let v_cumsum = self.cumsum_dim1(v_scaled, b, t, c);
+        // Estado acumulador
+        let mut aa = Tensor::<B, 2>::zeros([b, c], &device);  // numerador
+        let mut bb = Tensor::<B, 2>::zeros([b, c], &device);  // denominador
+        let mut pp = Tensor::<B, 2>::full([b, c], -1e30_f32, &device);  // max para estabilidade
         
-        // Re-escalar
-        let inv_pos: Vec<f32> = (0..t).map(|i| decay.powi(i as i32)).collect();
-        let inv_pos_scale = Tensor::<B, 1>::from_floats(inv_pos.as_slice(), &device)
-            .reshape([1, t, 1]);
+        let mut outputs = Vec::with_capacity(t);
         
-        let v_ema = v_cumsum * inv_pos_scale;
+        // Expande para broadcast
+        let w_exp = w.clone().reshape([1, c]);
+        let u_exp = u.clone().reshape([1, c]);
         
-        // Normalização
-        let norm_weights: Vec<f32> = (1..=t)
-            .map(|i| {
-                if decay >= 0.999 { i as f32 }
-                else { (1.0 - decay.powi(i as i32)) / (1.0 - decay) }
-            })
-            .collect();
-        let norm = Tensor::<B, 1>::from_floats(norm_weights.as_slice(), &device)
-            .reshape([1, t, 1])
-            .clamp_min(1e-9);
-        
-        let v_normalized = v_ema / norm;
-        
-        // Gate com k
-        let k_gate = activation::sigmoid(k.clamp(-30.0, 30.0) * 0.1);
-        
-        v_normalized * k_gate
-    }
-    
-    /// WKV chunked para sequências maiores
-    fn wkv_chunked(
-        &self,
-        k: Tensor<B, 3>,
-        v: Tensor<B, 3>,
-        t: usize,
-        b: usize,
-        c: usize,
-        decay: f32,
-    ) -> Tensor<B, 3> {
-        let device = v.device();
-        let chunk_size = 32_usize;
-        let n_chunks = (t + chunk_size - 1) / chunk_size;
-        
-        let mut outputs: Vec<Tensor<B, 3>> = Vec::with_capacity(n_chunks);
-        let mut carry_sum = Tensor::<B, 2>::zeros([b, c], &device);
-        let mut carry_weight: f32 = 0.0;
-        
-        for chunk_idx in 0..n_chunks {
-            let start = chunk_idx * chunk_size;
-            let end = (start + chunk_size).min(t);
-            let chunk_len = end - start;
+        for i in 0..t {
+            // Extrai k[i] e v[i]: [b, c]
+            let ki = k.clone().slice([0..b, i..i+1, 0..c]).reshape([b, c]);
+            let vi = v.clone().slice([0..b, i..i+1, 0..c]).reshape([b, c]);
             
-            let v_chunk = v.clone().slice([0..b, start..end, 0..c]);
-            let k_chunk = k.clone().slice([0..b, start..end, 0..c]);
+            // ✨ Calcula output para posição i
+            // ww = u + k[i] (bonus para token atual)
+            let ww = u_exp.clone() + ki.clone();
             
-            // EMA local
-            let positions: Vec<f32> = (0..chunk_len).map(|i| decay.powi(-(i as i32))).collect();
-            let pos_scale = Tensor::<B, 1>::from_floats(positions.as_slice(), &device)
-                .reshape([1, chunk_len, 1]);
+            // Estabilização: encontra máximo entre pp e ww
+            let p_max = self.tensor_max(pp.clone(), ww.clone()).clamp(-30.0, 30.0);
             
-            let v_scaled = v_chunk.clone() * pos_scale;
-            let v_cumsum = self.cumsum_dim1(v_scaled, b, chunk_len, c);
+            // e1 = exp(pp - p_max), e2 = exp(ww - p_max)
+            let e1 = (pp.clone() - p_max.clone()).clamp(-30.0, 0.0).exp();
+            let e2 = (ww - p_max.clone()).clamp(-30.0, 0.0).exp();
             
-            let inv_pos: Vec<f32> = (0..chunk_len).map(|i| decay.powi(i as i32)).collect();
-            let inv_pos_scale = Tensor::<B, 1>::from_floats(inv_pos.as_slice(), &device)
-                .reshape([1, chunk_len, 1]);
+            // Numerador e denominador para output
+            let a_num = e1.clone() * aa.clone() + e2.clone() * vi.clone();
+            let b_den = e1.clone() * bb.clone() + e2.clone();
             
-            let v_local = v_cumsum * inv_pos_scale;
+            // Output com proteção divisão por zero
+            let wkv = a_num / b_den.clamp_min(1e-9);
+            outputs.push(wkv.reshape([b, 1, c]));
             
-            // Carry contribution
-            let carry_contrib: Vec<f32> = (0..chunk_len)
-                .map(|i| decay.powi((i + 1) as i32))
-                .collect();
-            let carry_scale = Tensor::<B, 1>::from_floats(carry_contrib.as_slice(), &device)
-                .reshape([1, chunk_len, 1]);
+            // ✨ Atualiza estado para próximo token
+            // ww_next = w + k[i] (decay aplicado ao key atual)
+            let ww_next = w_exp.clone() + ki;
+            let p_max_next = self.tensor_max(pp.clone(), ww_next.clone()).clamp(-30.0, 30.0);
             
-            let carry_expanded = carry_sum.clone().reshape([b, 1, c]).repeat(&[1, chunk_len, 1]);
-            let v_with_carry = v_local + carry_expanded * carry_scale;
+            let e1_next = (pp.clone() - p_max_next.clone()).clamp(-30.0, 0.0).exp();
+            let e2_next = (ww_next - p_max_next.clone()).clamp(-30.0, 0.0).exp();
             
-            // Normalização
-            let norm_weights: Vec<f32> = (0..chunk_len)
-                .map(|i| {
-                    let local_w = if decay >= 0.999 { (i + 1) as f32 }
-                    else { (1.0 - decay.powi((i + 1) as i32)) / (1.0 - decay) };
-                    let carry_w = carry_weight * decay.powi((i + 1) as i32);
-                    (local_w + carry_w).max(1e-9)
-                })
-                .collect();
-            
-            let norm = Tensor::<B, 1>::from_floats(norm_weights.as_slice(), &device)
-                .reshape([1, chunk_len, 1]);
-            
-            let v_normalized = v_with_carry / norm;
-            
-            // Gate
-            let k_gate = activation::sigmoid(k_chunk.clamp(-30.0, 30.0) * 0.1);
-            outputs.push(v_normalized * k_gate);
-            
-            // Update carry
-            let decay_chunk = decay.powi(chunk_len as i32);
-            let old_carry = carry_sum.clone() * decay_chunk;
-            
-            let weights_for_carry: Vec<f32> = (0..chunk_len)
-                .map(|i| decay.powi((chunk_len - 1 - i) as i32))
-                .collect();
-            let w_carry = Tensor::<B, 1>::from_floats(weights_for_carry.as_slice(), &device)
-                .reshape([1, chunk_len, 1]);
-            
-            let new_contrib = (v_chunk * w_carry).sum_dim(1).reshape([b, c]);
-            carry_sum = old_carry + new_contrib;
-            
-            let old_weight = carry_weight * decay_chunk;
-            let new_weight: f32 = weights_for_carry.iter().sum();
-            carry_weight = old_weight + new_weight;
+            // Atualiza acumuladores
+            aa = (e1_next.clone() * aa + e2_next.clone() * vi).clamp(-1e6, 1e6);
+            bb = (e1_next * bb + e2_next).clamp(1e-9, 1e6);
+            pp = p_max_next;
         }
         
         Tensor::cat(outputs, 1)
     }
     
-    /// Cumsum eficiente ao longo da dimensão 1
-    fn cumsum_dim1(&self, x: Tensor<B, 3>, b: usize, t: usize, c: usize) -> Tensor<B, 3> {
-        if t == 1 {
-            return x;
-        }
-        
-        let device = x.device();
-        let mut result = Vec::with_capacity(t);
-        let mut running_sum = Tensor::<B, 3>::zeros([b, 1, c], &device);
-        
-        for i in 0..t {
-            let x_i = x.clone().slice([0..b, i..i+1, 0..c]);
-            running_sum = running_sum + x_i;
-            result.push(running_sum.clone());
-        }
-        
-        Tensor::cat(result, 1)
+    /// ✨ Máximo elemento-a-elemento usando fórmula matemática
+    /// max(a, b) = (a + b + |a - b|) / 2
+    /// Funciona em QUALQUER backend do Burn!
+    #[inline]
+    fn tensor_max(&self, a: Tensor<B, 2>, b: Tensor<B, 2>) -> Tensor<B, 2> {
+        let sum = a.clone() + b.clone();
+        let diff = (a - b).abs();
+        (sum + diff) / 2.0
     }
 
-    /// ✨ FORWARD STEP - Agora usa EMA compatível com treino
+    /// Forward incremental para inferência
     pub fn forward_step(
         &self,
-        x: Tensor<B, 2>,
-        state: &mut (Tensor<B, 2>, Tensor<B, 2>, Tensor<B, 2>),
+        x: Tensor<B, 2>,  // [b, c]
+        state: &mut (Tensor<B, 2>, Tensor<B, 2>, Tensor<B, 2>),  // (aa, bb, pp)
         prev_embedding: Tensor<B, 2>,
     ) -> Tensor<B, 2> {
         let [b, c] = x.dims();
 
+        // Token mixing com embedding anterior
         let mix_k = self.time_mix_k.val().reshape([1, c]);
         let mix_v = self.time_mix_v.val().reshape([1, c]);
         let mix_r = self.time_mix_r.val().reshape([1, c]);
 
-        let xk = prev_embedding.clone() + mix_k * (x.clone() - prev_embedding.clone());
-        let xv = prev_embedding.clone() + mix_v * (x.clone() - prev_embedding.clone());
-        let xr = prev_embedding.clone() + mix_r * (x.clone() - prev_embedding);
+        let x_diff = x.clone() - prev_embedding.clone();
+        let xk = prev_embedding.clone() + mix_k * x_diff.clone();
+        let xv = prev_embedding.clone() + mix_v * x_diff.clone();
+        let xr = prev_embedding + mix_r * x_diff;
 
+        // Projeções
         let r = activation::sigmoid(
             self.receptance.forward(xr.reshape([b, 1, c])).reshape([b, c]),
         );
         let k = self.key.forward(xk.reshape([b, 1, c])).reshape([b, c]);
         let v = self.value.forward(xv.reshape([b, 1, c])).reshape([b, c]);
 
-        // ✨ WKV EMA STEP - Compatível com treino
-        let wkv = self.wkv_ema_step(k, v, state);
+        // ✨ WKV step
+        let wkv = self.wkv_step(k, v, state);
         
         self.output.forward((r * wkv).reshape([b, 1, c])).reshape([b, c])
     }
 
-    /// ✨ WKV EMA Step - Versão incremental compatível com wkv_ema do treino
-    fn wkv_ema_step(
+    /// ✨ WKV incremental - Mantém compatibilidade com treino
+    fn wkv_step(
         &self,
-        k: Tensor<B, 2>,
-        v: Tensor<B, 2>,
+        k: Tensor<B, 2>,  // [b, c]
+        v: Tensor<B, 2>,  // [b, c]
         state: &mut (Tensor<B, 2>, Tensor<B, 2>, Tensor<B, 2>),
     ) -> Tensor<B, 2> {
-        let [b, c] = v.dims();
-        let device = v.device();
+        let [_, c] = v.dims();
         
-        // Mesmo decay usado no treino
-        let decay = self.get_decay();
+        // Parâmetros aprendíveis (mesmos do treino)
+        let w = self.time_decay.val().clamp(-7.0, -0.1).reshape([1, c]);
+        let u = self.time_first.val().clamp(-3.0, 3.0).reshape([1, c]);
         
-        let (ema_sum, ema_weight_tensor, step_tensor) = state;
+        let (aa, bb, pp) = state;
         
-        // Extrai peso escalar atual (média do tensor)
-        let ema_weight: f32 = ema_weight_tensor.clone()
-            .mean()
-            .into_scalar()
-            .elem::<f32>();
+        // ww = u + k
+        let ww = u + k.clone();
         
-        // Atualiza EMA: new_sum = decay * old_sum + v
-        let new_sum = ema_sum.clone() * decay + v.clone();
+        // Estabilização
+        let p_max = self.tensor_max(pp.clone(), ww.clone()).clamp(-30.0, 30.0);
         
-        // Atualiza peso: new_weight = decay * old_weight + 1
-        let new_weight = decay * ema_weight + 1.0;
+        let e1 = (pp.clone() - p_max.clone()).clamp(-30.0, 0.0).exp();
+        let e2 = (ww - p_max.clone()).clamp(-30.0, 0.0).exp();
         
-        // Calcula output normalizado (evita divisão por zero)
-        let safe_weight = new_weight.max(1e-9);
-        let output = new_sum.clone() / safe_weight;
-        
-        // Gate com k (mesmo do treino)
-        let k_clamped = k.clamp(-30.0, 30.0);
-        let k_gate = activation::sigmoid(k_clamped * 0.1);
-        let result = output * k_gate;
+        // Output
+        let a_num = e1.clone() * aa.clone() + e2.clone() * v.clone();
+        let b_den = e1.clone() * bb.clone() + e2.clone();
+        let wkv = a_num / b_den.clamp_min(1e-9);
         
         // Atualiza estado
-        *ema_sum = new_sum;
-        *ema_weight_tensor = Tensor::full([b, c], new_weight, &device);
+        let ww_next = w + k;
+        let p_max_next = self.tensor_max(pp.clone(), ww_next.clone()).clamp(-30.0, 30.0);
         
-        // Incrementa contador (para debug)
-        let step_val: f32 = step_tensor.clone()
-            .mean()
-            .into_scalar()
-            .elem::<f32>();
-        *step_tensor = Tensor::full([b, c], step_val + 1.0, &device);
+        let e1_next = (pp.clone() - p_max_next.clone()).clamp(-30.0, 0.0).exp();
+        let e2_next = (ww_next - p_max_next.clone()).clamp(-30.0, 0.0).exp();
         
-        result
+        *aa = (e1_next.clone() * aa.clone() + e2_next.clone() * v).clamp(-1e6, 1e6);
+        *bb = (e1_next * bb.clone() + e2_next).clamp(1e-9, 1e6);
+        *pp = p_max_next;
+        
+        wkv
     }
 
+    /// Token shift (desloca tokens para a direita)
     fn token_shift(&self, x: &Tensor<B, 3>, b: usize, t: usize, c: usize) -> Tensor<B, 3> {
         if t <= 1 {
             return Tensor::zeros([b, t, c], &x.device());
@@ -605,7 +553,7 @@ impl<B: Backend> TimeMixing<B> {
 }
 
 // ============================================================
-// CHANNEL MIXING
+// CHANNEL MIXING (FFN do RWKV)
 // ============================================================
 
 #[derive(Module, Debug)]
@@ -659,8 +607,10 @@ impl<B: Backend> ChannelMixing<B> {
         let xr = x_prev + mix_r * x_diff;
 
         let r = activation::sigmoid(self.receptance.forward(xr));
+        
+        // ✨ Squared ReLU (característica do RWKV)
         let k = activation::relu(self.key.forward(xk));
-        let k_sq = k.powf_scalar(2.0);
+        let k_sq = k.clone() * k;  // k^2
 
         r * self.value.forward(k_sq)
     }
@@ -672,21 +622,24 @@ impl<B: Backend> ChannelMixing<B> {
         let mix_r = self.time_mix_r.val().reshape([1, c]);
 
         let x_prev = state.clone();
+        let x_diff = x.clone() - x_prev.clone();
 
-        let xk = x_prev.clone() + mix_k * (x.clone() - x_prev.clone());
-        let xr = x_prev.clone() + mix_r * (x.clone() - x_prev);
+        let xk = x_prev.clone() + mix_k * x_diff.clone();
+        let xr = x_prev + mix_r * x_diff;
 
         let r = activation::sigmoid(
             self.receptance.forward(xr.reshape([b, 1, c])).reshape([b, c]),
         );
         let k_logits = self.key.forward(xk.reshape([b, 1, c]));
         let k = activation::relu(k_logits).flatten(1, 2);
-        let k_sq = k.powf_scalar(2.0);
+        let k_sq = k.clone() * k;
 
         let [b_dim, d_ffn_dim] = k_sq.dims();
         let output = r * self.value.forward(k_sq.reshape([b_dim, 1, d_ffn_dim])).reshape([b, c]);
 
+        // Atualiza estado
         *state = x;
+        
         output
     }
 
