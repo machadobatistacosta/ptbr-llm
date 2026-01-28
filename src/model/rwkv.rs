@@ -1,4 +1,4 @@
-//! RWKV Model - Versão Estável
+//! RWKV Model - Versão Mínima Estável
 
 use super::config::RWKVConfig;
 use super::wkv_optimized::{wkv_linear, wkv_step, WKVConfig};
@@ -10,10 +10,6 @@ use burn::{
     },
     tensor::{activation, backend::Backend, Int, Tensor},
 };
-
-// ============================================================
-// ESTADO PARA INFERÊNCIA
-// ============================================================
 
 #[derive(Clone, Debug)]
 pub struct RWKVState<B: Backend> {
@@ -30,7 +26,7 @@ impl<B: Backend> RWKVState<B> {
                     (
                         Tensor::zeros([batch_size, d_model], device),
                         Tensor::zeros([batch_size, d_model], device),
-                        Tensor::full([batch_size, d_model], -1e38_f32, device),
+                        Tensor::zeros([batch_size, d_model], device),
                     )
                 })
                 .collect(),
@@ -51,17 +47,13 @@ impl<B: Backend> RWKVState<B> {
             self.time_state[i] = (
                 Tensor::zeros([batch_size, d_model], device),
                 Tensor::zeros([batch_size, d_model], device),
-                Tensor::full([batch_size, d_model], -1e38_f32, device),
+                Tensor::zeros([batch_size, d_model], device),
             );
             self.channel_state[i] = Tensor::zeros([batch_size, d_model], device);
             self.prev_embedding[i] = Tensor::zeros([batch_size, d_model], device);
         }
     }
 }
-
-// ============================================================
-// RWKV PRINCIPAL
-// ============================================================
 
 #[derive(Module, Debug)]
 pub struct RWKV<B: Backend> {
@@ -99,11 +91,9 @@ impl<B: Backend> RWKV<B> {
         let head = if config.weight_tying {
             None
         } else {
-            Some(
-                LinearConfig::new(config.d_model, config.vocab_size)
-                    .with_bias(false)
-                    .init(device),
-            )
+            Some(LinearConfig::new(config.d_model, config.vocab_size)
+                .with_bias(false)
+                .init(device))
         };
 
         Self {
@@ -121,7 +111,6 @@ impl<B: Backend> RWKV<B> {
 
     pub fn forward(&self, input_ids: Tensor<B, 2, Int>) -> Tensor<B, 3> {
         let mut x = self.embedding.forward(input_ids);
-        
         x = self.ln_pre.forward(x);
 
         for block in self.blocks.iter() {
@@ -140,9 +129,9 @@ impl<B: Backend> RWKV<B> {
             self.head.as_ref().unwrap().forward(x)
         };
         
-        // ✅ Scale = 1/sqrt(d_model) para normalizar magnitude dos logits
+        // Scale para normalizar
         logits / (self.d_model as f32).sqrt()
-}
+    }
 
     pub fn forward_inference(&self, input_ids: Tensor<B, 2, Int>) -> Tensor<B, 2> {
         let logits = self.forward(input_ids);
@@ -191,10 +180,6 @@ impl<B: Backend> RWKV<B> {
     pub fn n_layers(&self) -> usize { self.n_layers }
 }
 
-// ============================================================
-// RWKV BLOCK - SEM layer_scale
-// ============================================================
-
 #[derive(Module, Debug)]
 pub struct RWKVBlock<B: Backend> {
     ln1: LayerNorm<B>,
@@ -214,13 +199,7 @@ impl<B: Backend> RWKVBlock<B> {
             ln2: LayerNormConfig::new(config.d_model)
                 .with_epsilon(config.layer_norm_eps)
                 .init(device),
-            channel_mixing: ChannelMixing::new(
-                config.d_model,
-                config.d_ffn,
-                layer_id,
-                config.n_layers,
-                device,
-            ),
+            channel_mixing: ChannelMixing::new(config.d_model, config.d_ffn, layer_id, config.n_layers, device),
             dropout: DropoutConfig::new(config.dropout).init(),
         }
     }
@@ -254,10 +233,6 @@ impl<B: Backend> RWKVBlock<B> {
         x + cm
     }
 }
-
-// ============================================================
-// TIME MIXING
-// ============================================================
 
 #[derive(Module, Debug)]
 pub struct TimeMixing<B: Backend> {
@@ -295,13 +270,8 @@ impl<B: Backend> TimeMixing<B> {
         let first_values: Vec<f32> = (0..d_model)
             .map(|i| {
                 let channel_ratio = i as f64 / (d_model - 1).max(1) as f64;
-                let zigzag = match i % 3 {
-                    0 => 0.1,
-                    1 => -0.1,
-                    _ => 0.0,
-                };
                 let base = (ratio_1_to_almost_0 * 0.5 + channel_ratio * 0.3) as f32;
-                (base + zigzag).clamp(-1.0, 1.0)
+                base.clamp(-1.0, 1.0)
             })
             .collect();
 
@@ -344,12 +314,7 @@ impl<B: Backend> TimeMixing<B> {
         let k = self.key.forward(xk);
         let v = self.value.forward(xv);
 
-        let wkv = wkv_linear(
-            k, v,
-            self.time_decay.val(),
-            self.time_first.val(),
-            &WKVConfig::for_t4(),
-        );
+        let wkv = wkv_linear(k, v, self.time_decay.val(), self.time_first.val(), &WKVConfig::for_t4());
         
         self.output.forward(r * wkv)
     }
@@ -371,18 +336,11 @@ impl<B: Backend> TimeMixing<B> {
         let xv = prev_embedding.clone() + mix_v * x_diff.clone();
         let xr = prev_embedding + mix_r * x_diff;
 
-        let r = activation::sigmoid(
-            self.receptance.forward(xr.clone().reshape([b, 1, c])).reshape([b, c]),
-        );
+        let r = activation::sigmoid(self.receptance.forward(xr.clone().reshape([b, 1, c])).reshape([b, c]));
         let k = self.key.forward(xk.clone().reshape([b, 1, c])).reshape([b, c]);
         let v = self.value.forward(xv.clone().reshape([b, 1, c])).reshape([b, c]);
 
-        let wkv = wkv_step(
-            k, v,
-            self.time_decay.val(),
-            self.time_first.val(),
-            state,
-        );
+        let wkv = wkv_step(k, v, self.time_decay.val(), self.time_first.val(), state);
         
         self.output.forward((r * wkv).reshape([b, 1, c])).reshape([b, c])
     }
@@ -397,10 +355,6 @@ impl<B: Backend> TimeMixing<B> {
     }
 }
 
-// ============================================================
-// CHANNEL MIXING
-// ============================================================
-
 #[derive(Module, Debug)]
 pub struct ChannelMixing<B: Backend> {
     receptance: Linear<B>,
@@ -413,13 +367,7 @@ pub struct ChannelMixing<B: Backend> {
 }
 
 impl<B: Backend> ChannelMixing<B> {
-    pub fn new(
-        d_model: usize,
-        d_ffn: usize,
-        layer_id: usize,
-        n_layers: usize,
-        device: &B::Device,
-    ) -> Self {
+    pub fn new(d_model: usize, d_ffn: usize, layer_id: usize, n_layers: usize, device: &B::Device) -> Self {
         let ratio_1_to_almost_0 = 1.0 - (layer_id as f64 / (n_layers.max(1) - 1).max(1) as f64);
 
         let mix_values: Vec<f32> = (0..d_model)
@@ -470,9 +418,7 @@ impl<B: Backend> ChannelMixing<B> {
         let xk = x_prev.clone() + mix_k * x_diff.clone();
         let xr = x_prev + mix_r * x_diff;
 
-        let r = activation::sigmoid(
-            self.receptance.forward(xr.clone().reshape([b, 1, c])).reshape([b, c]),
-        );
+        let r = activation::sigmoid(self.receptance.forward(xr.clone().reshape([b, 1, c])).reshape([b, c]));
         let k_logits = self.key.forward(xk.clone().reshape([b, 1, c]));
         let k = activation::relu(k_logits).flatten(1, 2);
         let k_sq = k.clone() * k;
