@@ -1,10 +1,4 @@
-// src/model/trainer.rs
 //! Trainer otimizado para T4 16GB - Memory Safe
-//!
-//! Mudanças:
-//! - Não acumula tensores de loss (apenas valores f32)
-//! - Cross-entropy eficiente para vocab grande
-//! - Cleanup periódico
 
 use super::config::{RWKVConfig, TrainingConfig};
 use super::rwkv::RWKV;
@@ -15,7 +9,6 @@ use burn::{
     tensor::{activation, backend::AutodiffBackend, ElementConversion, Int, Tensor},
 };
 
-/// Estatísticas de um step de treino
 #[derive(Debug, Clone, Default)]
 pub struct TrainStats {
     pub loss: f32,
@@ -30,22 +23,16 @@ pub struct Trainer<B: AutodiffBackend> {
     #[allow(dead_code)]
     model_config: RWKVConfig,
 
-    // Estado
     step: usize,
     micro_step: usize,
-    
-    // ✨ Acumula apenas f32, não tensores!
     accumulated_loss: f32,
 
-    // Métricas
     last_grad_norm: f32,
     ema_loss: f32,
     best_loss: f32,
     prev_loss: f32,
 
     device: B::Device,
-    
-    // Cleanup counter
     steps_since_cleanup: usize,
 }
 
@@ -84,46 +71,39 @@ impl<B: AutodiffBackend> Trainer<B> {
     ) -> Option<TrainStats> {
         let accum_steps = self.config.gradient_accumulation_steps;
         
-        // Forward
         let logits = self.model.forward(input_ids);
-
-        // Loss
-        let loss = self.cross_entropy_efficient(logits, target_ids);
+        let loss = self.cross_entropy_safe(logits, target_ids);
         let loss_value: f32 = loss.clone().into_scalar().elem();
 
-        if !loss_value.is_finite() {
-            eprintln!("❌ ERRO: Loss divergiu (NaN/Inf) step {}", self.step);
-            panic!("Training diverged!");
+        // ✅ Verificação mais robusta
+        if !loss_value.is_finite() || loss_value > 100.0 {
+            eprintln!("⚠️ Loss muito alta ou inválida: {} no step {}", loss_value, self.step);
+            if !loss_value.is_finite() {
+                panic!("Training diverged: NaN/Inf loss!");
+            }
         }
 
-        // Acumula apenas o valor f32
         self.accumulated_loss += loss_value;
         self.micro_step += 1;
 
-        // Normaliza e faz backward
         let normalized_loss = loss / (accum_steps as f32);
         let grads = normalized_loss.backward();
         let grad_params = GradientsParams::from_grads(grads, &self.model);
 
-        // Optimizer Step quando completar accumulation
         if self.micro_step % accum_steps == 0 {
             let avg_loss = self.accumulated_loss / accum_steps as f32;
             
-            // Grad norm estimation
             let grad_norm = self.estimate_grad_norm(avg_loss);
             self.last_grad_norm = grad_norm;
             self.prev_loss = avg_loss;
 
-            // Aplica gradientes
             let lr = self.get_learning_rate();
             self.model = self.optimizer.step(lr, self.model.clone(), grad_params);
 
-            // Reset
             self.accumulated_loss = 0.0;
             self.micro_step = 0;
             self.step += 1;
 
-            // EMA updates
             if self.step == 1 {
                 self.ema_loss = avg_loss;
             } else {
@@ -134,11 +114,9 @@ impl<B: AutodiffBackend> Trainer<B> {
                 self.best_loss = avg_loss;
             }
 
-            // Cleanup periódico
             self.steps_since_cleanup += 1;
             if self.steps_since_cleanup >= 50 {
                 self.steps_since_cleanup = 0;
-                // Força drop de temporários
                 std::hint::black_box(());
             }
 
@@ -152,20 +130,18 @@ impl<B: AutodiffBackend> Trainer<B> {
         None
     }
 
-    /// Cross-entropy eficiente para vocab grande
-    fn cross_entropy_efficient(
+    /// ✅ Cross-entropy SEGURA com clamp nos logits
+    fn cross_entropy_safe(
         &self,
         logits: Tensor<B, 3>,
         targets: Tensor<B, 2, Int>,
     ) -> Tensor<B, 1> {
         let [batch_size, seq_len, vocab_size] = logits.dims();
 
-        // Para casos que cabem na memória
         if seq_len * vocab_size <= 2_000_000 {
             return self.cross_entropy_direct(logits, targets);
         }
 
-        // Para casos grandes, processa em chunks de 32 tokens
         self.cross_entropy_chunked(logits, targets, batch_size, seq_len, vocab_size)
     }
 
@@ -176,9 +152,12 @@ impl<B: AutodiffBackend> Trainer<B> {
     ) -> Tensor<B, 1> {
         let [batch_size, seq_len, vocab_size] = logits.dims();
         let logits_flat = logits.reshape([batch_size * seq_len, vocab_size]);
+        
+        // ✅ CRÍTICO: Clamp para evitar overflow
+        let logits_safe = logits_flat.clamp(-30.0, 30.0);
+        
         let targets_flat = targets.reshape([batch_size * seq_len]);
-
-        let log_probs = activation::log_softmax(logits_flat, 1);
+        let log_probs = activation::log_softmax(logits_safe, 1);
         let targets_idx = targets_flat.unsqueeze_dim(1);
         let selected = log_probs.gather(1, targets_idx);
 
@@ -208,9 +187,12 @@ impl<B: AutodiffBackend> Trainer<B> {
             let targets_chunk = targets.clone().slice([0..batch_size, start..end]);
 
             let logits_flat = logits_chunk.reshape([batch_size * chunk_len, vocab_size]);
+            
+            // ✅ CRÍTICO: Clamp aqui também
+            let logits_safe = logits_flat.clamp(-30.0, 30.0);
+            
             let targets_flat = targets_chunk.reshape([batch_size * chunk_len]);
-
-            let log_probs = activation::log_softmax(logits_flat, 1);
+            let log_probs = activation::log_softmax(logits_safe, 1);
             let targets_idx = targets_flat.unsqueeze_dim(1);
             let selected = log_probs.gather(1, targets_idx);
 

@@ -122,10 +122,6 @@ impl<B: Backend> RWKV<B> {
     pub fn forward(&self, input_ids: Tensor<B, 2, Int>) -> Tensor<B, 3> {
         let mut x = self.embedding.forward(input_ids);
         
-        // ✅ Escala simples inline
-        let scale = 0.03125_f32; // 1/32, valor fixo seguro
-        x = x * scale;
-        
         x = self.ln_pre.forward(x);
 
         for block in self.blocks.iter() {
@@ -144,9 +140,9 @@ impl<B: Backend> RWKV<B> {
             self.head.as_ref().unwrap().forward(x)
         };
         
-        // ✅ Escala logits
-        logits * scale
-    }
+        // ✅ Scale = 1/sqrt(d_model) para normalizar magnitude dos logits
+        logits / (self.d_model as f32).sqrt()
+}
 
     pub fn forward_inference(&self, input_ids: Tensor<B, 2, Int>) -> Tensor<B, 2> {
         let logits = self.forward(input_ids);
@@ -160,9 +156,8 @@ impl<B: Backend> RWKV<B> {
         state: &mut RWKVState<B>,
     ) -> Tensor<B, 2> {
         let [b, _] = token_id.dims();
-        let scale = 0.03125_f32;
 
-        let x = self.embedding.forward(token_id) * scale;
+        let x = self.embedding.forward(token_id);
         let x = self.ln_pre.forward(x);
         let mut x = x.reshape([b, self.d_model]);
 
@@ -188,7 +183,7 @@ impl<B: Backend> RWKV<B> {
             self.head.as_ref().unwrap().forward(x).reshape([b, self.vocab_size])
         };
         
-        logits * scale
+        logits / (self.d_model as f32).sqrt()
     }
 
     pub fn vocab_size(&self) -> usize { self.vocab_size }
