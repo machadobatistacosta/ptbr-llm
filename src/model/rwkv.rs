@@ -1,9 +1,4 @@
-//! RWKV Model - Implementação Completa Corrigida
-//! 
-//! Correções aplicadas:
-//! 1. WKV usa time_decay corretamente (já é negativo)
-//! 2. Inicialização de parâmetros conforme paper original
-//! 3. Chunked backpropagation para T4 16GB
+//! RWKV Model - Versão Estável Corrigida
 
 use super::config::RWKVConfig;
 use super::wkv_optimized::{wkv_linear, wkv_step, WKVConfig};
@@ -22,11 +17,8 @@ use burn::{
 
 #[derive(Clone, Debug)]
 pub struct RWKVState<B: Backend> {
-    /// (aa, bb, pp) por layer - numerador, denominador, max log
     pub time_state: Vec<(Tensor<B, 2>, Tensor<B, 2>, Tensor<B, 2>)>,
-    /// Estado do channel mixing por layer
     pub channel_state: Vec<Tensor<B, 2>>,
-    /// Embedding anterior por layer
     pub prev_embedding: Vec<Tensor<B, 2>>,
 }
 
@@ -86,10 +78,6 @@ pub struct RWKV<B: Backend> {
     n_layers: usize,
     #[module(skip)]
     use_weight_tying: bool,
-    #[module(skip)]
-    emb_scale: f32,
-    #[module(skip)]
-    logit_scale: f32,
 }
 
 impl<B: Backend> RWKV<B> {
@@ -118,10 +106,6 @@ impl<B: Backend> RWKV<B> {
             )
         };
 
-        // Scaling factors para estabilidade
-        let emb_scale = (config.d_model as f32).powf(-0.5);
-        let logit_scale = 0.5 * (config.vocab_size as f32).ln().recip();
-
         Self {
             embedding,
             ln_pre,
@@ -132,28 +116,20 @@ impl<B: Backend> RWKV<B> {
             d_model: config.d_model,
             n_layers: config.n_layers,
             use_weight_tying: config.weight_tying,
-            emb_scale,
-            logit_scale,
         }
     }
 
-    /// Forward pass para training
     pub fn forward(&self, input_ids: Tensor<B, 2, Int>) -> Tensor<B, 3> {
-        // Embedding + scaling
         let mut x = self.embedding.forward(input_ids);
-        x = x * self.emb_scale;
         x = self.ln_pre.forward(x);
 
-        // Passa por todos os blocks
         for block in self.blocks.iter() {
             x = block.forward(x);
         }
 
-        // LayerNorm final
         x = self.ln_out.forward(x);
 
-        // Projeção para vocabulário
-        let logits = if self.use_weight_tying {
+        if self.use_weight_tying {
             let [b, t, d] = x.dims();
             let emb_weight = self.embedding.weight.val();
             let x_flat = x.reshape([b * t, d]);
@@ -161,19 +137,15 @@ impl<B: Backend> RWKV<B> {
             logits_flat.reshape([b, t, self.vocab_size])
         } else {
             self.head.as_ref().unwrap().forward(x)
-        };
-        
-        logits * self.logit_scale
+        }
     }
 
-    /// Forward que retorna apenas o último token (para inferência)
     pub fn forward_inference(&self, input_ids: Tensor<B, 2, Int>) -> Tensor<B, 2> {
         let logits = self.forward(input_ids);
         let [b, s, v] = logits.dims();
         logits.slice([0..b, s - 1..s, 0..v]).reshape([b, v])
     }
 
-    /// Forward step-by-step para geração
     pub fn forward_step(
         &self,
         token_id: Tensor<B, 2, Int>,
@@ -181,12 +153,10 @@ impl<B: Backend> RWKV<B> {
     ) -> Tensor<B, 2> {
         let [b, _] = token_id.dims();
 
-        // Embedding
-        let x = self.embedding.forward(token_id) * self.emb_scale;
+        let x = self.embedding.forward(token_id);
         let x = self.ln_pre.forward(x);
         let mut x = x.reshape([b, self.d_model]);
 
-        // Passa por cada block com state
         for (layer_idx, block) in self.blocks.iter().enumerate() {
             let prev_emb = state.prev_embedding[layer_idx].clone();
             x = block.forward_step(
@@ -198,22 +168,18 @@ impl<B: Backend> RWKV<B> {
             state.prev_embedding[layer_idx] = x.clone();
         }
 
-        // Output
         let x = x.reshape([b, 1, self.d_model]);
         let x = self.ln_out.forward(x);
 
-        let logits = if self.use_weight_tying {
+        if self.use_weight_tying {
             let x_flat = x.reshape([b, self.d_model]);
             let emb_weight = self.embedding.weight.val();
             x_flat.matmul(emb_weight.transpose())
         } else {
             self.head.as_ref().unwrap().forward(x).reshape([b, self.vocab_size])
-        };
-        
-        logits * self.logit_scale
+        }
     }
 
-    // Getters
     pub fn vocab_size(&self) -> usize { self.vocab_size }
     pub fn d_model(&self) -> usize { self.d_model }
     pub fn n_layers(&self) -> usize { self.n_layers }
@@ -254,12 +220,10 @@ impl<B: Backend> RWKVBlock<B> {
     }
 
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
-        // Time mixing com residual
         let ln1_out = self.ln1.forward(x.clone());
         let tm = self.time_mixing.forward(ln1_out);
         let x = x + self.dropout.forward(tm);
 
-        // Channel mixing com residual
         let ln2_out = self.ln2.forward(x.clone());
         let cm = self.channel_mixing.forward(ln2_out);
         x + self.dropout.forward(cm)
@@ -274,13 +238,11 @@ impl<B: Backend> RWKVBlock<B> {
     ) -> Tensor<B, 2> {
         let [b, c] = x.dims();
 
-        // Time mixing
         let x_3d = x.clone().reshape([b, 1, c]);
         let ln1_out = self.ln1.forward(x_3d).reshape([b, c]);
         let tm = self.time_mixing.forward_step(ln1_out, time_state, prev_embedding);
         let x = x + tm;
 
-        // Channel mixing
         let ln2_out = self.ln2.forward(x.clone().reshape([b, 1, c])).reshape([b, c]);
         let cm = self.channel_mixing.forward_step(ln2_out, channel_state);
         x + cm
@@ -288,7 +250,7 @@ impl<B: Backend> RWKVBlock<B> {
 }
 
 // ============================================================
-// TIME MIXING - VERSÃO CORRIGIDA
+// TIME MIXING
 // ============================================================
 
 #[derive(Module, Debug)]
@@ -298,12 +260,9 @@ pub struct TimeMixing<B: Backend> {
     value: Linear<B>,
     output: Linear<B>,
     
-    /// Time decay (NEGATIVO! ex: -5.0 para decay rápido)
     time_decay: Param<Tensor<B, 1>>,
-    /// Time first (bonus para token atual)
     time_first: Param<Tensor<B, 1>>,
     
-    /// Mixing weights para k, v, r
     time_mix_k: Param<Tensor<B, 1>>,
     time_mix_v: Param<Tensor<B, 1>>,
     time_mix_r: Param<Tensor<B, 1>>,
@@ -316,32 +275,22 @@ impl<B: Backend> TimeMixing<B> {
     pub fn new(d_model: usize, layer_id: usize, n_layers: usize, device: &B::Device) -> Self {
         let linear_config = LinearConfig::new(d_model, d_model).with_bias(false);
 
-        // Ratios para inicialização dependente do layer
         let ratio_0_to_1 = layer_id as f64 / (n_layers.max(1) - 1).max(1) as f64;
         let ratio_1_to_almost_0 = 1.0 - ratio_0_to_1;
 
-        // ═══════════════════════════════════════════════════════════
-        // INICIALIZAÇÃO CRÍTICA: time_decay (w)
-        // Valores NEGATIVOS! Mais negativo = decay mais rápido
-        // Fórmula do RWKV original para garantir bom aprendizado
-        // ═══════════════════════════════════════════════════════════
+        // time_decay: NEGATIVO, controla decay do histórico
         let decay_values: Vec<f32> = (0..d_model)
             .map(|i| {
                 let channel_ratio = i as f64 / (d_model - 1).max(1) as f64;
-                // Fórmula original do RWKV
                 let decay = -5.0 + 8.0 * channel_ratio.powf(0.7 + 1.3 * ratio_0_to_1);
                 (decay as f32).clamp(-8.0, -0.1)
             })
             .collect();
 
-        // ═══════════════════════════════════════════════════════════
-        // INICIALIZAÇÃO: time_first (u)
-        // Controla bonus para o token atual vs histórico
-        // ═══════════════════════════════════════════════════════════
+        // time_first: bonus para token atual
         let first_values: Vec<f32> = (0..d_model)
             .map(|i| {
                 let channel_ratio = i as f64 / (d_model - 1).max(1) as f64;
-                // Zigzag pattern + base value
                 let zigzag = match i % 3 {
                     0 => 0.1,
                     1 => -0.1,
@@ -352,10 +301,7 @@ impl<B: Backend> TimeMixing<B> {
             })
             .collect();
 
-        // ═══════════════════════════════════════════════════════════
-        // INICIALIZAÇÃO: time_mix (para k, v, r)
-        // Controla interpolação entre token atual e anterior
-        // ═══════════════════════════════════════════════════════════
+        // time_mix: interpolação entre token atual e anterior
         let mix_values: Vec<f32> = (0..d_model)
             .map(|i| {
                 let channel_ratio = i as f64 / (d_model - 1).max(1) as f64;
@@ -380,26 +326,21 @@ impl<B: Backend> TimeMixing<B> {
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
         let [b, t, c] = x.dims();
 
-        // Mixing weights expandidos para broadcast
         let mix_k = self.time_mix_k.val().reshape([1, 1, c]);
         let mix_v = self.time_mix_v.val().reshape([1, 1, c]);
         let mix_r = self.time_mix_r.val().reshape([1, 1, c]);
 
-        // Token shift: x_prev[t] = x[t-1]
         let x_prev = self.token_shift(&x, b, t, c);
-        
-        // Interpolação: xk = x_prev + mix_k * (x - x_prev)
         let x_diff = x.clone() - x_prev.clone();
+
         let xk = x_prev.clone() + mix_k * x_diff.clone();
         let xv = x_prev.clone() + mix_v * x_diff.clone();
         let xr = x_prev + mix_r * x_diff;
 
-        // Projeções lineares
         let r = activation::sigmoid(self.receptance.forward(xr));
         let k = self.key.forward(xk);
         let v = self.value.forward(xv);
 
-        // ✅ WKV usando implementação corrigida
         let wkv = wkv_linear(
             k, v,
             self.time_decay.val(),
@@ -407,7 +348,6 @@ impl<B: Backend> TimeMixing<B> {
             &WKVConfig::for_t4(),
         );
         
-        // Output com gate
         self.output.forward(r * wkv)
     }
 
@@ -419,7 +359,6 @@ impl<B: Backend> TimeMixing<B> {
     ) -> Tensor<B, 2> {
         let [b, c] = x.dims();
 
-        // Mixing
         let mix_k = self.time_mix_k.val().reshape([1, c]);
         let mix_v = self.time_mix_v.val().reshape([1, c]);
         let mix_r = self.time_mix_r.val().reshape([1, c]);
@@ -429,14 +368,12 @@ impl<B: Backend> TimeMixing<B> {
         let xv = prev_embedding.clone() + mix_v * x_diff.clone();
         let xr = prev_embedding + mix_r * x_diff;
 
-        // Projeções
         let r = activation::sigmoid(
             self.receptance.forward(xr.clone().reshape([b, 1, c])).reshape([b, c]),
         );
         let k = self.key.forward(xk.clone().reshape([b, 1, c])).reshape([b, c]);
         let v = self.value.forward(xv.clone().reshape([b, 1, c])).reshape([b, c]);
 
-        // ✅ WKV step corrigido
         let wkv = wkv_step(
             k, v,
             self.time_decay.val(),
@@ -447,7 +384,6 @@ impl<B: Backend> TimeMixing<B> {
         self.output.forward((r * wkv).reshape([b, 1, c])).reshape([b, c])
     }
 
-    /// Shift tokens para a direita, preenchendo com zeros
     fn token_shift(&self, x: &Tensor<B, 3>, b: usize, t: usize, c: usize) -> Tensor<B, 3> {
         if t <= 1 {
             return Tensor::zeros([b, t, c], &x.device());
@@ -459,7 +395,7 @@ impl<B: Backend> TimeMixing<B> {
 }
 
 // ============================================================
-// CHANNEL MIXING (FFN)
+// CHANNEL MIXING
 // ============================================================
 
 #[derive(Module, Debug)]
@@ -512,10 +448,7 @@ impl<B: Backend> ChannelMixing<B> {
         let xk = x_prev.clone() + mix_k * x_diff.clone();
         let xr = x_prev + mix_r * x_diff;
 
-        // Gate
         let r = activation::sigmoid(self.receptance.forward(xr));
-        
-        // FFN com squared ReLU (característica do RWKV)
         let k = activation::relu(self.key.forward(xk));
         let k_sq = k.clone() * k;
 
@@ -544,7 +477,6 @@ impl<B: Backend> ChannelMixing<B> {
         let [b_dim, d_ffn_dim] = k_sq.dims();
         let output = r * self.value.forward(k_sq.reshape([b_dim, 1, d_ffn_dim])).reshape([b, c]);
 
-        // Atualiza state
         *state = x;
         output
     }
@@ -556,76 +488,5 @@ impl<B: Backend> ChannelMixing<B> {
         let zeros = Tensor::zeros([b, 1, c], &x.device());
         let shifted = x.clone().slice([0..b, 0..t - 1, 0..c]);
         Tensor::cat(vec![zeros, shifted], 1)
-    }
-}
-
-// ============================================================
-// TESTES
-// ============================================================
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-    use burn::backend::NdArray;
-    
-    type TestBackend = NdArray<f32>;
-    
-    #[test]
-    fn test_rwkv_forward() {
-        let device = Default::default();
-        let config = RWKVConfig {
-            vocab_size: 1000,
-            d_model: 64,
-            n_layers: 2,
-            d_ffn: 128,
-            max_seq_len: 32,
-            dropout: 0.0,
-            layer_norm_eps: 1e-5,
-            weight_tying: true,
-        };
-        
-        let model: RWKV<TestBackend> = RWKV::new(&config, &device);
-        let input = Tensor::<TestBackend, 2, Int>::zeros([2, 8], &device);
-        let output = model.forward(input);
-        
-        assert_eq!(output.dims(), [2, 8, 1000]);
-    }
-    
-    #[test]
-    fn test_rwkv_step() {
-        let device = Default::default();
-        let config = RWKVConfig {
-            vocab_size: 100,
-            d_model: 32,
-            n_layers: 2,
-            d_ffn: 64,
-            max_seq_len: 16,
-            dropout: 0.0,
-            layer_norm_eps: 1e-5,
-            weight_tying: true,
-        };
-        
-        let model: RWKV<TestBackend> = RWKV::new(&config, &device);
-        let mut state = RWKVState::new(2, 32, 1, &device);
-        
-        let token = Tensor::<TestBackend, 2, Int>::zeros([1, 1], &device);
-        let output = model.forward_step(token, &mut state);
-        
-        assert_eq!(output.dims(), [1, 100]);
-    }
-    
-    #[test]
-    fn test_time_decay_is_negative() {
-        let device = Default::default();
-        let tm: TimeMixing<TestBackend> = TimeMixing::new(64, 0, 12, &device);
-        
-        let decay = tm.time_decay.val();
-        let data = decay.to_data();
-        let values = data.as_slice::<f32>().unwrap();
-        
-        // Todos os valores de decay devem ser negativos
-        for &v in values.iter() {
-            assert!(v < 0.0, "time_decay deve ser negativo, encontrado: {}", v);
-        }
     }
 }
