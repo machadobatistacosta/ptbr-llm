@@ -1,8 +1,15 @@
-//! WKV Linear Attention - Versão Vetorizada para GPU
+//! WKV Linear Attention - Versão Vetorizada com CACHE
 //! Otimizado para reduzir kernel launches no CUDA
-//! Com estabilidade numérica melhorada
+//! Com estabilidade numérica e cache de matriz de decay
 
 use burn::tensor::{backend::Backend, Tensor, TensorData};
+use std::collections::HashMap;
+use std::sync::RwLock;
+use once_cell::sync::Lazy;
+
+// Cache global para matrizes de decay (thread-safe)
+static DECAY_CACHE: Lazy<RwLock<HashMap<(usize, i32), Vec<f32>>>> = 
+    Lazy::new(|| RwLock::new(HashMap::new()));
 
 #[derive(Debug, Clone)]
 pub struct WKVConfig {
@@ -31,10 +38,40 @@ impl WKVConfig {
     }
 }
 
-/// WKV Linear Attention - Versão Vetorizada com Estabilidade Numérica
-/// 
-/// Usa operações matriciais paralelas em vez de loops sequenciais.
-/// Inclui proteções contra overflow/underflow.
+/// Obtém ou cria matriz de decay CACHEADA
+/// Evita recriar O(N²) dados em cada forward pass
+fn get_cached_decay_matrix(seq_len: usize, w_mean_x100: i32) -> Vec<f32> {
+    let key = (seq_len, w_mean_x100);
+    
+    // Tenta ler do cache primeiro (read lock - barato)
+    {
+        let cache = DECAY_CACHE.read().unwrap();
+        if let Some(data) = cache.get(&key) {
+            return data.clone();
+        }
+    }
+    
+    // Cria nova matriz apenas uma vez
+    let w_mean = w_mean_x100 as f32 / 100.0;
+    let mut decay_data = vec![0.0f32; seq_len * seq_len];
+    
+    for i in 0..seq_len {
+        for j in 0..i {
+            let dist = (i - j) as f32;
+            decay_data[i * seq_len + j] = (w_mean * dist).max(-10.0).exp();
+        }
+    }
+    
+    // Salva no cache (write lock - só primeira vez)
+    {
+        let mut cache = DECAY_CACHE.write().unwrap();
+        cache.insert(key, decay_data.clone());
+    }
+    
+    decay_data
+}
+
+/// WKV Linear Attention - Versão Vetorizada com Estabilidade Numérica e CACHE
 pub fn wkv_linear<B: Backend>(
     k: Tensor<B, 3>,      // [batch, seq_len, channels]
     v: Tensor<B, 3>,      // [batch, seq_len, channels]
@@ -48,71 +85,50 @@ pub fn wkv_linear<B: Backend>(
     // ========================================
     // ESTABILIDADE NUMÉRICA
     // ========================================
-    // Clamp agressivo para evitar overflow em exp()
     let k_safe = k.clamp(-15.0, 15.0);
     let u_safe = u.clamp(-15.0, 15.0);
     
-    // Normaliza k subtraindo o máximo por sequência (LogSumExp trick)
-    // Isso previne overflow em exp(k)
-    let k_max = k_safe.clone().max_dim(1); // [batch, 1, channels]
-    let k_centered = k_safe - k_max.clone(); // Centraliza k
-    
-    // exp(k - k_max) é numericamente estável
-    let k_exp = k_centered.exp(); // [batch, seq_len, channels]
+    // LogSumExp trick: k_centered = k - k_max
+    let k_max = k_safe.clone().max_dim(1);
+    let k_centered = k_safe - k_max.clone();
+    let k_exp = k_centered.exp();
     
     // v ponderado por exp(k - k_max)
-    let weighted_v = k_exp.clone() * v.clone(); // [batch, seq_len, channels]
+    let weighted_v = k_exp.clone() * v.clone();
     
-    // Bonus u para token atual (também normalizado)
+    // Bonus u para token atual
     let u_exp = u_safe.clamp(-10.0, 10.0).exp().reshape([1, 1, channels]);
-    
-    // Contribuição do token atual com bonus
     let current_contrib = k_exp.clone() * u_exp.clone() * v.clone();
     let current_weight = k_exp.clone() * u_exp;
     
     // ========================================
-    // Cumulative sum via matriz triangular inferior
+    // USA CACHE - Não recria matriz a cada forward!
     // ========================================
-    
-    // Cria matriz de decay triangular inferior [seq_len, seq_len]
-    // decay_matrix[i,j] = exp(w_mean * (i-j)) para j < i, 0 caso contrário
-    // Usando decay mais suave para estabilidade
-    let w_mean: f32 = -0.3; // Decay mais suave
-    let mut decay_data = vec![0.0f32; seq_len * seq_len];
-    for i in 0..seq_len {
-        for j in 0..i {
-            let dist = (i - j) as f32;
-            // Limita o decay para não ficar muito pequeno
-            let decay_val = (w_mean * dist).max(-10.0).exp();
-            decay_data[i * seq_len + j] = decay_val;
-        }
-    }
+    let w_mean_x100 = -30i32; // w_mean = -0.30
+    let decay_data = get_cached_decay_matrix(seq_len, w_mean_x100);
     
     let decay_tensor_data = TensorData::from(decay_data.as_slice());
     let sum_matrix: Tensor<B, 1> = Tensor::from_data(decay_tensor_data, &device);
     let sum_matrix = sum_matrix.reshape([seq_len, seq_len]);
     
-    // Aplica às contribuições
+    // Aplica cumsum via matmul
     let wv_t = weighted_v.swap_dims(1, 2);
     let wv_flat = wv_t.reshape([batch_size * channels, seq_len]);
     let wv_flat_t = wv_flat.transpose();
     let cum_wv_t = sum_matrix.clone().matmul(wv_flat_t);
     let cum_wv = cum_wv_t.transpose().reshape([batch_size, channels, seq_len]).swap_dims(1, 2);
     
-    // Mesma coisa para pesos (denominador)
     let kexp_t = k_exp.clone().swap_dims(1, 2);
     let kexp_flat = kexp_t.reshape([batch_size * channels, seq_len]);
     let kexp_flat_t = kexp_flat.transpose();
     let cum_kexp_t = sum_matrix.matmul(kexp_flat_t);
     let cum_kexp = cum_kexp_t.transpose().reshape([batch_size, channels, seq_len]).swap_dims(1, 2);
     
-    // Output final com epsilon maior para estabilidade
+    // Output final
     let numerator = cum_wv + current_contrib;
-    let denominator = cum_kexp + current_weight + 1e-6; // Epsilon maior
+    let denominator = cum_kexp + current_weight + 1e-6;
     
-    // Clamp final para evitar valores extremos
-    let output = numerator / denominator;
-    output.clamp(-100.0, 100.0)
+    (numerator / denominator).clamp(-100.0, 100.0)
 }
 
 /// WKV step para inferência (token por token)
@@ -127,20 +143,16 @@ pub fn wkv_step<B: Backend>(
 
     let (ref mut state_num, ref mut state_den, ref mut _last_k) = state;
 
-    // Clamps para estabilidade
     let w_exp = w.clone().clamp(-8.0, -0.1).reshape([1, channels]).exp();
     let u_exp = u.clamp(-10.0, 10.0).reshape([1, channels]).exp();
     let k_exp = k.clone().clamp(-15.0, 15.0).exp();
     
-    // Bonus para token atual
     let uk_exp = k_exp.clone() * u_exp;
 
-    // Output: (state_num + uk_exp * v) / (state_den + uk_exp)
     let num = state_num.clone() + uk_exp.clone() * v.clone();
     let den = state_den.clone() + uk_exp + 1e-6;
     let output = (num / den).clamp(-100.0, 100.0);
 
-    // Atualiza estado
     *state_num = state_num.clone() * w_exp.clone() + k_exp.clone() * v;
     *state_den = state_den.clone() * w_exp + k_exp;
 
