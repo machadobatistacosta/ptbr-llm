@@ -1,31 +1,78 @@
-//! WKV Linear Attention - Versão CORRIGIDA
-//! Usa decay real (w) por canal, não valor fixo
+//! WKV Linear Attention - Versão Vetorizada com CACHE
+//! Otimizado para reduzir kernel launches no CUDA
+//! Com estabilidade numérica e cache de matriz de decay
 
-use burn::tensor::{backend::Backend, Tensor};
+use burn::tensor::{backend::Backend, Tensor, TensorData};
+use std::collections::HashMap;
+use std::sync::RwLock;
+use once_cell::sync::Lazy;
+
+// Cache global para matrizes de decay (thread-safe)
+static DECAY_CACHE: Lazy<RwLock<HashMap<(usize, i32), Vec<f32>>>> = 
+    Lazy::new(|| RwLock::new(HashMap::new()));
 
 #[derive(Debug, Clone)]
 pub struct WKVConfig {
     pub chunk_size: usize,
+    pub use_fp32_accumulator: bool,
 }
 
 impl Default for WKVConfig {
     fn default() -> Self {
-        Self { chunk_size: 32 }
+        Self {
+            chunk_size: 32,
+            use_fp32_accumulator: true,
+        }
     }
 }
 
 impl WKVConfig {
-    pub fn for_t4() -> Self { Self::default() }
-    pub fn for_high_memory() -> Self { Self { chunk_size: 64 } }
+    pub fn for_t4() -> Self {
+        Self::default()
+    }
+    pub fn for_high_memory() -> Self {
+        Self {
+            chunk_size: 64,
+            use_fp32_accumulator: true,
+        }
+    }
 }
 
-/// WKV Linear Attention - CORRIGIDO
-/// Usa o decay real (w) por canal em vez de valor fixo
+/// Obtém ou cria matriz de decay CACHEADA
+fn get_cached_decay_matrix(seq_len: usize, w_mean_x100: i32) -> Vec<f32> {
+    let key = (seq_len, w_mean_x100);
+    
+    {
+        let cache = DECAY_CACHE.read().unwrap();
+        if let Some(data) = cache.get(&key) {
+            return data.clone();
+        }
+    }
+    
+    let w_mean = w_mean_x100 as f32 / 100.0;
+    let mut decay_data = vec![0.0f32; seq_len * seq_len];
+    
+    for i in 0..seq_len {
+        for j in 0..i {
+            let dist = (i - j) as f32;
+            decay_data[i * seq_len + j] = (w_mean * dist).max(-10.0).exp();
+        }
+    }
+    
+    {
+        let mut cache = DECAY_CACHE.write().unwrap();
+        cache.insert(key, decay_data.clone());
+    }
+    
+    decay_data
+}
+
+/// WKV Linear Attention - Versão Vetorizada Estável
 pub fn wkv_linear<B: Backend>(
-    k: Tensor<B, 3>,      // [batch, seq_len, channels]
-    v: Tensor<B, 3>,      // [batch, seq_len, channels]
-    w: Tensor<B, 1>,      // [channels] - decay POR CANAL (treinável!)
-    u: Tensor<B, 1>,      // [channels] - bonus para token atual
+    k: Tensor<B, 3>,
+    v: Tensor<B, 3>,
+    w: Tensor<B, 1>,      // ✅ Agora usa w para calcular média
+    u: Tensor<B, 1>,
     _config: &WKVConfig,
 ) -> Tensor<B, 3> {
     let [batch_size, seq_len, channels] = k.dims();
@@ -35,89 +82,56 @@ pub fn wkv_linear<B: Backend>(
     // ESTABILIDADE NUMÉRICA
     // ========================================
     let k_safe = k.clamp(-15.0, 15.0);
-    let w_safe = w.clamp(-8.0, -0.1);  // decay deve ser negativo
-    let u_safe = u.clamp(-10.0, 10.0);
+    let u_safe = u.clamp(-15.0, 15.0);
     
-    // ========================================
-    // VERSÃO VETORIZADA COM DECAY REAL
-    // ========================================
+    let k_max = k_safe.clone().max_dim(1);
+    let k_centered = k_safe - k_max.clone();
+    let k_exp = k_centered.exp();
     
-    // Reshape para broadcast
-    let w_3d = w_safe.reshape([1, 1, channels]);
-    let u_3d = u_safe.reshape([1, 1, channels]);
-    
-    // exp(k) para weighted attention
-    let k_exp = k_safe.clone().exp();
-    
-    // Weighted values
     let weighted_v = k_exp.clone() * v.clone();
     
-    // Bonus para token atual: exp(u + k)
-    let uk_exp = (u_3d + k_safe.clone()).clamp(-30.0, 30.0).exp();
-    let current_contrib = uk_exp.clone() * v.clone();
-    let current_weight = uk_exp;
+    let u_exp = u_safe.clamp(-10.0, 10.0).exp().reshape([1, 1, channels]);
+    let current_contrib = k_exp.clone() * u_exp.clone() * v.clone();
+    let current_weight = k_exp.clone() * u_exp;
     
     // ========================================
-    // CUMULATIVE SUM COM DECAY REAL
+    // ✅ USA W REAL PARA CALCULAR DECAY MÉDIO
     // ========================================
+    let w_clamped = w.clamp(-8.0, -0.1);
+    let w_data: Vec<f32> = w_clamped.to_data().to_vec().unwrap();
+    let w_mean: f32 = w_data.iter().sum::<f32>() / w_data.len() as f32;
+    let w_mean_x100 = (w_mean * 100.0) as i32;
     
-    // Decay por posição: w^t onde t é a distância
-    // Para seq_len=128, criamos matriz de decay
-    let w_exp = w_3d.exp();  // [1, 1, channels]
+    let decay_data = get_cached_decay_matrix(seq_len, w_mean_x100);
     
-    // Acumuladores
-    let mut cum_wv = Tensor::<B, 3>::zeros([batch_size, seq_len, channels], &device);
-    let mut cum_w = Tensor::<B, 3>::zeros([batch_size, seq_len, channels], &device);
+    let decay_tensor_data = TensorData::from(decay_data.as_slice());
+    let sum_matrix: Tensor<B, 1> = Tensor::from_data(decay_tensor_data, &device);
+    let sum_matrix = sum_matrix.reshape([seq_len, seq_len]);
     
-    // Estado acumulado (decai com w a cada passo)
-    let mut acc_wv = Tensor::<B, 2>::zeros([batch_size, channels], &device);
-    let mut acc_w = Tensor::<B, 2>::zeros([batch_size, channels], &device);
+    let wv_t = weighted_v.swap_dims(1, 2);
+    let wv_flat = wv_t.reshape([batch_size * channels, seq_len]);
+    let wv_flat_t = wv_flat.transpose();
+    let cum_wv_t = sum_matrix.clone().matmul(wv_flat_t);
+    let cum_wv = cum_wv_t.transpose().reshape([batch_size, channels, seq_len]).swap_dims(1, 2);
     
-    let w_exp_2d = w_exp.reshape([1, channels]);
+    let kexp_t = k_exp.clone().swap_dims(1, 2);
+    let kexp_flat = kexp_t.reshape([batch_size * channels, seq_len]);
+    let kexp_flat_t = kexp_flat.transpose();
+    let cum_kexp_t = sum_matrix.matmul(kexp_flat_t);
+    let cum_kexp = cum_kexp_t.transpose().reshape([batch_size, channels, seq_len]).swap_dims(1, 2);
     
-    for t in 0..seq_len {
-        // Extrai valores na posição t
-        let wv_t = weighted_v.clone()
-            .slice([0..batch_size, t..t+1, 0..channels])
-            .reshape([batch_size, channels]);
-        let w_t = k_exp.clone()
-            .slice([0..batch_size, t..t+1, 0..channels])
-            .reshape([batch_size, channels]);
-        
-        // Aplica decay ao estado anterior e adiciona novo
-        acc_wv = acc_wv * w_exp_2d.clone() + wv_t;
-        acc_w = acc_w.clone() * w_exp_2d.clone() + w_t;
-        
-        // Armazena (via slice assignment não disponível, usamos outro método)
-        // Por enquanto, construímos lista e concatenamos no final
-        if t == 0 {
-            cum_wv = acc_wv.clone().reshape([batch_size, 1, channels]);
-            cum_w = acc_w.clone().reshape([batch_size, 1, channels]);
-        } else {
-            cum_wv = Tensor::cat(vec![
-                cum_wv,
-                acc_wv.clone().reshape([batch_size, 1, channels])
-            ], 1);
-            cum_w = Tensor::cat(vec![
-                cum_w,
-                acc_w.clone().reshape([batch_size, 1, channels])
-            ], 1);
-        }
-    }
-    
-    // Output final
     let numerator = cum_wv + current_contrib;
-    let denominator = cum_w + current_weight + 1e-6;
+    let denominator = cum_kexp + current_weight + 1e-6;
     
     (numerator / denominator).clamp(-100.0, 100.0)
 }
 
-/// WKV step para inferência (token por token)
+/// WKV step para inferência
 pub fn wkv_step<B: Backend>(
-    k: Tensor<B, 2>,      // [batch, channels]
-    v: Tensor<B, 2>,      // [batch, channels]
-    w: Tensor<B, 1>,      // [channels]
-    u: Tensor<B, 1>,      // [channels]
+    k: Tensor<B, 2>,
+    v: Tensor<B, 2>,
+    w: Tensor<B, 1>,
+    u: Tensor<B, 1>,
     state: &mut (Tensor<B, 2>, Tensor<B, 2>, Tensor<B, 2>),
 ) -> Tensor<B, 2> {
     let [_batch_size, channels] = k.dims();
@@ -139,7 +153,6 @@ pub fn wkv_step<B: Backend>(
     output
 }
 
-/// Inicializa estado para inferência
 #[allow(dead_code)]
 pub fn init_state<B: Backend>(
     batch_size: usize,
@@ -153,7 +166,6 @@ pub fn init_state<B: Backend>(
     )
 }
 
-/// Alias para compatibilidade
 pub fn wkv_parallel_scan<B: Backend>(
     k: Tensor<B, 3>,
     v: Tensor<B, 3>,
