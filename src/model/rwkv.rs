@@ -1,4 +1,4 @@
-//! RWKV Model - Versão CORRIGIDA (sem scaling incorreto)
+//! RWKV Model - Versão Mínima Estável
 
 use super::config::RWKVConfig;
 use super::wkv_optimized::{wkv_linear, wkv_step, WKVConfig};
@@ -109,7 +109,6 @@ impl<B: Backend> RWKV<B> {
         }
     }
 
-    /// ✅ CORRIGIDO: Removido scaling incorreto
     pub fn forward(&self, input_ids: Tensor<B, 2, Int>) -> Tensor<B, 3> {
         let mut x = self.embedding.forward(input_ids);
         x = self.ln_pre.forward(x);
@@ -120,7 +119,7 @@ impl<B: Backend> RWKV<B> {
 
         x = self.ln_out.forward(x);
 
-        if self.use_weight_tying {
+        let logits = if self.use_weight_tying {
             let [b, t, d] = x.dims();
             let emb_weight = self.embedding.weight.val();
             let x_flat = x.reshape([b * t, d]);
@@ -128,8 +127,10 @@ impl<B: Backend> RWKV<B> {
             logits_flat.reshape([b, t, self.vocab_size])
         } else {
             self.head.as_ref().unwrap().forward(x)
-        }
-        // ❌ REMOVIDO: / (self.d_model as f32).sqrt()
+        };
+        
+        // Scale para normalizar
+        logits / (self.d_model as f32).sqrt()
     }
 
     pub fn forward_inference(&self, input_ids: Tensor<B, 2, Int>) -> Tensor<B, 2> {
@@ -138,7 +139,6 @@ impl<B: Backend> RWKV<B> {
         logits.slice([0..b, s - 1..s, 0..v]).reshape([b, v])
     }
 
-    /// ✅ CORRIGIDO: Removido scaling incorreto
     pub fn forward_step(
         &self,
         token_id: Tensor<B, 2, Int>,
@@ -164,14 +164,15 @@ impl<B: Backend> RWKV<B> {
         let x = x.reshape([b, 1, self.d_model]);
         let x = self.ln_out.forward(x);
 
-        if self.use_weight_tying {
+        let logits = if self.use_weight_tying {
             let x_flat = x.reshape([b, self.d_model]);
             let emb_weight = self.embedding.weight.val();
             x_flat.matmul(emb_weight.transpose())
         } else {
             self.head.as_ref().unwrap().forward(x).reshape([b, self.vocab_size])
-        }
-        // ❌ REMOVIDO: / (self.d_model as f32).sqrt()
+        };
+        
+        logits / (self.d_model as f32).sqrt()
     }
 
     pub fn vocab_size(&self) -> usize { self.vocab_size }
