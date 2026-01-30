@@ -1,4 +1,4 @@
-//! Trainer otimizado para T4 16GB - Memory Safe
+//! Trainer otimizado para T4 16GB - COM GRADIENT CLIPPING
 
 use super::config::{RWKVConfig, TrainingConfig};
 use super::rwkv::RWKV;
@@ -31,6 +31,10 @@ pub struct Trainer<B: AutodiffBackend> {
     ema_loss: f32,
     best_loss: f32,
     prev_loss: f32,
+    
+    // ✅ NOVO: tracking para gradient clipping adaptativo
+    consecutive_spikes: usize,
+    lr_scale: f64,
 
     device: B::Device,
     steps_since_cleanup: usize,
@@ -59,6 +63,8 @@ impl<B: AutodiffBackend> Trainer<B> {
             ema_loss: 10.0,
             best_loss: f32::MAX,
             prev_loss: 10.0,
+            consecutive_spikes: 0,
+            lr_scale: 1.0,
             device,
             steps_since_cleanup: 0,
         }
@@ -75,12 +81,17 @@ impl<B: AutodiffBackend> Trainer<B> {
         let loss = self.cross_entropy_safe(logits, target_ids);
         let loss_value: f32 = loss.clone().into_scalar().elem();
 
-        // ✅ Verificação mais robusta
-        if !loss_value.is_finite() || loss_value > 100.0 {
-            eprintln!("⚠️ Loss muito alta ou inválida: {} no step {}", loss_value, self.step);
-            if !loss_value.is_finite() {
-                panic!("Training diverged: NaN/Inf loss!");
-            }
+        // ✅ SKIP batches problemáticos
+        if !loss_value.is_finite() {
+            eprintln!("⚠️ Loss NaN/Inf no step {} - pulando batch", self.step);
+            return None;
+        }
+        
+        if loss_value > 50.0 {
+            eprintln!("⚠️ Loss muito alta ({:.2}) no step {} - pulando batch", loss_value, self.step);
+            self.accumulated_loss = 0.0;
+            self.micro_step = 0;
+            return None;
         }
 
         self.accumulated_loss += loss_value;
@@ -93,21 +104,25 @@ impl<B: AutodiffBackend> Trainer<B> {
         if self.micro_step % accum_steps == 0 {
             let avg_loss = self.accumulated_loss / accum_steps as f32;
             
+            // ✅ GRADIENT CLIPPING ADAPTATIVO VIA LR SCALING
+            let effective_lr = self.compute_safe_lr(avg_loss);
+            
             let grad_norm = self.estimate_grad_norm(avg_loss);
             self.last_grad_norm = grad_norm;
             self.prev_loss = avg_loss;
 
-            let lr = self.get_learning_rate();
-            self.model = self.optimizer.step(lr, self.model.clone(), grad_params);
+            self.model = self.optimizer.step(effective_lr, self.model.clone(), grad_params);
 
             self.accumulated_loss = 0.0;
             self.micro_step = 0;
             self.step += 1;
 
+            // ✅ EMA mais responsivo
             if self.step == 1 {
                 self.ema_loss = avg_loss;
             } else {
-                self.ema_loss = 0.99 * self.ema_loss + 0.01 * avg_loss;
+                let alpha = if avg_loss < self.ema_loss { 0.1 } else { 0.02 };
+                self.ema_loss = (1.0 - alpha) * self.ema_loss + alpha * avg_loss;
             }
 
             if avg_loss < self.best_loss {
@@ -123,14 +138,50 @@ impl<B: AutodiffBackend> Trainer<B> {
             return Some(TrainStats {
                 loss: avg_loss,
                 grad_norm,
-                lr,
+                lr: effective_lr,
             });
         }
 
         None
     }
 
-    /// ✅ Cross-entropy SEGURA com clamp nos logits
+    /// ✅ NOVO: Calcula LR seguro com gradient clipping implícito
+    fn compute_safe_lr(&mut self, current_loss: f32) -> f64 {
+        let base_lr = self.get_learning_rate();
+        
+        // Detecta spike de loss
+        let spike_threshold = self.ema_loss * 1.3; // 30% acima do EMA
+        let is_spike = current_loss > spike_threshold && self.step > 100;
+        
+        if is_spike {
+            self.consecutive_spikes += 1;
+            
+            // Reduz LR progressivamente em spikes consecutivos
+            self.lr_scale = match self.consecutive_spikes {
+                1 => 0.5,      // Primeiro spike: 50%
+                2 => 0.25,     // Segundo: 25%
+                3 => 0.1,      // Terceiro: 10%
+                _ => 0.05,     // Mais: 5%
+            };
+            
+            if self.consecutive_spikes >= 3 {
+                eprintln!(
+                    "⚠️ Step {} | {} spikes consecutivos | Loss: {:.4} (EMA: {:.4}) | LR: {:.2e} → {:.2e}",
+                    self.step, self.consecutive_spikes, current_loss, self.ema_loss,
+                    base_lr, base_lr * self.lr_scale
+                );
+            }
+        } else {
+            // Recupera LR gradualmente quando estável
+            if self.consecutive_spikes > 0 {
+                self.consecutive_spikes = 0;
+            }
+            self.lr_scale = (self.lr_scale + 0.1).min(1.0); // Recupera 10% por step
+        }
+        
+        base_lr * self.lr_scale
+    }
+
     fn cross_entropy_safe(
         &self,
         logits: Tensor<B, 3>,
@@ -153,8 +204,8 @@ impl<B: AutodiffBackend> Trainer<B> {
         let [batch_size, seq_len, vocab_size] = logits.dims();
         let logits_flat = logits.reshape([batch_size * seq_len, vocab_size]);
         
-        // ✅ CRÍTICO: Clamp para evitar overflow
-        let logits_safe = logits_flat.clamp(-30.0, 30.0);
+        // ✅ Clamp mais agressivo
+        let logits_safe = logits_flat.clamp(-20.0, 20.0);
         
         let targets_flat = targets.reshape([batch_size * seq_len]);
         let log_probs = activation::log_softmax(logits_safe, 1);
@@ -187,9 +238,7 @@ impl<B: AutodiffBackend> Trainer<B> {
             let targets_chunk = targets.clone().slice([0..batch_size, start..end]);
 
             let logits_flat = logits_chunk.reshape([batch_size * chunk_len, vocab_size]);
-            
-            // ✅ CRÍTICO: Clamp aqui também
-            let logits_safe = logits_flat.clamp(-30.0, 30.0);
+            let logits_safe = logits_flat.clamp(-20.0, 20.0);
             
             let targets_flat = targets_chunk.reshape([batch_size * chunk_len]);
             let log_probs = activation::log_softmax(logits_safe, 1);
@@ -228,7 +277,9 @@ impl<B: AutodiffBackend> Trainer<B> {
         let min_lr = self.config.learning_rate * self.config.min_lr_ratio;
 
         if step < warmup {
-            self.config.learning_rate * (step + 1.0) / warmup
+            // ✅ Warmup mais suave
+            let progress = (step + 1.0) / warmup;
+            self.config.learning_rate * progress * progress // Quadrático
         } else {
             let progress = (step - warmup) / (max_steps - warmup).max(1.0);
             let progress = progress.min(1.0);
@@ -250,12 +301,13 @@ impl<B: AutodiffBackend> Trainer<B> {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
 
         let meta = format!(
-            "step={}\nlr={:.6e}\nema_loss={:.6}\nbest_loss={:.6}\nlast_grad_norm={:.6}\n",
+            "step={}\nlr={:.6e}\nema_loss={:.6}\nbest_loss={:.6}\nlast_grad_norm={:.6}\nlr_scale={:.4}\n",
             self.step,
             self.get_learning_rate(),
             self.ema_loss,
             self.best_loss,
             self.last_grad_norm,
+            self.lr_scale,
         );
         std::fs::write(format!("{}.meta", path), meta)?;
 
@@ -282,6 +334,9 @@ impl<B: AutodiffBackend> Trainer<B> {
                 }
                 if let Some(val) = line.strip_prefix("best_loss=") {
                     self.best_loss = val.parse().unwrap_or(f32::MAX);
+                }
+                if let Some(val) = line.strip_prefix("lr_scale=") {
+                    self.lr_scale = val.parse().unwrap_or(1.0);
                 }
             }
         }
