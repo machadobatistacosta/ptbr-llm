@@ -1,12 +1,11 @@
-//! WKV Linear Attention - Versão ESTÁVEL para CUDA
+//! WKV Linear Attention - Versão Híbrida ESTÁVEL
 //! 
-//! CORREÇÃO: Evita Tensor::stack que causa segfault no CUDA
-//! Usa abordagem vetorizada com cumsum via matmul triangular
+//! Usa chunked processing com slice assignment (sem Tensor::stack)
+//! Preserva per-channel decay aprendido
 //!
-//! Baseado na fórmula RWKV:
-//! wkv_t = (Σ e^{-(t-i-1)*w + k_i} * v_i + e^{u+k_t} * v_t) / (Σ e^{-(t-i-1)*w + k_i} + e^{u+k_t})
+//! Para seq_len=128 com batch=4, processa em chunks de 16
 
-use burn::tensor::{backend::Backend, ElementConversion, Tensor, TensorData};
+use burn::tensor::{backend::Backend, ElementConversion, Tensor};
 
 #[derive(Debug, Clone)]
 pub struct WKVConfig {
@@ -17,7 +16,7 @@ pub struct WKVConfig {
 impl Default for WKVConfig {
     fn default() -> Self {
         Self {
-            chunk_size: 32,
+            chunk_size: 16,  // Chunk pequeno para evitar problemas de memória
             use_fp32_accumulator: true,
         }
     }
@@ -30,16 +29,16 @@ impl WKVConfig {
     
     pub fn for_high_memory() -> Self {
         Self {
-            chunk_size: 64,
+            chunk_size: 32,
             use_fp32_accumulator: true,
         }
     }
 }
 
-/// WKV Linear Attention - VERSÃO VETORIZADA ESTÁVEL
+/// WKV Linear Attention - VERSÃO SIMPLIFICADA E ESTÁVEL
 /// 
-/// Usa matmul com matriz triangular para simular cumsum com decay,
-/// evitando loops que causam segfault no CUDA.
+/// Usa EMA recursiva com state carryover entre chunks.
+/// Cada chunk computa output diretamente sem acumular em Vec.
 pub fn wkv_linear<B: Backend>(
     k: Tensor<B, 3>,      // [batch, seq_len, channels]
     v: Tensor<B, 3>,      // [batch, seq_len, channels]
@@ -57,133 +56,174 @@ pub fn wkv_linear<B: Backend>(
     let u_safe = u.clamp(-10.0, 10.0);
     let k_safe = k.clamp(-15.0, 15.0);
     
-    // ========================================
-    // CONTRIBUIÇÃO DO TOKEN ATUAL
-    // ========================================
-    // current_weight = exp(u + k) para cada posição
-    // current_value = current_weight * v
-    
-    let u_bc = u_safe.reshape([1, 1, channels]);
-    let current_weight = (u_bc.clone() + k_safe.clone()).exp();
-    let current_value = current_weight.clone() * v.clone();
+    // Pré-computa exp(w) e exp(u) broadcastados
+    let w_exp = w_safe.clone().exp().reshape([1, channels]);  // [1, channels]
+    let u_bc = u_safe.reshape([1, channels]);  // [1, channels]
     
     // ========================================
-    // CONTRIBUIÇÃO DO PASSADO VIA MATMUL TRIANGULAR
+    // PROCESSA SEQUÊNCIA COMPLETA EM CHUNKS
     // ========================================
-    // Para cada posição t, queremos somar contribuições de i < t com decay
-    // Isso é equivalente a: M @ weighted_v onde M é triangular inferior com decay
+    // Estado EMA: (numerator_state, denominator_state)
+    let mut state_num = Tensor::<B, 2>::zeros([batch_size, channels], &device);
+    let mut state_den = Tensor::<B, 2>::zeros([batch_size, channels], &device);
     
-    // Calcula média do decay para usar como aproximação uniforme
-    // (per-channel exato seria O(seq_len * seq_len * channels) - muito caro)
-    let w_mean: f32 = w_safe.clone().mean().into_scalar().elem();
+    // Processa chunk por chunk e concatena
+    let chunk_size = 16usize;
+    let num_chunks = (seq_len + chunk_size - 1) / chunk_size;
     
-    // Matriz triangular inferior com decay exponencial
-    // M[i,j] = exp(w * (i-j)) se j < i, else 0
-    // M[i,i] = 0 (diagonal é zero - token atual tratado separadamente)
-    let decay_matrix = create_decay_matrix::<B>(seq_len, w_mean, &device);
+    let mut output_chunks: Vec<Tensor<B, 3>> = Vec::with_capacity(num_chunks);
     
-    // exp(k) para ponderação
-    let k_exp = k_safe.exp();
-    
-    // weighted_v = exp(k) * v
-    let weighted_v = k_exp.clone() * v;
-    
-    // ========================================
-    // CUMSUM COM DECAY VIA MATMUL
-    // ========================================
-    // Reorganiza para matmul: [batch, channels, seq_len]
-    let wv_t = weighted_v.swap_dims(1, 2);  // [batch, channels, seq_len]
-    let wv_flat = wv_t.reshape([batch_size * channels, seq_len]);  // [batch*channels, seq_len]
-    
-    // cum_wv = decay_matrix @ wv_flat^T -> [seq_len, batch*channels]
-    // Então transpose de volta
-    let wv_flat_t = wv_flat.transpose();  // [seq_len, batch*channels]
-    let cum_wv_t = decay_matrix.clone().matmul(wv_flat_t);  // [seq_len, batch*channels]
-    let cum_wv = cum_wv_t.transpose()  // [batch*channels, seq_len]
-        .reshape([batch_size, channels, seq_len])
-        .swap_dims(1, 2);  // [batch, seq_len, channels]
-    
-    // Mesmo para os pesos (denominador)
-    let kexp_t = k_exp.swap_dims(1, 2);  // [batch, channels, seq_len]
-    let kexp_flat = kexp_t.reshape([batch_size * channels, seq_len]);
-    let kexp_flat_t = kexp_flat.transpose();
-    let cum_kexp_t = decay_matrix.matmul(kexp_flat_t);
-    let cum_kexp = cum_kexp_t.transpose()
-        .reshape([batch_size, channels, seq_len])
-        .swap_dims(1, 2);  // [batch, seq_len, channels]
-    
-    // ========================================
-    // OUTPUT FINAL
-    // ========================================
-    // numerator = past_contribution + current_contribution
-    // denominator = past_weights + current_weight
-    let numerator = cum_wv + current_value;
-    let denominator = cum_kexp + current_weight + 1e-6;
-    
-    (numerator / denominator).clamp(-100.0, 100.0)
-}
-
-/// Cria matriz triangular inferior com decay exponencial
-/// M[i,j] = exp(w * (i-j)) se j < i, else 0
-fn create_decay_matrix<B: Backend>(
-    seq_len: usize,
-    w_mean: f32,
-    device: &B::Device,
-) -> Tensor<B, 2> {
-    // Cria dados da matriz
-    let mut data = vec![0.0f32; seq_len * seq_len];
-    
-    for i in 0..seq_len {
-        for j in 0..i {  // j < i apenas (triangular inferior, sem diagonal)
-            let dist = (i - j) as f32;
-            // decay = exp(w * dist), w é negativo então é decay
-            let decay = (w_mean * dist).max(-20.0).exp();
-            data[i * seq_len + j] = decay;
-        }
+    for chunk_idx in 0..num_chunks {
+        let start = chunk_idx * chunk_size;
+        let end = (start + chunk_size).min(seq_len);
+        let chunk_len = end - start;
+        
+        // Extrai chunk
+        let k_chunk = k_safe.clone().slice([0..batch_size, start..end, 0..channels]);
+        let v_chunk = v.clone().slice([0..batch_size, start..end, 0..channels]);
+        
+        // Processa chunk com estado atual
+        let (chunk_output, new_state_num, new_state_den) = process_chunk(
+            k_chunk,
+            v_chunk,
+            w_exp.clone(),
+            u_bc.clone(),
+            state_num,
+            state_den,
+            batch_size,
+            chunk_len,
+            channels,
+            &device,
+        );
+        
+        output_chunks.push(chunk_output);
+        state_num = new_state_num;
+        state_den = new_state_den;
     }
     
-    let tensor_data = TensorData::from(data.as_slice());
-    let matrix: Tensor<B, 1> = Tensor::from_data(tensor_data, device);
-    matrix.reshape([seq_len, seq_len])
+    // Concatena chunks (mais seguro que stack para tensors 3D)
+    if output_chunks.len() == 1 {
+        output_chunks.pop().unwrap()
+    } else {
+        Tensor::cat(output_chunks, 1)
+    }
+}
+
+/// Processa um chunk mantendo estado EMA
+fn process_chunk<B: Backend>(
+    k: Tensor<B, 3>,       // [batch, chunk_len, channels]
+    v: Tensor<B, 3>,       // [batch, chunk_len, channels]
+    w_exp: Tensor<B, 2>,   // [1, channels] - exp(decay)
+    u_bc: Tensor<B, 2>,    // [1, channels] - bonus
+    mut state_num: Tensor<B, 2>,   // [batch, channels]
+    mut state_den: Tensor<B, 2>,   // [batch, channels]
+    batch_size: usize,
+    chunk_len: usize,
+    channels: usize,
+    device: &B::Device,
+) -> (Tensor<B, 3>, Tensor<B, 2>, Tensor<B, 2>) {
+    // Pré-aloca output
+    let mut output = Tensor::<B, 3>::zeros([batch_size, chunk_len, channels], device);
+    
+    for t in 0..chunk_len {
+        // Extrai k_t e v_t
+        let k_t = k.clone()
+            .slice([0..batch_size, t..t+1, 0..channels])
+            .reshape([batch_size, channels]);
+        
+        let v_t = v.clone()
+            .slice([0..batch_size, t..t+1, 0..channels])
+            .reshape([batch_size, channels]);
+        
+        // exp(k_t)
+        let k_exp = k_t.clone().exp();
+        
+        // Contribuição do token atual: exp(u + k_t) * v_t
+        let current_weight = (u_bc.clone() + k_t).exp();
+        let current_value = current_weight.clone() * v_t.clone();
+        
+        // Output: (state_num + current_value) / (state_den + current_weight)
+        let numerator = state_num.clone() + current_value;
+        let denominator = state_den.clone() + current_weight + 1e-6;
+        let output_t = (numerator / denominator).clamp(-50.0, 50.0);
+        
+        // IMPORTANTE: Usa slice_assign via reshape workaround
+        // Burn não tem slice_assign direto, então construímos manualmente
+        // Adiciona ao output via broadcast trick
+        let output_t_3d = output_t.clone().reshape([batch_size, 1, channels]);
+        
+        // Cria máscara para esta posição
+        if t == 0 && chunk_len == 1 {
+            output = output_t_3d;
+        } else {
+            // Concatena com output existente ou usa slicing
+            // Para evitar problemas, acumulamos via soma com máscara
+            let before = if t > 0 {
+                output.clone().slice([0..batch_size, 0..t, 0..channels])
+            } else {
+                Tensor::zeros([batch_size, 0, channels], device)
+            };
+            
+            let after_len = chunk_len - t - 1;
+            let after = if after_len > 0 {
+                Tensor::zeros([batch_size, after_len, channels], device)
+            } else {
+                Tensor::zeros([batch_size, 0, channels], device)
+            };
+            
+            // Reconstrói output
+            if t == 0 {
+                if after_len > 0 {
+                    output = Tensor::cat(vec![output_t_3d, after], 1);
+                } else {
+                    output = output_t_3d;
+                }
+            } else if after_len > 0 {
+                output = Tensor::cat(vec![before, output_t_3d, after], 1);
+            } else {
+                output = Tensor::cat(vec![before, output_t_3d], 1);
+            }
+        }
+        
+        // Atualiza estado: EMA com decay
+        // state_num = exp(w) * state_num + exp(k_t) * v_t
+        // state_den = exp(w) * state_den + exp(k_t)
+        state_num = state_num * w_exp.clone() + k_exp.clone() * v_t;
+        state_den = state_den * w_exp.clone() + k_exp;
+    }
+    
+    (output, state_num, state_den)
 }
 
 /// WKV step para inferência (token por token)
-/// Mantém estado entre chamadas para geração autoregressiva
 pub fn wkv_step<B: Backend>(
-    k: Tensor<B, 2>,      // [batch, channels] - key para token atual
-    v: Tensor<B, 2>,      // [batch, channels] - value para token atual
+    k: Tensor<B, 2>,      // [batch, channels]
+    v: Tensor<B, 2>,      // [batch, channels]
     w: Tensor<B, 1>,      // [channels] - learned decay
     u: Tensor<B, 1>,      // [channels] - learned bonus
-    state: &mut (Tensor<B, 2>, Tensor<B, 2>, Tensor<B, 2>),  // (state_a, state_b, last_k)
+    state: &mut (Tensor<B, 2>, Tensor<B, 2>, Tensor<B, 2>),
 ) -> Tensor<B, 2> {
     let [_batch_size, channels] = k.dims();
     
-    // Clamping para estabilidade
     let w_safe = w.clamp(-8.0, -0.01);
     let u_safe = u.clamp(-10.0, 10.0);
     let k_safe = k.clamp(-15.0, 15.0);
     
-    let (ref mut state_a, ref mut state_b, ref mut _last_k) = state;
+    let (ref mut state_num, ref mut state_den, ref mut _last_k) = state;
     
-    // exp(w) para decay
     let w_exp = w_safe.reshape([1, channels]).exp();
-    
-    // exp(k) para token atual
     let k_exp = k_safe.clone().exp();
     
-    // Contribuição do token atual com bonus u
     let u_bc = u_safe.reshape([1, channels]);
     let current_weight = (u_bc + k_safe).exp();
     let current_value = current_weight.clone() * v.clone();
     
-    // Output: (past + current) / (past_weights + current_weight)
-    let numerator = state_a.clone() + current_value;
-    let denominator = state_b.clone() + current_weight + 1e-6;
-    let output = (numerator / denominator).clamp(-100.0, 100.0);
+    let numerator = state_num.clone() + current_value;
+    let denominator = state_den.clone() + current_weight + 1e-6;
+    let output = (numerator / denominator).clamp(-50.0, 50.0);
     
-    // Atualiza estado para próximo token
-    *state_a = state_a.clone() * w_exp.clone() + k_exp.clone() * v;
-    *state_b = state_b.clone() * w_exp + k_exp;
+    *state_num = state_num.clone() * w_exp.clone() + k_exp.clone() * v;
+    *state_den = state_den.clone() * w_exp + k_exp;
     
     output
 }
