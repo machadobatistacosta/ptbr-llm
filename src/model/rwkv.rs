@@ -345,29 +345,33 @@ impl<B: Backend> TimeMixing<B> {
         // ========================================
         // TIME DECAY (w) - CRÍTICO!
         // ========================================
-        // Deve ser NEGATIVO para garantir decay exponencial
-        // Layers iniciais: decay mais lento (valores menos negativos)
-        // Layers finais: decay mais rápido (valores mais negativos)
-        // Canais com índice maior: decay variado
+        // DEVE ser SEMPRE NEGATIVO para garantir decay exponencial
+        // Range seguro: [-5, -0.5]
+        // ERRO ANTERIOR: fórmula podia dar valores positivos!
         let decay_values: Vec<f32> = (0..d_model)
             .map(|i| {
                 let channel_ratio = i as f64 / (d_model - 1).max(1) as f64;
-                // Fórmula do RWKV paper: -5 + 8 * (channel_ratio^(0.7 + 1.3*layer_ratio))
-                let decay = -5.0 + 8.0 * channel_ratio.powf(0.7 + 1.3 * ratio_0_to_1);
-                // Clamp para range seguro: [-8, -0.1]
-                (decay as f32).clamp(-8.0, -0.1)
+                // Decay varia de -5 (forte) a -0.5 (fraco) baseado no canal
+                // Layers iniciais: decay mais uniforme
+                // Layers finais: mais variação
+                let base_decay = -5.0 + 4.5 * channel_ratio;  // Range: -5 a -0.5
+                let layer_factor = 0.8 + 0.4 * ratio_0_to_1;  // 0.8 a 1.2
+                let decay = base_decay * layer_factor;
+                (decay as f32).clamp(-5.0, -0.5)  // SEMPRE negativo!
             })
             .collect();
 
         // ========================================
         // TIME FIRST (u) - bonus para token atual
         // ========================================
+        // Valores PEQUENOS perto de zero
+        // Se muito grande, distorce a atenção
         let first_values: Vec<f32> = (0..d_model)
             .map(|i| {
                 let channel_ratio = i as f64 / (d_model - 1).max(1) as f64;
-                // Valor moderado, variando por canal
-                let base = (ratio_1_to_almost_0 * 0.5 + channel_ratio * 0.3) as f32;
-                base.clamp(-1.0, 1.0)
+                // Bonus pequeno, variando de -0.5 a 0.5
+                let base = -0.5 + channel_ratio;  // -0.5 a 0.5
+                (base as f32).clamp(-0.5, 0.5)
             })
             .collect();
 
@@ -375,8 +379,7 @@ impl<B: Backend> TimeMixing<B> {
         // TIME MIX RATIOS
         // ========================================
         // Controla quanto do token anterior vs atual usar
-        // Layers iniciais: mais do token anterior (exploração)
-        // Layers finais: mais do token atual (precisão)
+        // Range: 0.3 a 0.7 (balanceado)
         let mix_values: Vec<f32> = (0..d_model)
             .map(|i| {
                 let channel_ratio = i as f64 / (d_model - 1).max(1) as f64;
