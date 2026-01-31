@@ -111,6 +111,12 @@ impl<B: AutodiffBackend> Trainer<B> {
         // ========================================
         if !loss_value.is_finite() {
             eprintln!("⚠️ Loss NaN/Inf no step {} - pulando batch", self.step);
+            // CRITICAL: Reset accumulated state to free memory
+            self.accumulated_loss = 0.0;
+            self.micro_step = 0;
+            self.accumulated_grads = None;
+            // DROP tensors before returning
+            drop(loss);
             return None;
         }
         
@@ -119,6 +125,7 @@ impl<B: AutodiffBackend> Trainer<B> {
             self.accumulated_loss = 0.0;
             self.micro_step = 0;
             self.accumulated_grads = None;
+            drop(loss);
             return None;
         }
 
