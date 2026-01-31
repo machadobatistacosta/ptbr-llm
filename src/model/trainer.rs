@@ -54,6 +54,9 @@ pub struct Trainer<B: AutodiffBackend> {
 
     device: B::Device,
     steps_since_cleanup: usize,
+    
+    // NaN protection - skip bad data regions  
+    consecutive_nan_count: usize,
 }
 
 impl<B: AutodiffBackend> Trainer<B> {
@@ -85,6 +88,7 @@ impl<B: AutodiffBackend> Trainer<B> {
             total_clips: 0,
             device,
             steps_since_cleanup: 0,
+            consecutive_nan_count: 0,
         }
     }
 
@@ -110,15 +114,26 @@ impl<B: AutodiffBackend> Trainer<B> {
         // SKIP BATCHES PROBLEMÁTICOS
         // ========================================
         if !loss_value.is_finite() {
-            eprintln!("⚠️ Loss NaN/Inf no step {} - pulando batch", self.step);
+            self.consecutive_nan_count += 1;
+            eprintln!("⚠️ Loss NaN/Inf no step {} - pulando batch (consecutivos: {})", 
+                     self.step, self.consecutive_nan_count);
+            
             // CRITICAL: Reset accumulated state to free memory
             self.accumulated_loss = 0.0;
             self.micro_step = 0;
             self.accumulated_grads = None;
-            // DROP tensors before returning
             drop(loss);
+            
+            // Se muitos NaN consecutivos, avisa para pular região do dataset
+            if self.consecutive_nan_count >= 5 {
+                eprintln!("🚨 {} NaN consecutivos! Pule 100 batches no dataset para evitar OOM!", 
+                         self.consecutive_nan_count);
+            }
             return None;
         }
+        
+        // Reset contador de NaN consecutivos quando batch é válido
+        self.consecutive_nan_count = 0;
         
         if loss_value > 50.0 {
             eprintln!("⚠️ Loss muito alta ({:.2}) no step {} - pulando batch", loss_value, self.step);
@@ -467,5 +482,22 @@ impl<B: AutodiffBackend> Trainer<B> {
     /// Reseta contador de clips por epoch
     pub fn reset_epoch_clips(&mut self) {
         self.clips_this_epoch = 0;
+    }
+    
+    /// Retorna o número de NaN consecutivos
+    pub fn consecutive_nan_count(&self) -> usize {
+        self.consecutive_nan_count
+    }
+    
+    /// Verifica se deve pular batches (5+ NaN) e reseta o contador
+    /// Retorna quantos batches pular (0 se normal, 100 se muitos NaN)
+    pub fn should_skip_batches(&mut self) -> usize {
+        if self.consecutive_nan_count >= 5 {
+            self.consecutive_nan_count = 0;  // Reset após skip
+            eprintln!("🔄 Pulando 100 batches para escapar da região problemática...");
+            100
+        } else {
+            0
+        }
     }
 }

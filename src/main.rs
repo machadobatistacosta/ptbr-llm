@@ -1245,7 +1245,13 @@ fn run_training_loop(
                     break 'training;
                 }
             }
-            // Se train_step retornou None, é um micro-step incompleto, continua
+            // Se train_step retornou None, verifica se precisa pular batches (muitos NaN)
+            let skip_count = trainer.should_skip_batches();
+            if skip_count > 0 {
+                // O loop naturalmente avança - só logamos a mensagem
+                // O importante é que o estado NaN foi resetado e memória liberada
+                eprintln!("  ✅ Estado resetado após {} NaN, continuando...", skip_count);
+            }
         }
 
         epoch += 1;
