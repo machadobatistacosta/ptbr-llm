@@ -160,11 +160,10 @@ impl<B: Backend> RWKV<B> {
         x = self.ln_out.forward(x);
 
         // ========================================
-        // OUTPUT LOGITS - SEM SCALING INCORRETO!
+        // OUTPUT LOGITS - SEM SCALING
         // ========================================
-        // O código anterior dividia por sqrt(d_model), o que parecia errado.
-        // MAS: para weight_tying com vocab grande, os logits podem ter escala
-        // proporcional a d_model, então precisamos normalizar agressivamente.
+        // O scaling por 1/d_model causava vanishing gradients.
+        // Removido para permitir aprendizado real.
         
         let logits = if self.use_weight_tying {
             // Reutiliza embedding weights: logits = x @ embedding^T
@@ -172,20 +171,13 @@ impl<B: Backend> RWKV<B> {
             let emb_weight = self.embedding.weight.val();  // [vocab_size, d_model]
             let x_flat = x.reshape([b * t, d]);
             let logits_flat = x_flat.matmul(emb_weight.transpose());  // [b*t, vocab_size]
-            
-            // SCALING AGRESSIVO: Divide por d_model para normalizar magnitude
-            // Isso traz logits para uma escala onde softmax funciona bem
-            let scale = self.d_model as f32;
-            let logits_scaled = logits_flat / scale;
-            
-            logits_scaled.reshape([b, t, self.vocab_size])
+            logits_flat.reshape([b, t, self.vocab_size])
         } else {
             // Usa cabeça separada
             self.head.as_ref().unwrap().forward(x)
         };
         
-        // ✅ RETORNA LOGITS COM SCALING APLICADO
-        // Clamp para evitar overflow numérico extremo
+        // Clamp para evitar overflow
         logits.clamp(-50.0, 50.0)
     }
 
@@ -259,10 +251,16 @@ pub struct RWKVBlock<B: Backend> {
     ln2: LayerNorm<B>,
     channel_mixing: ChannelMixing<B>,
     dropout: Dropout,
+    #[module(skip)]
+    residual_scale: f32,
 }
 
 impl<B: Backend> RWKVBlock<B> {
     pub fn new(config: &RWKVConfig, layer_id: usize, device: &B::Device) -> Self {
+        // GPT-J style residual scaling: 1/sqrt(2*n_layers)
+        // Isso previne que hidden states explodam através das layers
+        let residual_scale = 1.0 / ((2.0 * config.n_layers as f32).sqrt());
+        
         Self {
             ln1: LayerNormConfig::new(config.d_model)
                 .with_epsilon(config.layer_norm_eps)
@@ -273,20 +271,21 @@ impl<B: Backend> RWKVBlock<B> {
                 .init(device),
             channel_mixing: ChannelMixing::new(config.d_model, config.d_ffn, layer_id, config.n_layers, device),
             dropout: DropoutConfig::new(config.dropout).init(),
+            residual_scale,
         }
     }
 
     /// Forward para treinamento (processa sequência completa)
     pub fn forward(&self, x: Tensor<B, 3>) -> Tensor<B, 3> {
-        // Time mixing com residual connection
+        // Time mixing com residual connection escalada
         let ln1_out = self.ln1.forward(x.clone());
         let tm = self.time_mixing.forward(ln1_out);
-        let x = x + self.dropout.forward(tm);
+        let x = x + self.dropout.forward(tm) * self.residual_scale;
 
-        // Channel mixing com residual connection
+        // Channel mixing com residual connection escalada
         let ln2_out = self.ln2.forward(x.clone());
         let cm = self.channel_mixing.forward(ln2_out);
-        x + self.dropout.forward(cm)
+        x + self.dropout.forward(cm) * self.residual_scale
     }
 
     /// Forward step-by-step para inferência
@@ -299,16 +298,16 @@ impl<B: Backend> RWKVBlock<B> {
     ) -> Tensor<B, 2> {
         let [b, c] = x.dims();
 
-        // Time mixing com residual
+        // Time mixing com residual escalada
         let x_3d = x.clone().reshape([b, 1, c]);
         let ln1_out = self.ln1.forward(x_3d).reshape([b, c]);
         let tm = self.time_mixing.forward_step(ln1_out, time_state, prev_embedding);
-        let x = x + tm;
+        let x = x + tm * self.residual_scale;
 
-        // Channel mixing com residual
+        // Channel mixing com residual escalada
         let ln2_out = self.ln2.forward(x.clone().reshape([b, 1, c])).reshape([b, c]);
         let cm = self.channel_mixing.forward_step(ln2_out, channel_state);
-        x + cm
+        x + cm * self.residual_scale
     }
 }
 
