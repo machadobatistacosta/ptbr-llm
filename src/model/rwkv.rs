@@ -160,10 +160,12 @@ impl<B: Backend> RWKV<B> {
         x = self.ln_out.forward(x);
 
         // ========================================
-        // OUTPUT LOGITS - SEM SCALING
+        // OUTPUT LOGITS - COM SCALING BALANCEADO
         // ========================================
-        // O scaling por 1/d_model causava vanishing gradients.
-        // Removido para permitir aprendizado real.
+        // Combinando residual scaling + logit scaling:
+        // - Residual: 1/sqrt(2*n_layers) previne hidden state explosion
+        // - Logit: 1/sqrt(d_model * n_layers) normaliza escala final
+        // Juntos permitem loss ~11 COM gradientes fluindo
         
         let logits = if self.use_weight_tying {
             // Reutiliza embedding weights: logits = x @ embedding^T
@@ -171,7 +173,13 @@ impl<B: Backend> RWKV<B> {
             let emb_weight = self.embedding.weight.val();  // [vocab_size, d_model]
             let x_flat = x.reshape([b * t, d]);
             let logits_flat = x_flat.matmul(emb_weight.transpose());  // [b*t, vocab_size]
-            logits_flat.reshape([b, t, self.vocab_size])
+            
+            // Scale: 1/sqrt(d_model * n_layers) ≈ 1/157 para 400m
+            // Menos agressivo que 1/d_model, permite gradientes
+            let scale = ((self.d_model * self.n_layers) as f32).sqrt();
+            let logits_scaled = logits_flat / scale;
+            
+            logits_scaled.reshape([b, t, self.vocab_size])
         } else {
             // Usa cabeça separada
             self.head.as_ref().unwrap().forward(x)
