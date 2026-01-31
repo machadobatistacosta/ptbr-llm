@@ -162,8 +162,9 @@ impl<B: Backend> RWKV<B> {
         // ========================================
         // OUTPUT LOGITS - SEM SCALING INCORRETO!
         // ========================================
-        // O código anterior dividia por sqrt(d_model), o que é ERRADO.
-        // Para language models, logits devem ser passados diretamente ao softmax.
+        // O código anterior dividia por sqrt(d_model), o que parecia errado.
+        // MAS: para weight_tying com vocab grande, os logits podem ter escala
+        // proporcional a sqrt(d_model), então precisamos normalizar.
         
         let logits = if self.use_weight_tying {
             // Reutiliza embedding weights: logits = x @ embedding^T
@@ -171,14 +172,20 @@ impl<B: Backend> RWKV<B> {
             let emb_weight = self.embedding.weight.val();  // [vocab_size, d_model]
             let x_flat = x.reshape([b * t, d]);
             let logits_flat = x_flat.matmul(emb_weight.transpose());  // [b*t, vocab_size]
-            logits_flat.reshape([b, t, self.vocab_size])
+            
+            // SCALING: Divide por sqrt(d_model) para normalizar magnitude
+            // Isso é similar ao scaling em attention, mas aqui é 1/sqrt(d) não sqrt(d)
+            let scale = (self.d_model as f32).sqrt();
+            let logits_scaled = logits_flat / scale;
+            
+            logits_scaled.reshape([b, t, self.vocab_size])
         } else {
             // Usa cabeça separada
             self.head.as_ref().unwrap().forward(x)
         };
         
-        // ✅ RETORNA LOGITS SEM MODIFICAÇÃO
-        // O único clamp é para evitar overflow numérico extremo
+        // ✅ RETORNA LOGITS COM SCALING APLICADO
+        // Clamp para evitar overflow numérico extremo
         logits.clamp(-50.0, 50.0)
     }
 
