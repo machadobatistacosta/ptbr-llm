@@ -1,10 +1,8 @@
-//! WKV Linear Attention - Versão CORRIGIDA
+//! WKV Linear Attention - DIAGNÓSTICO
 //! 
-//! CORREÇÃO: u (bonus) só aplica ao token atual, não ao cumsum do passado
-//! 
-//! Fórmula RWKV correta:
-//! wkv_t = (Σ_{i<t} exp(-(t-1-i)*w + k_i) * v_i + exp(u + k_t) * v_t) /
-//!         (Σ_{i<t} exp(-(t-1-i)*w + k_i) + exp(u + k_t))
+//! VERSÃO SIMPLIFICADA: apenas retorna v diretamente
+//! Se loss ficar ~11, o problema está no WKV
+//! Se loss continuar ~39, o problema está em outro lugar
 
 use burn::tensor::{backend::Backend, ElementConversion, Tensor, TensorData};
 use std::collections::HashMap;
@@ -31,6 +29,7 @@ impl WKVConfig {
     pub fn for_high_memory() -> Self { Self { chunk_size: 64, use_fp32_accumulator: true } }
 }
 
+#[allow(dead_code)]
 fn get_cached_decay_matrix(seq_len: usize, w_mean_x100: i32) -> Vec<f32> {
     let key = (seq_len, w_mean_x100);
     {
@@ -53,106 +52,32 @@ fn get_cached_decay_matrix(seq_len: usize, w_mean_x100: i32) -> Vec<f32> {
     data
 }
 
-/// WKV - Versão CORRIGIDA
+/// WKV - DIAGNÓSTICO: apenas retorna v
 /// 
-/// IMPORTANTE: u (bonus) só aplica ao token ATUAL (posição t=t),
-/// NÃO aos tokens passados no cumsum!
+/// Esta versão NÃO faz atenção, apenas passa v através.
+/// Serve para diagnosticar se o problema está no WKV ou não.
 pub fn wkv_linear<B: Backend>(
-    k: Tensor<B, 3>,
+    _k: Tensor<B, 3>,
     v: Tensor<B, 3>,
-    w: Tensor<B, 1>,
-    u: Tensor<B, 1>,
+    _w: Tensor<B, 1>,
+    _u: Tensor<B, 1>,
     _config: &WKVConfig,
 ) -> Tensor<B, 3> {
-    let [batch_size, seq_len, channels] = k.dims();
-    let device = k.device();
-    
-    // Clamp para estabilidade
-    let k_safe = k.clamp(-10.0, 10.0);
-    let w_safe = w.clamp(-5.0, -0.1);
-    let u_safe = u.clamp(-5.0, 5.0);
-    
-    // Média do decay aprendido
-    let w_mean: f32 = w_safe.mean().into_scalar().elem();
-    let w_x100 = (w_mean * 100.0) as i32;
-    
-    // ========================================
-    // CONTRIBUIÇÃO DOS TOKENS PASSADOS (cumsum com decay)
-    // ========================================
-    // Para i < t: weight = exp(-(t-1-i)*w + k_i)
-    // Aproximação: exp(decay) * exp(k)
-    
-    let k_exp = k_safe.clone().exp();  // exp(k) para todos os tokens
-    
-    // Matriz de decay triangular
-    let decay_data = get_cached_decay_matrix(seq_len, w_x100);
-    let decay_td = TensorData::from(decay_data.as_slice());
-    let decay: Tensor<B, 1> = Tensor::from_data(decay_td, &device);
-    let decay = decay.reshape([seq_len, seq_len]);
-    
-    // weighted_v = exp(k) * v para todos os tokens
-    let wv = (k_exp.clone() * v.clone()).swap_dims(1, 2).reshape([batch_size * channels, seq_len]);
-    
-    // cumsum com decay: soma dos tokens ANTERIORES (j < i)
-    let cum_wv = decay.clone().matmul(wv.transpose()).transpose()
-        .reshape([batch_size, channels, seq_len]).swap_dims(1, 2);
-    
-    // soma dos pesos (denominador)
-    let kexp_flat = k_exp.clone().swap_dims(1, 2).reshape([batch_size * channels, seq_len]);
-    let cum_kexp = decay.matmul(kexp_flat.transpose()).transpose()
-        .reshape([batch_size, channels, seq_len]).swap_dims(1, 2);
-    
-    // ========================================
-    // CONTRIBUIÇÃO DO TOKEN ATUAL (com bonus u)
-    // ========================================
-    // weight_current = exp(u + k_t) = exp(u) * exp(k_t)
-    // Isso só aplica ao token na posição t, não aos anteriores!
-    
-    let u_exp = u_safe.exp().reshape([1, 1, channels]);  // exp(u)
-    let current_weight = k_exp.clone() * u_exp.clone();  // exp(u + k_t) para cada t
-    let current_num = current_weight.clone() * v;
-    
-    // ========================================
-    // OUTPUT FINAL
-    // ========================================
-    // numerator = sum_past + current
-    // denominator = sum_past_weights + current_weight
-    
-    let num = cum_wv + current_num;
-    let den = cum_kexp + current_weight + 1e-6;
-    
-    // Clamp mais apertado no output
-    (num / den).clamp(-20.0, 20.0)
+    // DIAGNÓSTICO: retorna v diretamente (sem atenção)
+    // Se loss ficar ~11, problema está no WKV real
+    // Se loss continuar ~39, problema está em outro lugar
+    v
 }
 
 pub fn wkv_step<B: Backend>(
-    k: Tensor<B, 2>,
+    _k: Tensor<B, 2>,
     v: Tensor<B, 2>,
-    w: Tensor<B, 1>,
-    u: Tensor<B, 1>,
-    state: &mut (Tensor<B, 2>, Tensor<B, 2>, Tensor<B, 2>),
+    _w: Tensor<B, 1>,
+    _u: Tensor<B, 1>,
+    _state: &mut (Tensor<B, 2>, Tensor<B, 2>, Tensor<B, 2>),
 ) -> Tensor<B, 2> {
-    let [_, channels] = k.dims();
-    let (ref mut state_num, ref mut state_den, ref mut _last_k) = state;
-
-    let k_safe = k.clamp(-10.0, 10.0);
-    let w_exp = w.clamp(-5.0, -0.1).reshape([1, channels]).exp();
-    let u_exp = u.clamp(-5.0, 5.0).reshape([1, channels]).exp();
-    let k_exp = k_safe.exp();
-    
-    // Token atual: exp(u + k)
-    let current_weight = k_exp.clone() * u_exp;
-    let current_num = current_weight.clone() * v.clone();
-    
-    // Output
-    let num = state_num.clone() + current_num;
-    let den = state_den.clone() + current_weight + 1e-6;
-    let output = (num / den).clamp(-20.0, 20.0);
-
-    // Atualiza estado para próximo token (só exp(k), sem u!)
-    *state_num = state_num.clone() * w_exp.clone() + k_exp.clone() * v;
-    *state_den = state_den.clone() * w_exp + k_exp;
-    output
+    // DIAGNÓSTICO: retorna v diretamente
+    v
 }
 
 #[allow(dead_code)]
