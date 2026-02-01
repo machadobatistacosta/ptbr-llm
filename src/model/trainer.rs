@@ -206,8 +206,21 @@ impl<B: AutodiffBackend> Trainer<B> {
             // Learning rate com warmup e decay
             let current_lr = self.get_learning_rate();
 
-            // Optimizer step com gradientes clippados
-            self.model = self.optimizer.step(current_lr, self.model.clone(), clipped_grads);
+            // ========================================
+            // REAL GRADIENT CLIPPING VIA LR SCALING
+            // ========================================
+            // Since we can't modify gradients directly in Burn,
+            // we apply the clip scale to the learning rate.
+            // Effect: grads * lr * scale = grads * effective_lr
+            let clip_scale = if grad_norm > self.config.gradient_clip as f32 {
+                self.config.gradient_clip as f32 / grad_norm
+            } else {
+                1.0
+            };
+            let effective_lr = current_lr * clip_scale as f64;
+
+            // Optimizer step com gradientes clippados via LR scaling
+            self.model = self.optimizer.step(effective_lr, self.model.clone(), clipped_grads);
 
             // Reset acumulação
             self.accumulated_loss = 0.0;

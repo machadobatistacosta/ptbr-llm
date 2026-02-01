@@ -43,7 +43,13 @@ fn get_cached_decay_matrix(seq_len: usize, w_mean_x100: i32) -> Vec<f32> {
     let mut data = vec![0.0f32; seq_len * seq_len];
     for i in 0..seq_len {
         for j in 0..i {
-            data[i * seq_len + j] = (w_mean * (i - j) as f32).max(-20.0).exp();
+            // ========================================
+            // FIX 4: Clamp exponent to avoid underflow
+            // ========================================
+            // Before: exp(-2 * 63) = exp(-126) → 0 (underflow)
+            // After: exp(max(-10, -2*63)) = exp(-10) ≈ 4.5e-5 (safe)
+            let exponent = (w_mean * (i - j) as f32).clamp(-10.0, 0.0);
+            data[i * seq_len + j] = exponent.exp();
         }
     }
     
@@ -63,10 +69,18 @@ pub fn wkv_linear<B: Backend>(
     let [batch_size, seq_len, channels] = k.dims();
     let device = k.device();
     
-    // Clamp para estabilidade
-    let k_safe = k.clamp(-10.0, 10.0);
+    // ========================================
+    // FIX 2: Tighter clamps to avoid overflow
+    // ========================================
+    // exp(5) = 148 (safe), exp(10) = 22026 (dangerous)
+    let k_safe = k.clamp(-5.0, 5.0);
     let w_safe = w.clamp(-5.0, -0.5);  // Sempre negativo
-    let u_safe = u.clamp(-3.0, 3.0);   // Pequeno
+    let u_safe = u.clamp(-3.0, 3.0);
+    
+    // ========================================
+    // FIX 3: Clamp v tensor to prevent explosion
+    // ========================================
+    let v_safe = v.clamp(-10.0, 10.0);
     
     // Média do decay aprendido
     let w_mean: f32 = w_safe.mean().into_scalar().elem();
@@ -82,7 +96,7 @@ pub fn wkv_linear<B: Backend>(
     let decay = decay.reshape([seq_len, seq_len]);
     
     // Cumsum do passado: sum_{j<i} decay^(i-j) * exp(k_j) * v_j
-    let wv = (k_exp.clone() * v.clone()).swap_dims(1, 2).reshape([batch_size * channels, seq_len]);
+    let wv = (k_exp.clone() * v_safe.clone()).swap_dims(1, 2).reshape([batch_size * channels, seq_len]);
     let cum_wv = decay.clone().matmul(wv.transpose()).transpose()
         .reshape([batch_size, channels, seq_len]).swap_dims(1, 2);
     
@@ -94,7 +108,7 @@ pub fn wkv_linear<B: Backend>(
     // Token atual: exp(u + k_t) = exp(u) * exp(k_t)
     let u_exp = u_safe.exp().reshape([1, 1, channels]);
     let current_weight = k_exp * u_exp;
-    let current_num = current_weight.clone() * v;
+    let current_num = current_weight.clone() * v_safe;
     
     // Output final
     let num = cum_wv + current_num;
@@ -112,19 +126,21 @@ pub fn wkv_step<B: Backend>(
     let [_, channels] = k.dims();
     let (ref mut state_num, ref mut state_den, ref mut _last_k) = state;
 
-    let k_safe = k.clamp(-10.0, 10.0);
+    // Same fixes as wkv_linear
+    let k_safe = k.clamp(-5.0, 5.0);  // FIX 2: tighter clamp
+    let v_safe = v.clamp(-10.0, 10.0);  // FIX 3: clamp v
     let w_exp = w.clamp(-5.0, -0.5).reshape([1, channels]).exp();
     let u_exp = u.clamp(-3.0, 3.0).reshape([1, channels]).exp();
     let k_exp = k_safe.exp();
     
     let current_weight = k_exp.clone() * u_exp;
-    let current_num = current_weight.clone() * v.clone();
+    let current_num = current_weight.clone() * v_safe.clone();
     
     let num = state_num.clone() + current_num;
     let den = state_den.clone() + current_weight + 1e-6;
     let output = (num / den).clamp(-20.0, 20.0);
 
-    *state_num = state_num.clone() * w_exp.clone() + k_exp.clone() * v;
+    *state_num = state_num.clone() * w_exp.clone() + k_exp.clone() * v_safe;
     *state_den = state_den.clone() * w_exp + k_exp;
     output
 }
