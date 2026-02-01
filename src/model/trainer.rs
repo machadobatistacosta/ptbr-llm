@@ -166,6 +166,17 @@ impl<B: AutodiffBackend> Trainer<B> {
         if self.micro_step % accum_steps == 0 {
             let avg_loss = self.accumulated_loss / accum_steps as f32;
             
+            // CRITICAL: Check if accumulated loss is valid BEFORE applying gradients
+            // This prevents corrupting model weights with NaN gradients
+            if !avg_loss.is_finite() || avg_loss > 100.0 {
+                eprintln!("🛑 CRITICAL: avg_loss inválido ({:.4}) - ABORTANDO optimizer step para proteger pesos!", avg_loss);
+                self.accumulated_loss = 0.0;
+                self.micro_step = 0;
+                self.accumulated_grads = None;
+                self.consecutive_nan_count += 1;
+                return None;
+            }
+            
             // Pega gradientes acumulados
             let grads = self.accumulated_grads.take().unwrap();
             
@@ -176,6 +187,15 @@ impl<B: AutodiffBackend> Trainer<B> {
                 grads, 
                 self.config.gradient_clip as f32
             );
+            
+            // CRITICAL: Check if grad_norm is valid
+            if !grad_norm.is_finite() {
+                eprintln!("🛑 CRITICAL: grad_norm NaN/Inf - ABORTANDO optimizer step para proteger pesos!");
+                self.accumulated_loss = 0.0;
+                self.micro_step = 0;
+                self.consecutive_nan_count += 1;
+                return None;
+            }
             
             self.last_grad_norm = grad_norm;
             if was_clipped {
