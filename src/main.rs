@@ -159,6 +159,8 @@ enum Commands {
         learning_rate: f64,
         #[arg(long, default_value = "500")]
         warmup_steps: usize,
+        #[arg(long, default_value = "1.0")]
+        gradient_clip: f64,
         #[arg(long, default_value = "1024")]
         seq_len: usize,
         #[arg(long, default_value = "500")]
@@ -342,6 +344,7 @@ fn main() {
             grad_accum,
             learning_rate,
             warmup_steps,
+            gradient_clip,
             seq_len,
             eval_every,
             eval_samples,
@@ -356,6 +359,7 @@ fn main() {
             grad_accum,
             learning_rate,
             warmup_steps,
+            gradient_clip,
             seq_len,
             eval_every,
             eval_samples,
@@ -864,6 +868,7 @@ fn train_model(
     grad_accum: usize,
     learning_rate: f64,
     warmup_steps: usize,
+    gradient_clip: f64,
     seq_len: usize,
     eval_every: usize,
     eval_samples: usize,
@@ -967,7 +972,7 @@ fn train_model(
         warmup_steps,
         max_steps,
         weight_decay: 0.01,
-        gradient_clip: 1.0,
+        gradient_clip,
         save_every,
         log_every: 10,
         min_lr_ratio: 0.1,
