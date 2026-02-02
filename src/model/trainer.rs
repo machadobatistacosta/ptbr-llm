@@ -92,17 +92,15 @@ impl<B: AutodiffBackend> Trainer<B> {
         }
     }
 
-    /// Executa um step de treinamento
+    /// Executa um step de treinamento completo
     /// 
-    /// Retorna Some(stats) quando um optimizer step completo foi feito
-    /// (após gradient_accumulation_steps micro-batches)
+    /// SIMPLIFICADO: Cada chamada = 1 step completo (forward, backward, update)
+    /// Gradient accumulation é simulado pelo caller chamando múltiplas vezes
     pub fn train_step(
         &mut self,
         input_ids: Tensor<B, 2, Int>,
         target_ids: Tensor<B, 2, Int>,
     ) -> Option<TrainStats> {
-        let accum_steps = self.config.gradient_accumulation_steps;
-        
         // Forward pass
         let logits = self.model.forward(input_ids);
         
@@ -110,111 +108,59 @@ impl<B: AutodiffBackend> Trainer<B> {
         let loss = self.cross_entropy_safe(logits, target_ids);
         let loss_value: f32 = loss.clone().into_scalar().elem();
 
-        // ========================================
-        // SKIP BATCHES PROBLEMÁTICOS
-        // ========================================
-        if !loss_value.is_finite() {
+        // Skip problematic batches
+        if !loss_value.is_finite() || loss_value > 50.0 {
             self.consecutive_nan_count += 1;
-            eprintln!("⚠️ Loss NaN/Inf no step {} - pulando batch (consecutivos: {})", 
-                     self.step, self.consecutive_nan_count);
-            
-            // CRITICAL: Reset accumulated state to free memory
-            self.accumulated_loss = 0.0;
-            self.micro_step = 0;
-            drop(loss);
-            
-            // Se muitos NaN consecutivos, avisa para pular região do dataset
             if self.consecutive_nan_count >= 5 {
-                eprintln!("🚨 {} NaN consecutivos! Pule 100 batches no dataset para evitar OOM!", 
-                         self.consecutive_nan_count);
+                eprintln!("🚨 {} NaN/high loss consecutivos!", self.consecutive_nan_count);
             }
             return None;
         }
-        
-        // Reset contador de NaN consecutivos quando batch é válido
         self.consecutive_nan_count = 0;
-        
-        if loss_value > 50.0 {
-            eprintln!("⚠️ Loss muito alta ({:.2}) no step {} - pulando batch", loss_value, self.step);
-            self.accumulated_loss = 0.0;
-            self.micro_step = 0;
-            drop(loss);
-            return None;
-        }
-
-        // Acumula loss para estatísticas
-        self.accumulated_loss += loss_value;
-        self.micro_step += 1;
 
         // ========================================
-        // BACKWARD PASS - APLICA IMEDIATAMENTE
+        // BACKWARD PASS
         // ========================================
-        // Normaliza loss pelo número de steps de acumulação
-        // Isso faz cada micro-batch contribuir 1/N do gradiente
-        let normalized_loss = loss / (accum_steps as f32);
-        let grads = normalized_loss.backward();
+        let grads = loss.backward();
         let grad_params = GradientsParams::from_grads(grads, &self.model);
 
         // ========================================
-        // APLICA GRADIENTE COM LR ADAPTATIVO
+        // OPTIMIZER STEP
         // ========================================
         let current_lr = self.get_learning_rate();
         
-        // Adaptive LR based on current loss value:
-        // - When loss is high (>10), we need smaller updates
-        // - Scale: lr * min(1.0, 10.0 / loss)
-        // - This prevents explosion during early training
-        let loss_scale = if loss_value > 10.0 {
-            10.0 / loss_value
+        // Simple clipping via LR scaling when loss is very high
+        let clip_scale = if loss_value > 15.0 {
+            (15.0 / loss_value) as f64
         } else {
             1.0
         };
+        let effective_lr = current_lr * clip_scale;
         
-        // Additional gradient clipping via fixed max_norm = 1.0
-        // Since we can't compute actual grad_norm in Burn easily,
-        // we use conservative LR scaling
-        let effective_lr = current_lr * loss_scale as f64 * 0.1;  // Extra 0.1 safety factor
-        
-        // Track the effective scaling for logging
-        let grad_norm = 1.0 / (loss_scale * 0.1);  // Inverse of scaling = "effective grad norm"
-        
-        // Aplica gradientes
+        // Apply gradients
         self.model = self.optimizer.step(effective_lr, self.model.clone(), grad_params);
+        
+        // Update metrics
+        self.step += 1;
+        let grad_norm = 1.0 / clip_scale as f32;
         self.last_grad_norm = grad_norm;
-
-        // ========================================
-        // RETORNA STATS quando acumulação completa
-        // ========================================
-        if self.micro_step % accum_steps == 0 {
-            let avg_loss = self.accumulated_loss / accum_steps as f32;
-            
-            // Atualiza EMA loss
-            if self.ema_loss < 0.0 {
-                self.ema_loss = avg_loss;
-            } else {
-                self.ema_loss = 0.99 * self.ema_loss + 0.01 * avg_loss;
-            }
-            
-            if avg_loss < self.best_loss {
-                self.best_loss = avg_loss;
-            }
-            // Cleanup periódico de memória
-            self.steps_since_cleanup += 1;
-            if self.steps_since_cleanup >= 50 {
-                self.steps_since_cleanup = 0;
-                std::hint::black_box(());
-            }
-
-            let was_clipped = loss_scale < 1.0;
-            return Some(TrainStats {
-                loss: avg_loss,
-                grad_norm,
-                lr: current_lr,
-                clipped: was_clipped,
-            });
+        
+        if self.ema_loss < 0.0 {
+            self.ema_loss = loss_value;
+        } else {
+            self.ema_loss = 0.99 * self.ema_loss + 0.01 * loss_value;
+        }
+        
+        if loss_value < self.best_loss {
+            self.best_loss = loss_value;
         }
 
-        None
+        Some(TrainStats {
+            loss: loss_value,
+            grad_norm,
+            lr: current_lr,
+            clipped: clip_scale < 1.0,
+        })
     }
 
     /// ========================================
