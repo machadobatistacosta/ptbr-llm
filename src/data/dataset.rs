@@ -2,6 +2,7 @@ use memmap2::Mmap;
 use rand::seq::SliceRandom;
 use rand::SeedableRng;
 use rand_chacha::ChaCha8Rng;
+use rayon::prelude::*;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
@@ -189,20 +190,21 @@ impl<'a> Iterator for DataLoader<'a> {
         }
 
         let end_idx = (self.current_idx + self.batch_size).min(self.dataset.len());
-
-        let mut inputs = Vec::with_capacity(self.batch_size);
-        let mut targets = Vec::with_capacity(self.batch_size);
-
-        for idx in self.current_idx..end_idx {
-            if let Some((input, target)) = self.dataset.get(idx) {
-                inputs.push(input);
-                targets.push(target);
-            }
-        }
+        let indices: Vec<usize> = (self.current_idx..end_idx).collect();
+        
+        // Parallel batch loading using Rayon
+        let results: Vec<_> = indices.par_iter()
+            .filter_map(|&idx| self.dataset.get(idx))
+            .collect();
 
         self.current_idx = end_idx;
 
-        if inputs.is_empty() { None } else { Some((inputs, targets)) }
+        if results.is_empty() { 
+            None 
+        } else { 
+            let (inputs, targets): (Vec<_>, Vec<_>) = results.into_iter().unzip();
+            Some((inputs, targets))
+        }
     }
 }
 
