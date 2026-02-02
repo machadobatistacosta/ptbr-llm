@@ -10,7 +10,7 @@ use super::wkv_optimized::{wkv_linear, wkv_step, WKVConfig};
 use burn::{
     module::{Module, Param},
     nn::{
-        Dropout, DropoutConfig, Embedding, EmbeddingConfig, LayerNorm, LayerNormConfig, Linear,
+        Dropout, DropoutConfig, Embedding, EmbeddingConfig, Initializer, LayerNorm, LayerNormConfig, Linear,
         LinearConfig,
     },
     tensor::{activation, backend::Backend, Int, Tensor},
@@ -91,10 +91,13 @@ pub struct RWKV<B: Backend> {
 impl<B: Backend> RWKV<B> {
     pub fn new(config: &RWKVConfig, device: &B::Device) -> Self {
         // ========================================
-        // EMBEDDING
+        // EMBEDDING - COM INICIALIZAÇÃO CORRETA
         // ========================================
-        // Burn usa inicialização padrão (uniform) que é OK para embeddings
-        let embedding = EmbeddingConfig::new(config.vocab_size, config.d_model).init(device);
+        // Burn default é N(0, 1) que é muito grande!
+        // GPT-2/RWKV usam std=0.02 para embeddings
+        let embedding = EmbeddingConfig::new(config.vocab_size, config.d_model)
+            .with_initializer(Initializer::Normal { mean: 0.0, std: 0.02 })
+            .init(device);
 
         // ========================================
         // LAYER NORMS
