@@ -121,7 +121,6 @@ impl<B: AutodiffBackend> Trainer<B> {
             // CRITICAL: Reset accumulated state to free memory
             self.accumulated_loss = 0.0;
             self.micro_step = 0;
-            self.accumulated_grads = None;
             drop(loss);
             
             // Se muitos NaN consecutivos, avisa para pular região do dataset
@@ -139,112 +138,60 @@ impl<B: AutodiffBackend> Trainer<B> {
             eprintln!("⚠️ Loss muito alta ({:.2}) no step {} - pulando batch", loss_value, self.step);
             self.accumulated_loss = 0.0;
             self.micro_step = 0;
-            self.accumulated_grads = None;
             drop(loss);
             return None;
         }
 
-        // Acumula loss
+        // Acumula loss para estatísticas
         self.accumulated_loss += loss_value;
         self.micro_step += 1;
 
         // ========================================
-        // BACKWARD PASS
+        // BACKWARD PASS - APLICA IMEDIATAMENTE
         // ========================================
-        // Normaliza pelo número de steps de acumulação
+        // Normaliza loss pelo número de steps de acumulação
+        // Isso faz cada micro-batch contribuir 1/N do gradiente
         let normalized_loss = loss / (accum_steps as f32);
         let grads = normalized_loss.backward();
         let grad_params = GradientsParams::from_grads(grads, &self.model);
 
-        // Acumula gradientes (Burn faz isso automaticamente no optimizer.step,
-        // mas precisamos acumular manualmente para gradient clipping)
-        self.accumulated_grads = Some(grad_params);
+        // ========================================
+        // APLICA GRADIENTE IMEDIATAMENTE
+        // ========================================
+        // Learning rate escalado para acumulação:
+        // - Com LR normal e loss/N, cada step aplica grad/N
+        // - Após N steps, efeito total = grad (soma de grad/N)
+        let current_lr = self.get_learning_rate();
+        
+        // Gradient clipping via estimativa de norma
+        let grad_norm = self.estimate_grad_norm_from_loss();
+        let clip_scale = if grad_norm > self.config.gradient_clip as f32 {
+            self.config.gradient_clip as f32 / grad_norm
+        } else {
+            1.0
+        };
+        let effective_lr = current_lr * clip_scale as f64;
+        
+        // Aplica gradientes a cada micro-batch
+        self.model = self.optimizer.step(effective_lr, self.model.clone(), grad_params);
+        self.last_grad_norm = grad_norm;
 
         // ========================================
-        // OPTIMIZER STEP (quando acumulação completa)
+        // RETORNA STATS quando acumulação completa
         // ========================================
         if self.micro_step % accum_steps == 0 {
             let avg_loss = self.accumulated_loss / accum_steps as f32;
             
-            // CRITICAL: Check if accumulated loss is valid BEFORE applying gradients
-            // This prevents corrupting model weights with NaN gradients
-            if !avg_loss.is_finite() || avg_loss > 100.0 {
-                eprintln!("🛑 CRITICAL: avg_loss inválido ({:.4}) - ABORTANDO optimizer step para proteger pesos!", avg_loss);
-                self.accumulated_loss = 0.0;
-                self.micro_step = 0;
-                self.accumulated_grads = None;
-                self.consecutive_nan_count += 1;
-                return None;
-            }
-            
-            // Pega gradientes acumulados
-            let grads = self.accumulated_grads.take().unwrap();
-            
-            // ========================================
-            // GRADIENT CLIPPING - IMPLEMENTAÇÃO REAL
-            // ========================================
-            let (clipped_grads, grad_norm, was_clipped) = self.clip_gradients(
-                grads, 
-                self.config.gradient_clip as f32
-            );
-            
-            // CRITICAL: Check if grad_norm is valid
-            if !grad_norm.is_finite() {
-                eprintln!("🛑 CRITICAL: grad_norm NaN/Inf - ABORTANDO optimizer step para proteger pesos!");
-                self.accumulated_loss = 0.0;
-                self.micro_step = 0;
-                self.consecutive_nan_count += 1;
-                return None;
-            }
-            
-            self.last_grad_norm = grad_norm;
-            if was_clipped {
-                self.clips_this_epoch += 1;
-                self.total_clips += 1;
-            }
-
-            // Learning rate com warmup e decay
-            let current_lr = self.get_learning_rate();
-
-            // ========================================
-            // REAL GRADIENT CLIPPING VIA LR SCALING
-            // ========================================
-            // Since we can't modify gradients directly in Burn,
-            // we apply the clip scale to the learning rate.
-            // Effect: grads * lr * scale = grads * effective_lr
-            let clip_scale = if grad_norm > self.config.gradient_clip as f32 {
-                self.config.gradient_clip as f32 / grad_norm
-            } else {
-                1.0
-            };
-            let effective_lr = current_lr * clip_scale as f64;
-
-            // Optimizer step com gradientes clippados via LR scaling
-            self.model = self.optimizer.step(effective_lr, self.model.clone(), clipped_grads);
-
-            // Reset acumulação
-            self.accumulated_loss = 0.0;
-            self.micro_step = 0;
-            self.step += 1;
-
-            // ========================================
-            // ATUALIZA MÉTRICAS
-            // ========================================
-            self.prev_loss = avg_loss;
-            
-            // EMA de loss (mais responsivo a quedas)
-            if self.step == 1 {
+            // Atualiza EMA loss
+            if self.ema_loss < 0.0 {
                 self.ema_loss = avg_loss;
             } else {
-                // Alpha maior quando loss melhora, menor quando piora
-                let alpha = if avg_loss < self.ema_loss { 0.1 } else { 0.05 };
-                self.ema_loss = (1.0 - alpha) * self.ema_loss + alpha * avg_loss;
+                self.ema_loss = 0.99 * self.ema_loss + 0.01 * avg_loss;
             }
-
+            
             if avg_loss < self.best_loss {
                 self.best_loss = avg_loss;
             }
-
             // Cleanup periódico de memória
             self.steps_since_cleanup += 1;
             if self.steps_since_cleanup >= 50 {
@@ -252,6 +199,7 @@ impl<B: AutodiffBackend> Trainer<B> {
                 std::hint::black_box(());
             }
 
+            let was_clipped = clip_scale < 1.0;
             return Some(TrainStats {
                 loss: avg_loss,
                 grad_norm,
