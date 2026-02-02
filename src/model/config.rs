@@ -186,8 +186,8 @@ impl Default for TrainingConfig {
     fn default() -> Self {
         Self {
             learning_rate: 3e-4,
-            batch_size: 1,
-            gradient_accumulation_steps: 8,
+            batch_size: 4,
+            gradient_accumulation_steps: 16,
             warmup_steps: 200,
             max_steps: 10_000,
             weight_decay: 0.01,
@@ -203,8 +203,8 @@ impl TrainingConfig {
     pub fn for_t4_400m() -> Self {
         Self {
             learning_rate: 3e-4,
-            batch_size: 1,
-            gradient_accumulation_steps: 8,
+            batch_size: 4,
+            gradient_accumulation_steps: 16,
             warmup_steps: 200,
             max_steps: 10_000,
             weight_decay: 0.01,
@@ -218,7 +218,7 @@ impl TrainingConfig {
     pub fn for_t4_safe() -> Self {
         Self {
             learning_rate: 2e-4,
-            batch_size: 1,
+            batch_size: 4,
             gradient_accumulation_steps: 16,
             warmup_steps: 300,
             max_steps: 10_000,
