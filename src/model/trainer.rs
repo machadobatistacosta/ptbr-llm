@@ -211,15 +211,38 @@ impl<B: AutodiffBackend> Trainer<B> {
             let avg_loss = self.accumulated_loss / accum_steps as f32;
             let current_lr = self.get_learning_rate();
             
-            // Clipping via LR scaling quando loss alta
-            let clip_scale = if avg_loss > 15.0 {
+            // ✅ CORRIGIDO: Clip scale agora DIVIDE o LR quando loss alta
+            let loss_threshold = 10.0;
+            
+            // 🔍 Detecção de spike repentino (divergência precoce)
+            let loss_spike = avg_loss > self.ema_loss * 1.3 && self.ema_loss > 1.0;
+            let high_loss = avg_loss > loss_threshold;
+            
+            let clip_scale = if high_loss || loss_spike {
                 self.clips_this_epoch += 1;
                 self.total_clips += 1;
-                (15.0 / avg_loss) as f64
+                
+                if loss_spike && !high_loss {
+                    eprintln!("⚠️  SPIKE detectado! loss={:.2} vs EMA={:.2} (step {})", 
+                             avg_loss, self.ema_loss, self.step);
+                }
+                
+                // Quanto maior a loss, maior o clip_scale, menor o LR efetivo
+                let base_scale = if high_loss {
+                    (avg_loss / loss_threshold).max(1.0)
+                } else {
+                    1.3  // Spike moderado
+                };
+                
+                // Penalidade extra se for spike repentino
+                let spike_penalty = if loss_spike { 1.2 } else { 1.0 };
+                
+                (base_scale * spike_penalty) as f64
             } else {
                 1.0
             };
-            let effective_lr = current_lr * clip_scale;
+            // ✅ BUG FIX #1: DIVIDIR ao invés de MULTIPLICAR!
+            let effective_lr = current_lr / clip_scale;
             
             // Apply gradients
             self.model = self.optimizer.step(effective_lr, self.model.clone(), grad_params);
@@ -227,7 +250,7 @@ impl<B: AutodiffBackend> Trainer<B> {
             // Update metrics
             self.prev_loss = self.ema_loss;
             self.step += 1;
-            let grad_norm = 1.0 / clip_scale as f32;
+            let grad_norm = clip_scale as f32;  // ✅ Grad norm é o próprio clip_scale
             self.last_grad_norm = grad_norm;
             
             if self.ema_loss < 0.0 {
