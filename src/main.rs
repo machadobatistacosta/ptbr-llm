@@ -875,12 +875,13 @@ fn train_model(
 ) {
     std::env::set_var("CUDA_VISIBLE_DEVICES", "0");
 
-    let (safe_seq_len, safe_grad_accum) = get_safe_config(model_size, seq_len, grad_accum);
+    let (safe_seq_len, safe_grad_accum, safe_batch) = get_safe_config(model_size, seq_len, grad_accum, batch_size);
 
-    if safe_seq_len != seq_len || safe_grad_accum != grad_accum {
+    if safe_seq_len != seq_len || safe_grad_accum != grad_accum || safe_batch != batch_size {
         println!("  ⚠️ Config ajustada para T4 16GB:");
         println!("     seq_len: {} -> {}", seq_len, safe_seq_len);
         println!("     grad_accum: {} -> {}", grad_accum, safe_grad_accum);
+        println!("     batch_size: {} -> {}", batch_size, safe_batch);
         println!();
     }
 
@@ -906,7 +907,7 @@ fn train_model(
         model_config.vocab_size = tokenizer.vocab_size();
     }
 
-    let effective_batch = batch_size * safe_grad_accum;
+    let effective_batch = safe_batch * safe_grad_accum;
 
     println!(
         "  Modelo: {} ({} params)",
@@ -915,11 +916,11 @@ fn train_model(
     );
     println!(
         "  VRAM estimada: {}",
-        format_bytes(model_config.estimated_vram(batch_size, safe_seq_len))
+        format_bytes(model_config.estimated_vram(safe_batch, safe_seq_len))
     );
     println!(
         "  Batch size: {} x {} = {} efetivo",
-        batch_size, safe_grad_accum, effective_batch
+        safe_batch, safe_grad_accum, effective_batch
     );
     println!("  Seq len: {}", safe_seq_len);
     println!("  Learning rate: {:.2e}", learning_rate);
@@ -967,7 +968,7 @@ fn train_model(
 
     let train_config = TrainingConfig {
         learning_rate,
-        batch_size,
+        batch_size: safe_batch,
         gradient_accumulation_steps: safe_grad_accum,
         warmup_steps,
         max_steps,
@@ -995,20 +996,37 @@ fn train_model(
         save_every,
         eval_every,
         eval_samples,
-        batch_size,
+        safe_batch,
         output,
         &mut metrics_file,
         &device,
     );
 }
 
-fn get_safe_config(model_size: &str, seq_len: usize, grad_accum: usize) -> (usize, usize) {
+// Retorna (safe_seq_len, safe_grad_accum, safe_batch_size)
+fn get_safe_config(model_size: &str, seq_len: usize, grad_accum: usize, batch_size: usize) -> (usize, usize, usize) {
     match model_size {
-        "800m" | "800M" => (seq_len.min(256), grad_accum.min(4)),
-        "400m" | "400M" => (seq_len.min(512), grad_accum.min(8)),
-        "1b" | "1B" => (seq_len.min(192), grad_accum.min(2)),
-        "1.5b" | "1.5B" => (seq_len.min(128), grad_accum.min(2)),
-        _ => (seq_len.min(1024), grad_accum),
+        // T4 16GB Limits
+        "400m" | "400M" => {
+            // Cap batch_size em 2 para 400M
+            let safe_batch = batch_size.min(2);
+            // Compensa no grad_accum se batch_size for reduzido
+            let scaling = batch_size as f32 / safe_batch as f32;
+            let new_accum = (grad_accum as f32 * scaling).ceil() as usize;
+            
+            (seq_len.min(512), new_accum, safe_batch)
+        },
+        "800m" | "800M" => {
+            // Cap batch_size em 1 para 800M
+            let safe_batch = batch_size.min(1);
+            let scaling = batch_size as f32 / safe_batch as f32;
+            let new_accum = (grad_accum as f32 * scaling).ceil() as usize;
+
+            (seq_len.min(256), new_accum, safe_batch)
+        },
+        "1b" | "1B" => (seq_len.min(192), grad_accum.min(2), batch_size.min(1)),
+        "1.5b" | "1.5B" => (seq_len.min(128), grad_accum.min(2), batch_size.min(1)),
+        _ => (seq_len.min(1024), grad_accum, batch_size),
     }
 }
 
@@ -1037,7 +1055,7 @@ fn resume_training(
 
     let device = get_device();
 
-    let (safe_seq_len, safe_grad_accum) = get_safe_config(model_size, seq_len, grad_accum);
+    let (safe_seq_len, safe_grad_accum, safe_batch) = get_safe_config(model_size, seq_len, grad_accum, batch_size);
 
     let mut model_config = get_model_config(model_size);
     model_config.max_seq_len = safe_seq_len;
@@ -1045,7 +1063,7 @@ fn resume_training(
 
     let train_config = TrainingConfig {
         learning_rate,
-        batch_size,
+        batch_size: safe_batch,
         gradient_accumulation_steps: safe_grad_accum,
         warmup_steps: 100,
         max_steps: additional_steps,
@@ -1099,7 +1117,7 @@ fn resume_training(
         save_every,
         eval_every,
         eval_samples,
-        batch_size,
+        safe_batch,
         output,
         &mut metrics_file,
         &device,
