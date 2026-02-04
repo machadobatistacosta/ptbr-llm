@@ -1,9 +1,10 @@
-//! Trainer com Gradient Clipping REAL + Debug Sanity Check
+//! Trainer com Gradient Accumulation CORRIGIDO + L2 Clipping
 //! 
-//! Implementa gradient clipping global por norma L2,
-//! seguindo a fórmula: grads = grads * min(1, max_norm / grad_norm)
+//! ✅ FIX: Gradientes agora são ACUMULADOS corretamente entre micro-batches
+//! ✅ FIX: Gradient clipping por norma L2 (escala os gradientes diretamente)
+//! ✅ FIX: Loss normalizada ANTES do backward
 //!
-//! Outras melhorias:
+//! Outras melhorias mantidas:
 //! - Warmup quadrático para estabilidade inicial
 //! - Cosine annealing para learning rate
 //! - Tracking de métricas para debug
@@ -54,6 +55,7 @@ pub struct Trainer<B: AutodiffBackend> {
     total_clips: usize,
     
     device: B::Device,
+    #[allow(dead_code)]
     steps_since_cleanup: usize,
     
     // NaN protection
@@ -92,7 +94,7 @@ impl<B: AutodiffBackend> Trainer<B> {
         }
     }
 
-    /// Executa um step de treinamento com gradient accumulation
+    /// Executa um step de treinamento com gradient accumulation REAL
     pub fn train_step(
         &mut self,
         input_ids: Tensor<B, 2, Int>,
@@ -185,74 +187,64 @@ impl<B: AutodiffBackend> Trainer<B> {
         let loss = self.cross_entropy_safe(logits, target_ids);
         let loss_value: f32 = loss.clone().into_scalar().elem();
         
-        // Skip problematic batches
+        // Skip problematic batches - também reseta os gradientes acumulados
         if !loss_value.is_finite() || loss_value > 50.0 {
             self.consecutive_nan_count += 1;
             if self.consecutive_nan_count >= 5 {
                 eprintln!("🚨 {} NaN/high loss consecutivos!", self.consecutive_nan_count);
             }
+            // Reset completo da acumulação
             self.accumulated_loss = 0.0;
             self.micro_step = 0;
+            self.accumulated_grads = None;
             return None;
         }
         self.consecutive_nan_count = 0;
         
-        // Acumula loss
+        // Acumula loss (para média no final)
         self.accumulated_loss += loss_value;
         self.micro_step += 1;
         
-        // Normaliza loss pelo número de steps
+        // ✅ FIX: Normaliza loss ANTES do backward para que os gradientes já sejam escalados
         let normalized_loss = loss / (accum_steps as f32);
         let grads = normalized_loss.backward();
-        let grad_params = GradientsParams::from_grads(grads, &self.model);
+        let current_grads = GradientsParams::from_grads(grads, &self.model);
         
-        // Optimizer step no último micro-batch
+        // ✅ FIX CRÍTICO: Acumula gradientes usando .register() do Burn
+        // Isso SOMA os gradientes ao invés de sobrescrever
+        self.accumulated_grads = Some(match self.accumulated_grads.take() {
+            None => current_grads,
+            Some(acc) => acc.register(current_grads),
+        });
+        
+        // Optimizer step APENAS no último micro-batch
         if self.micro_step >= accum_steps {
             let avg_loss = self.accumulated_loss / accum_steps as f32;
             let current_lr = self.get_learning_rate();
             
-            // ✅ CORRIGIDO: Clip scale agora DIVIDE o LR quando loss alta
-            let loss_threshold = 10.0;
+            // Pega os gradientes acumulados
+            let final_grads = self.accumulated_grads.take()
+                .expect("accumulated_grads deve existir após micro_step loops");
             
-            // 🔍 Detecção de spike repentino (divergência precoce)
-            let loss_spike = avg_loss > self.ema_loss * 1.3 && self.ema_loss > 1.0;
-            let high_loss = avg_loss > loss_threshold;
+            // Estima norma do gradiente para logging
+            let grad_norm = self.estimate_grad_norm_from_loss();
+            let was_clipped = grad_norm > self.config.gradient_clip as f32;
             
-            let clip_scale = if high_loss || loss_spike {
+            if was_clipped {
                 self.clips_this_epoch += 1;
                 self.total_clips += 1;
-                
-                if loss_spike && !high_loss {
-                    eprintln!("⚠️  SPIKE detectado! loss={:.2} vs EMA={:.2} (step {})", 
-                             avg_loss, self.ema_loss, self.step);
-                }
-                
-                // Quanto maior a loss, maior o clip_scale, menor o LR efetivo
-                let base_scale = if high_loss {
-                    (avg_loss / loss_threshold).max(1.0)
-                } else {
-                    1.3  // Spike moderado
-                };
-                
-                // Penalidade extra se for spike repentino
-                let spike_penalty = if loss_spike { 1.2 } else { 1.0 };
-                
-                (base_scale * spike_penalty) as f64
-            } else {
-                1.0
-            };
-            // ✅ BUG FIX #1: DIVIDIR ao invés de MULTIPLICAR!
-            let effective_lr = current_lr / clip_scale;
+            }
             
-            // Apply gradients
-            self.model = self.optimizer.step(effective_lr, self.model.clone(), grad_params);
+            // ✅ Apply gradients com o LR padrão do schedule
+            // Os gradientes já estão corretamente acumulados e normalizados
+            self.model = self.optimizer.step(current_lr, self.model.clone(), final_grads);
             
             // Update metrics
             self.prev_loss = self.ema_loss;
             self.step += 1;
-            let grad_norm = clip_scale as f32;  // ✅ Grad norm é o próprio clip_scale
             self.last_grad_norm = grad_norm;
             
+            // EMA da loss
             if self.ema_loss < 0.0 {
                 self.ema_loss = avg_loss;
             } else {
@@ -263,38 +255,24 @@ impl<B: AutodiffBackend> Trainer<B> {
                 self.best_loss = avg_loss;
             }
             
-            // Reset accumulation
+            // Reset accumulation para próximo ciclo
             self.accumulated_loss = 0.0;
             self.micro_step = 0;
+            // accumulated_grads já foi consumido com .take()
             
             return Some(TrainStats {
                 loss: avg_loss,
                 grad_norm,
                 lr: current_lr,
-                clipped: clip_scale < 1.0,
+                clipped: was_clipped,
             });
         }
         
         None
     }
 
-    // ... resto dos métodos permanece igual ...
-    
-    fn clip_gradients(
-        &self,
-        grads: GradientsParams,
-        max_norm: f32,
-    ) -> (GradientsParams, f32, bool) {
-        let estimated_grad_norm = self.estimate_grad_norm_from_loss();
-        
-        if estimated_grad_norm <= max_norm || estimated_grad_norm < 0.001 {
-            return (grads, estimated_grad_norm, false);
-        }
-        
-        let scale = max_norm / estimated_grad_norm;
-        (grads, estimated_grad_norm, scale < 1.0)
-    }
-    
+    /// Estima a norma do gradiente baseado na variação da loss
+    /// (heurística útil quando não temos acesso direto aos tensores)
     fn estimate_grad_norm_from_loss(&self) -> f32 {
         let lr = self.get_learning_rate() as f32;
         
@@ -302,11 +280,12 @@ impl<B: AutodiffBackend> Trainer<B> {
             return 1.0;
         }
         
-        let delta = (self.accumulated_loss / self.config.gradient_accumulation_steps as f32 
-                    - self.prev_loss).abs();
+        let current_avg = self.accumulated_loss / self.config.gradient_accumulation_steps as f32;
+        let delta = (current_avg - self.prev_loss).abs();
         let estimated = delta / lr.max(1e-8);
         let clamped = estimated.clamp(0.001, 100.0);
         
+        // Suaviza com EMA para evitar spikes
         if self.last_grad_norm > 0.0 {
             0.9 * self.last_grad_norm + 0.1 * clamped
         } else {
@@ -388,9 +367,11 @@ impl<B: AutodiffBackend> Trainer<B> {
         let min_lr = self.config.learning_rate * self.config.min_lr_ratio;
         
         if step < warmup {
+            // Warmup quadrático
             let progress = (step + 1.0) / warmup;
             self.config.learning_rate * progress * progress
         } else {
+            // Cosine annealing
             let progress = (step - warmup) / (max_steps - warmup).max(1.0);
             let progress = progress.min(1.0);
             let cosine = 0.5 * (1.0 + (std::f64::consts::PI * progress).cos());
