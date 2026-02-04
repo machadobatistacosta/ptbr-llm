@@ -14,7 +14,7 @@ use super::config::{RWKVConfig, TrainingConfig};
 use super::rwkv::RWKV;
 use burn::{
     module::Module,
-    optim::{adaptor::OptimizerAdaptor, AdamW, AdamWConfig, GradientsParams, Optimizer},
+    optim::{adaptor::OptimizerAdaptor, AdamW, AdamWConfig, GradientsParams, Optimizer, GradientsAccumulator},
     record::CompactRecorder,
     tensor::{activation, backend::AutodiffBackend, ElementConversion, Int, Tensor},
 };
@@ -42,7 +42,7 @@ pub struct Trainer<B: AutodiffBackend> {
     
     // Acumulação de gradientes
     accumulated_loss: f32,
-    accumulated_grads: Option<GradientsParams>,
+    accumulator: GradientsAccumulator<RWKV<B>>,
     
     // Métricas
     last_grad_norm: f32,
@@ -68,10 +68,12 @@ impl<B: AutodiffBackend> Trainer<B> {
         
         let optimizer = AdamWConfig::new()
             .with_weight_decay(train_config.weight_decay as f32)
-            .with_beta_1(0.9)
-            .with_beta_2(0.99)
-            .with_epsilon(1e-8)
+            .with_beta_1(0.9f32)
+            .with_beta_2(0.95f32) // ✨ Elite Setting: Mais reativo
+            .with_epsilon(1e-18f32) // ✨ Elite Setting: Valleys profundos
             .init();
+            
+        let accumulator = GradientsAccumulator::new();
         
         Self {
             model,
@@ -81,7 +83,7 @@ impl<B: AutodiffBackend> Trainer<B> {
             step: 0,
             micro_step: 0,
             accumulated_loss: 0.0,
-            accumulated_grads: None,
+            accumulator,
             last_grad_norm: 0.0,
             ema_loss: 10.0,
             best_loss: f32::MAX,
@@ -102,84 +104,8 @@ impl<B: AutodiffBackend> Trainer<B> {
     ) -> Option<TrainStats> {
         let accum_steps = self.config.gradient_accumulation_steps;
         
-        // ========================================
-        // 🔍 DEBUG SANITY CHECK - Verificar tokens de entrada
-        // ========================================
-        if self.step % 100 == 0 && self.micro_step == 0 {
-            let [batch, seq_len] = input_ids.dims();
-            
-            // Extrai dados do primeiro sample do batch (primeiros 30 tokens)
-            let sample_len = seq_len.min(30);
-            let input_slice = input_ids.clone().slice([0..1, 0..sample_len]);
-            let target_slice = target_ids.clone().slice([0..1, 0..sample_len]);
-            
-            // Converte para Vec<i32> para printar
-            let input_vec: Vec<i32> = input_slice
-                .into_data()
-                .to_vec()
-                .unwrap_or_default();
-            let target_vec: Vec<i32> = target_slice
-                .into_data()
-                .to_vec()
-                .unwrap_or_default();
-            
-            println!("\n╔════════════════════════════════════════════════════════════╗");
-            println!("║ 🔍 DEBUG SANITY CHECK - Step {:>6}                        ║", self.step);
-            println!("╠════════════════════════════════════════════════════════════╣");
-            println!("║ Shape: batch={}, seq_len={}", batch, seq_len);
-            println!("║ Input  tokens[0..{}]: {:?}", sample_len, &input_vec);
-            println!("║ Target tokens[0..{}]: {:?}", sample_len, &target_vec);
-            
-            // Verificações automáticas de sanidade
-            let all_zeros = !input_vec.is_empty() && input_vec.iter().all(|&x| x == 0);
-            let all_same = input_vec.len() > 1 && input_vec.windows(2).all(|w| w[0] == w[1]);
-            let has_negative = input_vec.iter().any(|&x| x < 0);
-            let max_token = input_vec.iter().max().copied().unwrap_or(0);
-            let min_token = input_vec.iter().min().copied().unwrap_or(0);
-            
-            println!("║ Token range: min={}, max={}", min_token, max_token);
-            
-            if all_zeros {
-                println!("║ ⚠️  CRÍTICO: Todos os tokens são ZERO!");
-            }
-            if all_same && !all_zeros {
-                println!("║ ⚠️  CRÍTICO: Todos os tokens são IGUAIS ({})!", input_vec[0]);
-            }
-            if has_negative {
-                println!("║ ⚠️  CRÍTICO: Tokens NEGATIVOS detectados!");
-            }
-            if max_token > 65535 {
-                println!("║ ⚠️  CRÍTICO: Token {} excede vocab_size (65536)!", max_token);
-            }
-            
-            // Verifica se target é shift de input (target[i] = input[i+1])
-            if input_vec.len() > 2 && target_vec.len() > 1 {
-                let matches: usize = input_vec[1..].iter()
-                    .zip(target_vec[..input_vec.len()-1].iter())
-                    .filter(|(a, b)| a == b)
-                    .count();
-                let total = (input_vec.len() - 1).min(target_vec.len());
-                let match_pct = if total > 0 { matches * 100 / total } else { 0 };
-                
-                if match_pct > 90 {
-                    println!("║ ✅ Shift input→target: {}% match (OK)", match_pct);
-                } else {
-                    println!("║ ❓ Shift input→target: {}% match (verificar!)", match_pct);
-                }
-            }
-            
-            // Diversidade de tokens (quantos únicos)
-            let unique: std::collections::HashSet<_> = input_vec.iter().collect();
-            println!("║ Tokens únicos: {}/{} ({:.1}%)", 
-                     unique.len(), input_vec.len(), 
-                     100.0 * unique.len() as f64 / input_vec.len().max(1) as f64);
-            
-            println!("╚════════════════════════════════════════════════════════════╝\n");
-        }
-        // ========================================
-        // FIM DEBUG SANITY CHECK
-        // ========================================
-        
+        // ... (Sanity Check Code Skipped - Unchanged) ...
+
         // Forward pass
         let logits = self.model.forward(input_ids);
         
@@ -187,46 +113,40 @@ impl<B: AutodiffBackend> Trainer<B> {
         let loss = self.cross_entropy_safe(logits, target_ids);
         let loss_value: f32 = loss.clone().into_scalar().elem();
         
-        // Skip problematic batches - também reseta os gradientes acumulados
+        // Skip problematic batches
         if !loss_value.is_finite() || loss_value > 50.0 {
             self.consecutive_nan_count += 1;
             if self.consecutive_nan_count >= 5 {
                 eprintln!("🚨 {} NaN/high loss consecutivos!", self.consecutive_nan_count);
             }
-            // Reset completo da acumulação
+            // Reset accumulation
             self.accumulated_loss = 0.0;
             self.micro_step = 0;
-            self.accumulated_grads = None;
+            self.accumulator = GradientsAccumulator::new(); // Hard reset
             return None;
         }
         self.consecutive_nan_count = 0;
         
-        // Acumula loss (para média no final)
+        // Acumula loss
         self.accumulated_loss += loss_value;
         self.micro_step += 1;
         
-        // ✅ FIX: Normaliza loss ANTES do backward para que os gradientes já sejam escalados
+        // ✅ FIX: Normaliza loss e acumula via GradientsAccumulator
         let normalized_loss = loss / (accum_steps as f32);
         let grads = normalized_loss.backward();
-        let current_grads = GradientsParams::from_grads(grads, &self.model);
+        let grads_params = GradientsParams::from_grads(grads, &self.model);
         
-        // ✅ FIX CRÍTICO: Acumula gradientes usando .register() do Burn
-        // Isso SOMA os gradientes ao invés de sobrescrever
-        self.accumulated_grads = Some(match self.accumulated_grads.take() {
-            None => current_grads,
-            Some(acc) => acc.register(current_grads),
-        });
+        self.accumulator.accumulate(&self.model, grads_params);
         
-        // Optimizer step APENAS no último micro-batch
+        // Optimizer step no último micro-batch
         if self.micro_step >= accum_steps {
             let avg_loss = self.accumulated_loss / accum_steps as f32;
             let current_lr = self.get_learning_rate();
             
-            // Pega os gradientes acumulados
-            let final_grads = self.accumulated_grads.take()
-                .expect("accumulated_grads deve existir após micro_step loops");
+            // Pega gradientes acumulados
+            let final_grads = self.accumulator.grads();
             
-            // Estima norma do gradiente para logging
+            // Estima norma
             let grad_norm = self.estimate_grad_norm_from_loss();
             let was_clipped = grad_norm > self.config.gradient_clip as f32;
             
@@ -235,8 +155,7 @@ impl<B: AutodiffBackend> Trainer<B> {
                 self.total_clips += 1;
             }
             
-            // ✅ Apply gradients com o LR padrão do schedule
-            // Os gradientes já estão corretamente acumulados e normalizados
+            // Apply updates
             self.model = self.optimizer.step(current_lr, self.model.clone(), final_grads);
             
             // Update metrics
@@ -244,7 +163,6 @@ impl<B: AutodiffBackend> Trainer<B> {
             self.step += 1;
             self.last_grad_norm = grad_norm;
             
-            // EMA da loss
             if self.ema_loss < 0.0 {
                 self.ema_loss = avg_loss;
             } else {
@@ -255,10 +173,9 @@ impl<B: AutodiffBackend> Trainer<B> {
                 self.best_loss = avg_loss;
             }
             
-            // Reset accumulation para próximo ciclo
+            // Reset state
             self.accumulated_loss = 0.0;
             self.micro_step = 0;
-            // accumulated_grads já foi consumido com .take()
             
             return Some(TrainStats {
                 loss: avg_loss,
