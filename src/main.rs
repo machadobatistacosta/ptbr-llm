@@ -195,6 +195,8 @@ enum Commands {
         eval_every: usize,
         #[arg(long, default_value = "100")]
         eval_samples: usize,
+        #[arg(long, default_value = "1.0")]
+        gradient_clip: f64,
     },
 
     /// Testa modelo com prompts
@@ -378,6 +380,7 @@ fn main() {
             seq_len,
             eval_every,
             eval_samples,
+            gradient_clip,
         } => resume_training(
             &checkpoint,
             &data,
@@ -391,6 +394,7 @@ fn main() {
             seq_len,
             eval_every,
             eval_samples,
+            gradient_clip,
         ),
 
         Commands::TestModel {
@@ -1045,6 +1049,7 @@ fn resume_training(
     seq_len: usize,
     eval_every: usize,
     eval_samples: usize,
+    gradient_clip: f64,
 ) {
     std::env::set_var("CUDA_VISIBLE_DEVICES", "0");
 
@@ -1068,7 +1073,7 @@ fn resume_training(
         warmup_steps: 100,
         max_steps: additional_steps,
         weight_decay: 0.01,
-        gradient_clip: 1.0,
+        gradient_clip,
         save_every,
         log_every: 10,
         min_lr_ratio: 0.1,
