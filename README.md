@@ -1,6 +1,6 @@
 # 🇧🇷 PTBR-LLM
 
-**Portuguese Brazilian Language Model — trained from scratch in Rust.**
+**PT-BR RWKV Large Language Model trained from scratch in Rust (Burn). Tokenizer + streaming data pipeline + checkpoints.**
 
 <p align="left">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-Apache--2.0-blue.svg" /></a>

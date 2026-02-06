@@ -970,6 +970,7 @@ fn train_model(
     )
     .expect("Erro escrevendo header");
 
+    // Training config
     let train_config = TrainingConfig {
         learning_rate,
         batch_size: safe_batch,
@@ -979,7 +980,7 @@ fn train_model(
         weight_decay: 0.01,
         gradient_clip,
         save_every,
-        log_every: 10,
+        log_every: 1, // Log every step for debug
         min_lr_ratio: 0.1,
         ..Default::default()
     };
@@ -1008,26 +1009,37 @@ fn train_model(
 }
 
 // Retorna (safe_seq_len, safe_grad_accum, safe_batch_size)
-fn get_safe_config(model_size: &str, seq_len: usize, grad_accum: usize, batch_size: usize) -> (usize, usize, usize) {
+fn get_safe_config(
+    model_size: &str,
+    seq_len: usize,
+    grad_accum: usize,
+    batch_size: usize,
+) -> (usize, usize, usize) {
     match model_size {
-        // T4 16GB Limits
         "400m" | "400M" => {
-            // Cap batch_size em 2 para 400M
-            let safe_batch = batch_size.min(2);
-            // Compensa no grad_accum se batch_size for reduzido
-            let scaling = batch_size as f32 / safe_batch as f32;
-            let new_accum = (grad_accum as f32 * scaling).ceil() as usize;
-            
-            (seq_len.min(512), new_accum, safe_batch)
-        },
+            // T4 16GB: 400M cabe com batch=2, seq=512
+            // Com batch=4, seq=256 também funciona
+            let safe_batch = batch_size.min(4);
+            let safe_seq = seq_len.min(512);
+
+            // Se batch*seq muito grande, reduz
+            if safe_batch * safe_seq > 1024 {
+                // batch=2, seq=512 ou batch=4, seq=256
+                let safe_batch = 2;
+                let safe_seq = seq_len.min(512);
+                let scaling = batch_size as f32 / safe_batch as f32;
+                let new_accum = (grad_accum as f32 * scaling).ceil() as usize;
+                (safe_seq, new_accum, safe_batch)
+            } else {
+                (safe_seq, grad_accum, safe_batch)
+            }
+        }
         "800m" | "800M" => {
-            // Cap batch_size em 1 para 800M
             let safe_batch = batch_size.min(1);
             let scaling = batch_size as f32 / safe_batch as f32;
             let new_accum = (grad_accum as f32 * scaling).ceil() as usize;
-
             (seq_len.min(256), new_accum, safe_batch)
-        },
+        }
         "1b" | "1B" => (seq_len.min(192), grad_accum.min(2), batch_size.min(1)),
         "1.5b" | "1.5B" => (seq_len.min(128), grad_accum.min(2), batch_size.min(1)),
         _ => (seq_len.min(1024), grad_accum, batch_size),
@@ -1064,8 +1076,15 @@ fn resume_training(
 
     let mut model_config = get_model_config(model_size);
     model_config.max_seq_len = safe_seq_len;
-    model_config.dropout = 0.05;
+    // model_config.dropout removed (configured in Config::default now)
 
+    // Force correct dimensions for T4
+    model_config.d_model = 1024;
+    model_config.d_ffn = 4096;
+    model_config.n_layers = 24;
+    model_config.vocab_size = 65536;
+    model_config.max_seq_len = seq_len;
+    // model_config.dropout removed (configured in Config::default now)
     let train_config = TrainingConfig {
         learning_rate,
         batch_size: safe_batch,

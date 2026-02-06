@@ -69,8 +69,8 @@ impl<B: AutodiffBackend> Trainer<B> {
         let optimizer = AdamWConfig::new()
             .with_weight_decay(train_config.weight_decay as f32)
             .with_beta_1(0.9f32)
-            .with_beta_2(0.95f32) // ✨ Elite Setting: Mais reativo
-            .with_epsilon(1e-18f32) // ✨ Elite Setting: Valleys profundos
+            .with_beta_2(0.99f32)
+            .with_epsilon(1e-8f32)
             .init();
             
         let accumulator = GradientsAccumulator::new();
