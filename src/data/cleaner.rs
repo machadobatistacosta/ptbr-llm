@@ -455,9 +455,10 @@ mod tests {
     #[test]
     fn test_clean_link() {
         let cleaner = WikiCleaner::new();
-        let input = "O [[Brasil|país]] é grande";
+        // Longer input to pass filter_lines (min 30 chars, 5 words)
+        let input = "O [[Brasil|pa\u{00ED}s]] \u{00E9} grande e muito bonito com suas praias e montanhas";
         let output = cleaner.clean(input);
-        assert!(output.contains("país"));
+        assert!(output.contains("pa\u{00ED}s"), "Output was: {}", output);
         assert!(!output.contains("[["));
     }
 

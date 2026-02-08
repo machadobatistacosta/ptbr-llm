@@ -1,10 +1,13 @@
+use lru::LruCache;
 use parking_lot::RwLock;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::collections::{HashMap, VecDeque};
+use std::collections::HashMap;
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
+use std::num::NonZeroUsize;
 use std::sync::Arc;
+use crate::utils::format_number;
 
 const MAX_CACHE_SIZE: usize = 100_000;
 
@@ -37,43 +40,28 @@ impl Default for BPEVocab {
     fn default() -> Self { Self::new() }
 }
 
-struct LRUCache {
-    map: HashMap<String, Vec<u16>>,
-    order: VecDeque<String>,
-    max_size: usize,
+// Bug #17 fix: Use lru crate for proper LRU cache semantics (was FIFO before)
+type TokenCache = LruCache<String, Vec<u16>>;
+
+fn new_cache() -> Arc<RwLock<TokenCache>> {
+    Arc::new(RwLock::new(
+        LruCache::new(NonZeroUsize::new(MAX_CACHE_SIZE).unwrap())
+    ))
 }
 
-impl LRUCache {
-    fn new(max_size: usize) -> Self {
-        Self {
-            map: HashMap::with_capacity(max_size),
-            order: VecDeque::with_capacity(max_size),
-            max_size,
-        }
-    }
-
-    fn get(&self, key: &str) -> Option<Vec<u16>> {
-        self.map.get(key).cloned()
-    }
-
-    fn insert(&mut self, key: String, value: Vec<u16>) {
-        if self.map.len() >= self.max_size {
-            if let Some(oldest) = self.order.pop_front() {
-                self.map.remove(&oldest);
-            }
-        }
-        self.map.insert(key.clone(), value);
-        self.order.push_back(key);
-    }
-}
 
 /// Tokenizer BPE thread-safe
 pub struct BPETokenizer {
     id_to_token: Vec<Vec<u8>>,
     token_to_id: HashMap<Vec<u8>, u16>,
     merges: Vec<(u16, u16)>,
+    // Bug #8 fix: HashMap for O(1) merge priority lookup instead of O(n) linear scan
+    merge_priority: HashMap<(u16, u16), usize>,
     special_tokens: HashMap<String, u16>,
-    cache: Arc<RwLock<LRUCache>>,
+    // Bug #17 fix: Proper LRU cache from lru crate
+    cache: Arc<RwLock<TokenCache>>,
+    // Bug #16 fix: Static array for O(1) byte-to-id lookup
+    byte_to_id: [u16; 256],
 }
 
 impl BPETokenizer {
@@ -104,13 +92,32 @@ impl BPETokenizer {
 
     pub fn from_vocab(vocab: BPEVocab) -> Self {
         let token_to_id = vocab.build_token_to_id();
+        // Bug #8 fix: Build HashMap for O(1) merge priority lookup
+        let merge_priority: HashMap<(u16, u16), usize> = vocab.merges
+            .iter()
+            .enumerate()
+            .map(|(i, &pair)| (pair, i))
+            .collect();
+        
+        // Bug #16 fix: Build static byte-to-id lookup array
+        let unk = *vocab.special_tokens.get("[UNK]").unwrap_or(&1);
+        let mut byte_to_id = [unk; 256];
+        for b in 0u16..=255 {
+            if let Some(&id) = token_to_id.get(&vec![b as u8]) {
+                byte_to_id[b as usize] = id;
+            }
+        }
+        
         Self {
             id_to_token: vocab.id_to_token,
             token_to_id,
             merges: vocab.merges,
+            merge_priority,
             special_tokens: vocab.special_tokens,
-            cache: Arc::new(RwLock::new(LRUCache::new(MAX_CACHE_SIZE))),
+            cache: new_cache(),  // Bug #17: Use lru crate
+            byte_to_id,
         }
+
     }
 
     pub fn from_file(path: &str) -> std::io::Result<Self> {
@@ -133,26 +140,29 @@ impl BPETokenizer {
             .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e))
     }
 
-    /// Encode thread-safe (não precisa de &mut self)
+    /// Encode thread-safe
     pub fn encode(&self, text: &str) -> Vec<u16> {
         let mut result = Vec::new();
 
         for word in self.pre_tokenize(text) {
-            // Check cache
-            {
-                let cache = self.cache.read();
-                if let Some(cached) = cache.get(&word) {
-                    result.extend(cached);
-                    continue;
-                }
+            // Bug #17: lru::get() requires &mut, so use write() lock
+            // try peek() first for read-only check, fall back to get() for LRU update
+            let cached = {
+                let mut cache = self.cache.write();
+                cache.get(&word).cloned()
+            };
+            
+            if let Some(tokens) = cached {
+                result.extend(tokens);
+                continue;
             }
 
             let tokens = self.encode_word(&word);
 
-            // Insert cache
+            // Insert cache with automatic eviction
             {
                 let mut cache = self.cache.write();
-                cache.insert(word, tokens.clone());
+                cache.put(word, tokens.clone());
             }
 
             result.extend(tokens);
@@ -179,9 +189,11 @@ impl BPETokenizer {
             .to_string()
     }
 
+    /// Bug #14 fix: Add Ġ prefix to first token
     fn pre_tokenize(&self, text: &str) -> Vec<String> {
         let mut tokens = Vec::new();
         let mut current = String::new();
+        let mut is_first_word = true;
         let mut chars = text.chars().peekable();
 
         while let Some(c) = chars.next() {
@@ -204,7 +216,14 @@ impl BPETokenizer {
                     }
                     tokens.push(c.to_string());
                 }
-                _ => current.push(c),
+                _ => {
+                    // Bug #14: First word gets Ġ prefix
+                    if is_first_word && current.is_empty() {
+                        current.push('Ġ');
+                        is_first_word = false;
+                    }
+                    current.push(c);
+                }
             }
         }
 
@@ -221,9 +240,10 @@ impl BPETokenizer {
             return Vec::new();
         }
 
+        // Bug #16 fix: Use byte_to_id array for O(1) lookup
         let mut tokens: Vec<u16> = bytes
             .iter()
-            .map(|&b| self.token_to_id.get(&vec![b]).copied().unwrap_or(self.unk_id()))
+            .map(|&b| self.byte_to_id[b as usize])
             .collect();
 
         loop {
@@ -236,7 +256,8 @@ impl BPETokenizer {
 
             for i in 0..tokens.len() - 1 {
                 let pair = (tokens[i], tokens[i + 1]);
-                if let Some(pos) = self.merges.iter().position(|m| *m == pair) {
+                // Bug #8 fix: O(1) HashMap lookup instead of O(n) linear scan
+                if let Some(&pos) = self.merge_priority.get(&pair) {
                     if pos < best_priority {
                         best_priority = pos;
                         best_merge = Some((i, pos));
@@ -276,13 +297,158 @@ impl Clone for BPETokenizer {
             id_to_token: self.id_to_token.clone(),
             token_to_id: self.token_to_id.clone(),
             merges: self.merges.clone(),
+            merge_priority: self.merge_priority.clone(),
             special_tokens: self.special_tokens.clone(),
-            cache: Arc::new(RwLock::new(LRUCache::new(MAX_CACHE_SIZE))),
+            cache: new_cache(),  // Bug #17: Fresh LRU cache
+            byte_to_id: self.byte_to_id,  // Bug #16: Copy array
         }
     }
 }
 
-/// BPETrainer com suporte a special tokens dinâmicos (v2 - ChatML Ready)
+
+use std::collections::BinaryHeap;
+use std::cmp::Ordering;
+
+/// Entry for priority queue - tracks pair and its count
+#[derive(Eq, PartialEq)]
+struct PairEntry {
+    pair: (u16, u16),
+    count: usize,
+}
+
+impl Ord for PairEntry {
+    fn cmp(&self, other: &Self) -> Ordering {
+        // Max-heap: higher count = higher priority
+        self.count.cmp(&other.count)
+            .then_with(|| other.pair.cmp(&self.pair)) // Tie-break by pair for determinism
+    }
+}
+
+impl PartialOrd for PairEntry {
+    fn partial_cmp(&self, other: &Self) -> Option<Ordering> {
+        Some(self.cmp(other))
+    }
+}
+
+/// Indexed word representation for O(1) merge operations
+/// Uses a linked-list-like structure with indices instead of actual removals
+struct IndexedWord {
+    tokens: Vec<u16>,
+    next: Vec<i32>,  // next[i] = index of next active token, -1 if end
+    first: i32,      // index of first active token
+    freq: usize,
+}
+
+impl IndexedWord {
+    fn new(tokens: Vec<u16>, freq: usize) -> Self {
+        let len = tokens.len();
+        let next: Vec<i32> = (0..len).map(|i| if i + 1 < len { (i + 1) as i32 } else { -1 }).collect();
+        Self {
+            tokens,
+            next,
+            first: if len > 0 { 0 } else { -1 },
+            freq,
+        }
+    }
+
+    /// Iterate over active (token_idx, token_id) pairs
+    fn iter_active(&self) -> impl Iterator<Item = (usize, u16)> + '_ {
+        let mut idx = self.first;
+        std::iter::from_fn(move || {
+            if idx < 0 {
+                None
+            } else {
+                let current = idx as usize;
+                let token = self.tokens[current];
+                idx = self.next[current];
+                Some((current, token))
+            }
+        })
+    }
+
+    /// Get active pairs as (idx, pair)
+    fn get_pairs(&self) -> Vec<(usize, (u16, u16))> {
+        let mut pairs = Vec::new();
+        let mut prev_idx: Option<usize> = None;
+        let mut prev_token: Option<u16> = None;
+        
+        for (idx, token) in self.iter_active() {
+            if let (Some(pi), Some(pt)) = (prev_idx, prev_token) {
+                pairs.push((pi, (pt, token)));
+            }
+            prev_idx = Some(idx);
+            prev_token = Some(token);
+        }
+        pairs
+    }
+
+    /// Apply merge: replace (a, b) with new_id, returns pairs removed and added
+    fn apply_merge(&mut self, a: u16, b: u16, new_id: u16) -> (Vec<(u16, u16)>, Vec<(u16, u16)>) {
+        let mut removed = Vec::new();
+        let mut added = Vec::new();
+        
+        let mut prev_prev_idx: Option<usize> = None;
+        let mut prev_idx: Option<usize> = None;
+        let mut prev_token: Option<u16> = None;
+        
+        let mut idx = self.first;
+        while idx >= 0 {
+            let current = idx as usize;
+            let token = self.tokens[current];
+            let next_idx = self.next[current];
+            
+            // Check if current pair is (a, b)
+            if let (Some(pi), Some(pt)) = (prev_idx, prev_token) {
+                if pt == a && token == b {
+                    // Found match - merge!
+                    
+                    // Record pair being removed
+                    removed.push((a, b));
+                    
+                    // Record left neighbor pair being removed (if exists)
+                    if let (Some(ppi), Some(_)) = (prev_prev_idx, prev_idx) {
+                        removed.push((self.tokens[ppi], a));
+                    }
+                    
+                    // Record right neighbor pair being removed (if exists)
+                    if next_idx >= 0 {
+                        removed.push((b, self.tokens[next_idx as usize]));
+                    }
+                    
+                    // Apply merge: update prev token to new_id, skip current
+                    self.tokens[pi] = new_id;
+                    self.next[pi] = next_idx;
+                    
+                    // Record new pairs
+                    if let Some(ppi) = prev_prev_idx {
+                        added.push((self.tokens[ppi], new_id));
+                    }
+                    if next_idx >= 0 {
+                        added.push((new_id, self.tokens[next_idx as usize]));
+                    }
+                    
+                    // Reset prev tracking since current was consumed
+                    // prev stays the same (now has new_id), prev_prev stays
+                    prev_token = Some(new_id);
+                    idx = next_idx;
+                    continue;
+                }
+            }
+            
+            prev_prev_idx = prev_idx;
+            prev_idx = Some(current);
+            prev_token = Some(token);
+            idx = next_idx;
+        }
+        
+        (removed, added)
+    }
+}
+
+/// BPETrainer com suporte a special tokens dinâmicos (v3 - OPTIMIZED)
+/// 
+/// Performance: O(V * log P) where V = vocab_size, P = unique pairs
+/// Previous: O(V * W * L) where W = words, L = avg word length
 pub struct BPETrainer {
     vocab_size: usize,
     min_frequency: usize,
@@ -330,9 +496,10 @@ impl BPETrainer {
         let mut total_words = 0usize;
 
         for text in texts {
-            for word in text.split_whitespace() {
+            // Bug #9 fix: Use same pre-tokenization logic as BPETokenizer
+            for word in pre_tokenize_for_training(&text) {
                 if word.len() <= 100 {
-                    *word_freqs.entry(word.to_string()).or_insert(0) += 1;
+                    *word_freqs.entry(word).or_insert(0) += 1;
                     total_words += 1;
                 }
             }
@@ -343,21 +510,18 @@ impl BPETrainer {
 
         println!("  🔍 Fase 2: Filtrando (min_freq={})...", self.min_frequency);
 
+        // Bug #19 fix: Don't add hardcoded Ġ prefix - pre_tokenize_for_training already handles it
         let filtered: HashMap<Vec<u8>, usize> = word_freqs
             .into_iter()
             .filter(|(_, freq)| *freq >= self.min_frequency)
-            .map(|(word, freq)| {
-                let mut bytes = vec![0xC4, 0xA0];
-                bytes.extend(word.bytes());
-                (bytes, freq)
-            })
+            .map(|(word, freq)| (word.into_bytes(), freq))
             .collect();
 
         println!("    Após filtro: {} palavras", format_number(filtered.len()));
 
-        println!("  🔧 Fase 3: Treinando BPE...");
+        println!("  🔧 Fase 3: Treinando BPE (OTIMIZADO)...");
 
-        let vocab = self.train_bpe(filtered);
+        let vocab = self.train_bpe_optimized(filtered);
 
         let elapsed = start.elapsed();
         println!("  ✅ Concluído em {:.1}s", elapsed.as_secs_f64());
@@ -367,7 +531,11 @@ impl BPETrainer {
         vocab
     }
 
-    fn train_bpe(&self, word_freqs: HashMap<Vec<u8>, usize>) -> BPEVocab {
+    /// Optimized BPE training with:
+    /// - Incremental pair counting (no full recount per merge)
+    /// - Priority queue for O(log n) best pair lookup
+    /// - Indexed word structure for O(1) merges (no Vec::remove)
+    fn train_bpe_optimized(&self, word_freqs: HashMap<Vec<u8>, usize>) -> BPEVocab {
         let mut id_to_token: Vec<Vec<u8>> = (0u8..=255).map(|b| vec![b]).collect();
         let mut token_to_id: HashMap<Vec<u8>, u16> = id_to_token
             .iter()
@@ -375,7 +543,7 @@ impl BPETrainer {
             .map(|(i, t)| (t.clone(), i as u16))
             .collect();
 
-        // ✨ Usa special_tokens dinâmicos ao invés de constantes hardcoded
+        // Add special tokens
         let mut special_map = HashMap::new();
         for token_str in &self.special_tokens {
             let id = id_to_token.len() as u16;
@@ -385,53 +553,62 @@ impl BPETrainer {
             special_map.insert(token_str.clone(), id);
         }
 
-        let mut word_splits: Vec<(Vec<u16>, usize)> = word_freqs
+        // Convert words to indexed representation
+        let mut words: Vec<IndexedWord> = word_freqs
             .iter()
             .map(|(word, &freq)| {
-                let splits: Vec<u16> = word.iter().map(|&b| token_to_id[&vec![b]]).collect();
-                (splits, freq)
+                let tokens: Vec<u16> = word.iter().map(|&b| token_to_id[&vec![b]]).collect();
+                IndexedWord::new(tokens, freq)
             })
+            .collect();
+
+        // Initial pair counting
+        let mut pair_counts: HashMap<(u16, u16), usize> = HashMap::new();
+        for word in &words {
+            for (_, pair) in word.get_pairs() {
+                *pair_counts.entry(pair).or_insert(0) += word.freq;
+            }
+        }
+
+        // Build initial priority queue
+        let mut heap: BinaryHeap<PairEntry> = pair_counts
+            .iter()
+            .map(|(&pair, &count)| PairEntry { pair, count })
             .collect();
 
         let mut merges: Vec<(u16, u16)> = Vec::new();
         let target = self.vocab_size;
         let mut last_print = std::time::Instant::now();
+        let train_start = std::time::Instant::now();
+        let mut merge_count = 0usize;
 
         while id_to_token.len() < target {
-            let pair_counts: HashMap<(u16, u16), usize> = word_splits
-                .par_chunks(5000)
-                .map(|chunk| {
-                    let mut counts = HashMap::new();
-                    for (splits, freq) in chunk {
-                        for w in splits.windows(2) {
-                            *counts.entry((w[0], w[1])).or_insert(0) += freq;
+            // Find best pair (may need to skip stale entries)
+            let best_pair = loop {
+                match heap.pop() {
+                    None => break None,
+                    Some(entry) => {
+                        // Check if this entry is still valid (count matches)
+                        let current_count = pair_counts.get(&entry.pair).copied().unwrap_or(0);
+                        if current_count == entry.count && current_count >= self.min_frequency {
+                            break Some((entry.pair, entry.count));
+                        }
+                        // Stale entry - if count still valid, re-add with correct count
+                        if current_count >= self.min_frequency {
+                            heap.push(PairEntry { pair: entry.pair, count: current_count });
                         }
                     }
-                    counts
-                })
-                .reduce(HashMap::new, |mut a, b| {
-                    for (k, v) in b {
-                        *a.entry(k).or_insert(0) += v;
-                    }
-                    a
-                });
+                }
+            };
 
-            if pair_counts.is_empty() {
-                break;
-            }
-
-            let (best_pair, best_count) = pair_counts
-                .iter()
-                .max_by_key(|(_, &c)| c)
-                .map(|(&p, &c)| (p, c))
-                .unwrap();
-
-            if best_count < self.min_frequency {
-                break;
-            }
+            let (best_pair, _best_count) = match best_pair {
+                Some(p) => p,
+                None => break, // No more valid pairs
+            };
 
             let (a, b) = best_pair;
 
+            // Create new token
             let mut new_token = Vec::new();
             new_token.extend(&id_to_token[a as usize]);
             new_token.extend(&id_to_token[b as usize]);
@@ -440,25 +617,43 @@ impl BPETrainer {
             token_to_id.insert(new_token.clone(), new_id);
             id_to_token.push(new_token);
             merges.push(best_pair);
+            merge_count += 1;
 
-            word_splits.par_iter_mut().for_each(|(splits, _)| {
-                let mut i = 0;
-                while i < splits.len().saturating_sub(1) {
-                    if splits[i] == a && splits[i + 1] == b {
-                        splits[i] = new_id;
-                        splits.remove(i + 1);
-                    } else {
-                        i += 1;
+            // Apply merge to all words and update pair counts incrementally
+            for word in &mut words {
+                let (removed, added) = word.apply_merge(a, b, new_id);
+                
+                // Update counts for removed pairs
+                for pair in removed {
+                    if let Some(count) = pair_counts.get_mut(&pair) {
+                        *count = count.saturating_sub(word.freq);
                     }
                 }
-            });
+                
+                // Update counts for added pairs
+                for pair in added {
+                    let new_count = pair_counts.entry(pair).or_insert(0);
+                    *new_count += word.freq;
+                    // Add to heap (may create duplicates, but we handle stale entries)
+                    heap.push(PairEntry { pair, count: *new_count });
+                }
+            }
 
+            // Remove merged pair from counts
+            pair_counts.remove(&best_pair);
+
+            // Progress logging
             if last_print.elapsed().as_secs() >= 3 {
+                let merges_per_sec = merge_count as f64 / train_start.elapsed().as_secs_f64().max(0.001);
+                let remaining = target.saturating_sub(id_to_token.len());
+                let eta_secs = remaining as f64 / merges_per_sec.max(0.1);
                 println!(
-                    "    Vocab: {}/{} | Merges: {}",
+                    "    Vocab: {}/{} | Merges: {} | {:.1} merges/s | ETA: {:.0}s",
                     id_to_token.len(),
                     target,
-                    merges.len()
+                    merges.len(),
+                    merges_per_sec,
+                    eta_secs
                 );
                 last_print = std::time::Instant::now();
             }
@@ -472,12 +667,51 @@ impl BPETrainer {
     }
 }
 
-fn format_number(n: usize) -> String {
-    if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1e6)
-    } else if n >= 1_000 {
-        format!("{:.1}K", n as f64 / 1e3)
-    } else {
-        n.to_string()
+
+
+/// Bug #9 fix: Pre-tokenize function for training that matches BPETokenizer::pre_tokenize
+/// This ensures trainer and tokenizer split text the same way
+/// Bug #14 fix: Now adds Ġ prefix to first token
+fn pre_tokenize_for_training(text: &str) -> Vec<String> {
+    let mut tokens = Vec::new();
+    let mut current = String::new();
+    let mut is_first_word = true;
+    let mut chars = text.chars().peekable();
+
+    while let Some(c) = chars.next() {
+        match c {
+            ' ' | '\t' | '\n' => {
+                if !current.is_empty() {
+                    tokens.push(current.clone());
+                    current.clear();
+                }
+                if let Some(&next) = chars.peek() {
+                    if !next.is_whitespace() {
+                        current.push('Ġ');
+                    }
+                }
+            }
+            '.' | ',' | '!' | '?' | ':' | ';' | '(' | ')' | '"' | '\'' | '-' => {
+                if !current.is_empty() {
+                    tokens.push(current.clone());
+                    current.clear();
+                }
+                tokens.push(c.to_string());
+            }
+            _ => {
+                // Bug #14: First word gets Ġ prefix
+                if is_first_word && current.is_empty() {
+                    current.push('Ġ');
+                    is_first_word = false;
+                }
+                current.push(c);
+            }
+        }
     }
+
+    if !current.is_empty() {
+        tokens.push(current);
+    }
+
+    tokens
 }

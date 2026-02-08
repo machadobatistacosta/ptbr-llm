@@ -35,8 +35,9 @@ pub struct RWKVConfig {
 }
 
 impl RWKVConfig {
-    /// 85M - Baseline rápido
-    pub fn ptbr_85m() -> Self {
+    /// Bug #11 fix: Renamed from ptbr_85m - actual params ~140M not 85M
+    /// ~140M params: d_model=768, n_layers=12, d_ffn=3072 (with weight tying)
+    pub fn ptbr_140m() -> Self {
         Self {
             vocab_size: 65_536,
             d_model: 768,
@@ -207,7 +208,7 @@ pub struct TrainingConfig {
     #[config(default = "10000")]
     pub max_steps: usize,
 
-    #[config(default = "0.01")]
+    #[config(default = "0.001")]
     pub weight_decay: f64,
 
     #[config(default = "1.0")]
@@ -231,7 +232,7 @@ impl Default for TrainingConfig {
             gradient_accumulation_steps: 16,
             warmup_steps: 200,
             max_steps: 10_000,
-            weight_decay: 0.01,
+            weight_decay: 0.001,  // Bug #10 fix: reduced from 0.01
             gradient_clip: 1.0,
             save_every: 500,
             log_every: 10,
@@ -248,7 +249,7 @@ impl TrainingConfig {
             gradient_accumulation_steps: 32,  // ✅ effective batch = 64
             warmup_steps: 300,
             max_steps: 50_000,
-            weight_decay: 0.01,
+            weight_decay: 0.001,  // Bug #20 fix: consistent with default
             gradient_clip: 1.0,
             save_every: 1000,
             log_every: 1,
@@ -263,7 +264,7 @@ impl TrainingConfig {
             gradient_accumulation_steps: 32,
             warmup_steps: 500,
             max_steps: 50_000,
-            weight_decay: 0.01,
+            weight_decay: 0.001,  // Bug #20 fix: consistent with default
             gradient_clip: 1.0,
             save_every: 1000,
             log_every: 1,

@@ -13,6 +13,7 @@
 use super::config::{RWKVConfig, TrainingConfig};
 use super::rwkv::RWKV;
 use burn::{
+    grad_clipping::GradientClippingConfig,
     module::Module,
     optim::{adaptor::OptimizerAdaptor, AdamW, AdamWConfig, GradientsParams, Optimizer, GradientsAccumulator},
     record::CompactRecorder,
@@ -66,12 +67,16 @@ impl<B: AutodiffBackend> Trainer<B> {
     pub fn new(model_config: &RWKVConfig, train_config: TrainingConfig, device: B::Device) -> Self {
         let model = RWKV::new(model_config, &device);
         
+        // Bug #10 fix: weight_decay default reduced to 0.001 in TrainingConfig
+        // Bug #1 fix: Real gradient clipping via Burn's GradientClippingConfig
         let optimizer = AdamWConfig::new()
             .with_weight_decay(train_config.weight_decay as f32)
             .with_beta_1(0.9f32)
             .with_beta_2(0.99f32)
             .with_epsilon(1e-8f32)
+            .with_grad_clipping(Some(GradientClippingConfig::Norm(train_config.gradient_clip as f32)))
             .init();
+
             
         let accumulator = GradientsAccumulator::new();
         
@@ -85,7 +90,7 @@ impl<B: AutodiffBackend> Trainer<B> {
             accumulated_loss: 0.0,
             accumulator,
             last_grad_norm: 0.0,
-            ema_loss: 10.0,
+            ema_loss: f32::NAN,  // Bug #15 fix: Use NaN to detect first value
             best_loss: f32::MAX,
             prev_loss: 10.0,
             clips_this_epoch: 0,
@@ -146,14 +151,11 @@ impl<B: AutodiffBackend> Trainer<B> {
             // Pega gradientes acumulados
             let final_grads = self.accumulator.grads();
             
-            // Estima norma
-            let grad_norm = self.estimate_grad_norm_from_loss();
-            let was_clipped = grad_norm > self.config.gradient_clip as f32;
-            
-            if was_clipped {
-                self.clips_this_epoch += 1;
-                self.total_clips += 1;
-            }
+            // Bug #2 fix: Removed fake estimate_grad_norm_from_loss()
+            // Gradient clipping is now handled by Burn's optimizer (GradientClippingConfig)
+            // We report 0.0 for grad_norm since we don't compute it manually
+            let grad_norm = 0.0f32;
+            let was_clipped = false; // Burn handles clipping internally
             
             // Apply updates
             self.model = self.optimizer.step(current_lr, self.model.clone(), final_grads);
@@ -163,7 +165,8 @@ impl<B: AutodiffBackend> Trainer<B> {
             self.step += 1;
             self.last_grad_norm = grad_norm;
             
-            if self.ema_loss < 0.0 {
+            // Bug #15 fix: Use is_nan() instead of < 0.0
+            if self.ema_loss.is_nan() {
                 self.ema_loss = avg_loss;
             } else {
                 self.ema_loss = 0.99 * self.ema_loss + 0.01 * avg_loss;
@@ -188,27 +191,8 @@ impl<B: AutodiffBackend> Trainer<B> {
         None
     }
 
-    /// Estima a norma do gradiente baseado na variação da loss
-    /// (heurística útil quando não temos acesso direto aos tensores)
-    fn estimate_grad_norm_from_loss(&self) -> f32 {
-        let lr = self.get_learning_rate() as f32;
-        
-        if self.step == 0 || lr < 1e-10 {
-            return 1.0;
-        }
-        
-        let current_avg = self.accumulated_loss / self.config.gradient_accumulation_steps as f32;
-        let delta = (current_avg - self.prev_loss).abs();
-        let estimated = delta / lr.max(1e-8);
-        let clamped = estimated.clamp(0.001, 100.0);
-        
-        // Suaviza com EMA para evitar spikes
-        if self.last_grad_norm > 0.0 {
-            0.9 * self.last_grad_norm + 0.1 * clamped
-        } else {
-            clamped
-        }
-    }
+    // Bug #2: Removed estimate_grad_norm_from_loss() - was fake heuristic
+    // Real gradient clipping is now handled by Burn's GradientClippingConfig
 
     fn cross_entropy_safe(
         &self,

@@ -1,6 +1,7 @@
 //! PTBR-LLM: Language Model para Português Brasileiro
 
 pub mod data;
+pub mod error;
 pub mod model;
 pub mod tokenizer;
 pub mod logger;
@@ -8,8 +9,8 @@ pub mod utils;
 
 // Re-exports principais
 pub use data::{DataLoader, MmapDataset, TokenizedDatasetWriter, WikiCleaner, DirtySample, WikiStreamParser};
-pub use model::{RWKVConfig, Trainer, TrainingConfig, RWKV};
-pub use tokenizer::{BPETokenizer, BPETrainer, PTBRNormalizer};
+pub use model::{RWKVConfig, Trainer, TrainingConfig, RWKV, RWKVState, TrainStats};
+pub use tokenizer::{BPETokenizer, BPETrainer, PTBRNormalizer, BPEVocab};
 
 /// Retorna nome do backend ativo
 pub fn backend_name() -> &'static str {

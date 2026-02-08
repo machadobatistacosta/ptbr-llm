@@ -18,11 +18,15 @@ use burn::{
 };
 
 /// Estado do modelo para geração autoregressiva
+/// Bug #4 fix: Separated prev_embedding into prev_time_input (post-LN1) and prev_channel_input (post-LN2)
 #[derive(Clone, Debug)]
 pub struct RWKVState<B: Backend> {
     pub time_state: Vec<(Tensor<B, 2>, Tensor<B, 2>, Tensor<B, 2>)>,
     pub channel_state: Vec<Tensor<B, 2>>,
-    pub prev_embedding: Vec<Tensor<B, 2>>,
+    /// Bug #4: Post-LN1 output from previous timestep (for token_shift in TimeMixing)
+    pub prev_time_input: Vec<Tensor<B, 2>>,
+    /// Bug #4: Post-LN2 output from previous timestep (for token_shift in ChannelMixing)
+    pub prev_channel_input: Vec<Tensor<B, 2>>,
 }
 
 impl<B: Backend> RWKVState<B> {
@@ -38,7 +42,10 @@ impl<B: Backend> RWKVState<B> {
             channel_state: (0..n_layers)
                 .map(|_| Tensor::zeros([batch_size, d_model], device))
                 .collect(),
-            prev_embedding: (0..n_layers)
+            prev_time_input: (0..n_layers)
+                .map(|_| Tensor::zeros([batch_size, d_model], device))
+                .collect(),
+            prev_channel_input: (0..n_layers)
                 .map(|_| Tensor::zeros([batch_size, d_model], device))
                 .collect(),
         }
@@ -54,7 +61,8 @@ impl<B: Backend> RWKVState<B> {
                 Tensor::zeros([batch_size, d_model], device),
             );
             self.channel_state[i] = Tensor::zeros([batch_size, d_model], device);
-            self.prev_embedding[i] = Tensor::zeros([batch_size, d_model], device);
+            self.prev_time_input[i] = Tensor::zeros([batch_size, d_model], device);
+            self.prev_channel_input[i] = Tensor::zeros([batch_size, d_model], device);
         }
     }
 }
@@ -161,14 +169,15 @@ impl<B: Backend> RWKV<B> {
         let mut x = x.reshape([b, self.d_model]);
 
         for (layer_idx, block) in self.blocks.iter().enumerate() {
-            let prev_emb = state.prev_embedding[layer_idx].clone();
+            // Bug #4 fix: Pass mutable refs to prev_time_input and prev_channel_input
+            // Block will save post-LN1 and post-LN2 outputs respectively
             x = block.forward_step(
-                x.clone(),
+                x,
                 &mut state.time_state[layer_idx],
                 &mut state.channel_state[layer_idx],
-                prev_emb,
+                &mut state.prev_time_input[layer_idx],
+                &mut state.prev_channel_input[layer_idx],
             );
-            state.prev_embedding[layer_idx] = x.clone();
         }
 
         let x = x.reshape([b, 1, self.d_model]);
@@ -230,24 +239,31 @@ impl<B: Backend> RWKVBlock<B> {
         let cm = self.channel_mixing.forward(ln2_out);
         x + self.dropout.forward(cm)
     }
-
+    /// Bug #4 COMPLETE FIX: forward_step now correctly saves post-LN outputs
     pub fn forward_step(
         &self,
         x: Tensor<B, 2>,
         time_state: &mut (Tensor<B, 2>, Tensor<B, 2>, Tensor<B, 2>),
         channel_state: &mut Tensor<B, 2>,
-        prev_embedding: Tensor<B, 2>,
+        prev_time_input: &mut Tensor<B, 2>,
+        prev_channel_input: &mut Tensor<B, 2>,
     ) -> Tensor<B, 2> {
         let [b, c] = x.dims();
 
+        // TimeMixing with post-LN1 token shift
         let x_3d = x.clone().reshape([b, 1, c]);
         let ln1_out = self.ln1.forward(x_3d).reshape([b, c]);
-        let tm = self.time_mixing.forward_step(ln1_out, time_state, prev_embedding);
-        let x = x + tm;  // ✅ SEM scale
+        let tm = self.time_mixing.forward_step(ln1_out.clone(), time_state, prev_time_input.clone());
+        *prev_time_input = ln1_out;  // Bug #4: Save POST-LN1 for next timestep
+        
+        let x = x + tm;
 
+        // ChannelMixing with post-LN2 token shift
         let ln2_out = self.ln2.forward(x.clone().reshape([b, 1, c])).reshape([b, c]);
-        let cm = self.channel_mixing.forward_step(ln2_out, channel_state);
-        x + cm  // ✅ SEM scale
+        let cm = self.channel_mixing.forward_step(ln2_out.clone(), channel_state);
+        *prev_channel_input = ln2_out;  // Bug #4: Save POST-LN2 for next timestep
+        
+        x + cm
     }
 }
 
@@ -299,12 +315,31 @@ impl<B: Backend> TimeMixing<B> {
             })
             .collect();
 
-        // Mix ratios
-        let mix_values: Vec<f32> = (0..d_model)
+        // Bug #12 fix: Separate mix ratio initialization per RWKV-4 paper
+        // mix_k: ddd = (1 - i/d_model) ^ ratio_1_to_almost_0
+        let mix_k_values: Vec<f32> = (0..d_model)
             .map(|i| {
-                let channel_ratio = i as f64 / (d_model - 1).max(1) as f64;
-                (ratio_1_to_almost_0 * (1.0 - channel_ratio)
-                    + 0.5 * channel_ratio) as f32
+                let ratio = i as f64 / (d_model - 1).max(1) as f64;
+                let ddd = 1.0 - ratio;
+                ddd.powf(ratio_1_to_almost_0) as f32
+            })
+            .collect();
+
+        // mix_v: same as mix_k but with +0.3 * layer_ratio offset
+        let mix_v_values: Vec<f32> = (0..d_model)
+            .map(|i| {
+                let ratio = i as f64 / (d_model - 1).max(1) as f64;
+                let ddd = 1.0 - ratio;
+                (ddd.powf(ratio_1_to_almost_0) + 0.3 * ratio_0_to_1) as f32
+            })
+            .collect();
+
+        // mix_r: uses HALF the ratio (more conservative)
+        let mix_r_values: Vec<f32> = (0..d_model)
+            .map(|i| {
+                let ratio = i as f64 / (d_model - 1).max(1) as f64;
+                let ddd = 1.0 - ratio;
+                ddd.powf(0.5 * ratio_1_to_almost_0) as f32
             })
             .collect();
 
@@ -320,14 +355,15 @@ impl<B: Backend> TimeMixing<B> {
                 Tensor::from_floats(first_values.as_slice(), device),
             ),
             time_mix_k: Param::from_tensor(
-                Tensor::from_floats(mix_values.as_slice(), device),
+                Tensor::from_floats(mix_k_values.as_slice(), device),
             ),
             time_mix_v: Param::from_tensor(
-                Tensor::from_floats(mix_values.as_slice(), device),
+                Tensor::from_floats(mix_v_values.as_slice(), device),
             ),
             time_mix_r: Param::from_tensor(
-                Tensor::from_floats(mix_values.as_slice(), device),
+                Tensor::from_floats(mix_r_values.as_slice(), device),
             ),
+
             d_model,
         }
     }

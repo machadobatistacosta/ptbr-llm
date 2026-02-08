@@ -6,6 +6,7 @@ use rayon::prelude::*;
 use std::fs::File;
 use std::io::{BufWriter, Write};
 use std::path::Path;
+use crate::utils::format_number;
 
 /// Erros do dataset
 #[derive(Debug)]
@@ -150,6 +151,39 @@ impl MmapDataset {
     pub fn next_epoch(&mut self) {
         self.epoch += 1;
     }
+
+    /// Bug #7 fix: Reserve last `val_ratio` of samples for validation
+    /// Returns the number of samples reserved for validation
+    /// These samples won't be included in training iteration, but Evaluator
+    /// will still access them via get() since we keep the same mmap
+    pub fn reserve_validation(&mut self, val_ratio: f64) -> usize {
+        let total = self.indices.len();
+        let val_count = ((total as f64 * val_ratio) as usize).max(100);
+        let train_count = total.saturating_sub(val_count);
+        
+        // Keep only training indices (first 90%)
+        // Validation uses get() directly with indices from [train_count..]
+        self.indices.truncate(train_count);
+        
+        println!(
+            "  📊 Bug #7 Train/Val split: {} train, {} val ({:.0}%/{:.0}%)",
+            format_number(train_count),
+            format_number(val_count),
+            (1.0 - val_ratio) * 100.0,
+            val_ratio * 100.0
+        );
+        
+        val_count
+    }
+    
+    /// Returns the total number of sequences (including validation)
+    /// Useful for Evaluator to know where validation samples start
+    pub fn original_len(&self) -> usize {
+        // After truncation, we need to recalculate
+        // For now, store original len or calculate from num_tokens
+        let num_sequences = (self.num_tokens - self.seq_len - 1) / self.seq_len;
+        num_sequences
+    }
 }
 
 pub struct DataLoader<'a> {
@@ -255,14 +289,4 @@ impl TokenizedDatasetWriter {
 
     #[allow(dead_code)]
     pub fn tokens_written(&self) -> usize { self.tokens_written }
-}
-
-fn format_number(n: usize) -> String {
-    if n >= 1_000_000 {
-        format!("{:.1}M", n as f64 / 1e6)
-    } else if n >= 1_000 {
-        format!("{:.1}K", n as f64 / 1e3)
-    } else {
-        n.to_string()
-    }
 }

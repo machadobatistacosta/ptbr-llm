@@ -43,12 +43,19 @@ parking_lot = "0.12"
 rand = "0.8"
 rand_chacha = "0.3"
 
+# Bug #17: Proper LRU cache
+lru = "0.12"
+
 # CLI
 clap = { version = "4.5", features = ["derive"] }
 
 # Logging
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+
+# Dev/Test dependencies
+[dev-dependencies]
+tempfile = "3"
 
 # ✨ RELEASE OTIMIZADO PARA PERFORMANCE
 [profile.release]
