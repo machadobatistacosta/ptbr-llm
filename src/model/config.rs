@@ -9,7 +9,7 @@ use burn::config::Config;
 
 #[derive(Config, Debug)]
 pub struct RWKVConfig {
-    #[config(default = "65536")]
+    #[config(default = "32000")]
     pub vocab_size: usize,
 
     #[config(default = "768")]
@@ -39,7 +39,7 @@ impl RWKVConfig {
     /// ~140M params: d_model=768, n_layers=12, d_ffn=3072 (with weight tying)
     pub fn ptbr_140m() -> Self {
         Self {
-            vocab_size: 65_536,
+            vocab_size: 32_000,
             d_model: 768,
             n_layers: 12,
             d_ffn: 3072,       // ✅ FIX: 4 * 768 (era 2688 = 3.5x)
@@ -53,7 +53,7 @@ impl RWKVConfig {
     /// 400M - OTIMIZADO para T4 16GB
     pub fn ptbr_400m() -> Self {
         Self {
-            vocab_size: 65_536,
+            vocab_size: 32_000,
             d_model: 1024,
             n_layers: 24,
             d_ffn: 4096,       // ✅ FIX: 4 * 1024 (era 3584 = 3.5x)
@@ -67,7 +67,7 @@ impl RWKVConfig {
     /// 800M - Para T4 com seq_len reduzido
     pub fn ptbr_800m() -> Self {
         Self {
-            vocab_size: 65_536,
+            vocab_size: 32_000,
             d_model: 1536,
             n_layers: 24,
             d_ffn: 6144,       // ✅ FIX: 4 * 1536
@@ -81,7 +81,7 @@ impl RWKVConfig {
     /// 1B - Limite T4
     pub fn ptbr_1b() -> Self {
         Self {
-            vocab_size: 65_536,
+            vocab_size: 32_000,
             d_model: 2048,
             n_layers: 24,
             d_ffn: 8192,       // ✅ FIX: 4 * 2048
@@ -95,7 +95,7 @@ impl RWKVConfig {
     /// 1.5B - Apenas inferência na T4
     pub fn ptbr_1_5b() -> Self {
         Self {
-            vocab_size: 65_536,
+            vocab_size: 32_000,
             d_model: 2304,
             n_layers: 28,
             d_ffn: 9216,       // ✅ FIX: 4 * 2304
