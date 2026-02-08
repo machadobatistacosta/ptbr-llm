@@ -137,13 +137,15 @@ impl<B: Backend> RWKV<B> {
 
         x = self.ln_out.forward(x);
 
-        // ✅ FIX: SEM scaling! RWKV oficial não escala logits.
+        // ✅ FIX: Add scaling for weight tying to normalize logit variance
         let logits = if self.use_weight_tying {
             let [b, t, d] = x.dims();
             let emb_weight = self.embedding.weight.val();
             let x_flat = x.reshape([b * t, d]);
             let logits_flat = x_flat.matmul(emb_weight.transpose());
-            logits_flat.reshape([b, t, self.vocab_size])
+            // Scale by 1/sqrt(d_model) to normalize variance
+            let scale = 1.0 / (d as f64).sqrt();
+            logits_flat.mul_scalar(scale as f32).reshape([b, t, self.vocab_size])
         } else {
             self.head.as_ref().unwrap().forward(x)
         };
@@ -183,11 +185,14 @@ impl<B: Backend> RWKV<B> {
         let x = x.reshape([b, 1, self.d_model]);
         let x = self.ln_out.forward(x);
 
-        // ✅ FIX: SEM scaling na inferência também
+        // ✅ FIX: Add scaling for weight tying (same as forward)
         let logits = if self.use_weight_tying {
             let x_flat = x.reshape([b, self.d_model]);
             let emb_weight = self.embedding.weight.val();
-            x_flat.matmul(emb_weight.transpose())
+            let logits = x_flat.matmul(emb_weight.transpose());
+            // Scale by 1/sqrt(d_model) to normalize variance
+            let scale = 1.0 / (self.d_model as f64).sqrt();
+            logits.mul_scalar(scale as f32)
         } else {
             self.head.as_ref().unwrap().forward(x).reshape([b, self.vocab_size])
         };
@@ -291,11 +296,7 @@ impl<B: Backend> TimeMixing<B> {
         device: &B::Device,
     ) -> Self {
         let linear_config = LinearConfig::new(d_model, d_model).with_bias(false);
-        
-        // Output MUST be zeros for identity init per RWKV-4
-        let zero_linear_config = LinearConfig::new(d_model, d_model)
-            .with_bias(false)
-            .with_initializer(Initializer::Zeros);
+        // Note: output uses same Kaiming init, scaling handled at logit level
 
         let ratio_0_to_1 = layer_id as f64 / (n_layers.max(1) - 1).max(1) as f64;
         let ratio_1_to_almost_0 = 1.0 - ratio_0_to_1;
@@ -352,7 +353,7 @@ impl<B: Backend> TimeMixing<B> {
             receptance: linear_config.clone().init(device),
             key: linear_config.clone().init(device),
             value: linear_config.clone().init(device),
-            output: zero_linear_config.init(device),
+            output: linear_config.init(device),
             time_decay: Param::from_tensor(
                 Tensor::from_floats(decay_values.as_slice(), device),
             ),
@@ -480,10 +481,9 @@ impl<B: Backend> ChannelMixing<B> {
                 .with_bias(false).init(device),
             key: LinearConfig::new(d_model, d_ffn)
                 .with_bias(false).init(device),
-            // Value MUST be zeros for identity init per RWKV-4
+            // Note: value uses Kaiming init, scaling handled at logit level
             value: LinearConfig::new(d_ffn, d_model)
                 .with_bias(false)
-                .with_initializer(Initializer::Zeros)
                 .init(device),
             time_mix_k: Param::from_tensor(
                 Tensor::from_floats(mix_values.as_slice(), device),
