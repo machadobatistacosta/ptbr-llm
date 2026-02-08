@@ -292,8 +292,7 @@ impl<B: Backend> TimeMixing<B> {
     ) -> Self {
         let linear_config = LinearConfig::new(d_model, d_model).with_bias(false);
         
-        // ✅ CRITICAL FIX: output projection MUST be zeros for identity init
-        // This ensures block starts as identity per RWKV-4 paper
+        // Output MUST be zeros for identity init per RWKV-4
         let zero_linear_config = LinearConfig::new(d_model, d_model)
             .with_bias(false)
             .with_initializer(Initializer::Zeros);
@@ -353,7 +352,7 @@ impl<B: Backend> TimeMixing<B> {
             receptance: linear_config.clone().init(device),
             key: linear_config.clone().init(device),
             value: linear_config.clone().init(device),
-            output: zero_linear_config.init(device),  // ← ZEROS for identity init
+            output: zero_linear_config.init(device),
             time_decay: Param::from_tensor(
                 Tensor::from_floats(decay_values.as_slice(), device),
             ),
@@ -481,7 +480,7 @@ impl<B: Backend> ChannelMixing<B> {
                 .with_bias(false).init(device),
             key: LinearConfig::new(d_model, d_ffn)
                 .with_bias(false).init(device),
-            // ✅ CRITICAL FIX: value projection MUST be zeros for identity init
+            // Value MUST be zeros for identity init per RWKV-4
             value: LinearConfig::new(d_ffn, d_model)
                 .with_bias(false)
                 .with_initializer(Initializer::Zeros)
