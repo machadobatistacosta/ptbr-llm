@@ -57,6 +57,7 @@ pub(crate) fn get_safe_config(
 pub(crate) fn run_training_loop(
     trainer: &mut Trainer<TrainBackend>,
     dataset: &mut MmapDataset,
+    val_dataset: Option<&MmapDataset>,
     tokenizer: &BPETokenizer,
     max_steps: usize,
     save_every: usize,
@@ -154,9 +155,10 @@ pub(crate) fn run_training_loop(
                     tokens_since_log = 0;
                 }
 
-                // Evaluation
+                // Evaluation - use val_dataset if available
                 if step % eval_every == 0 && step > 0 {
-                    let eval_metrics = evaluator.evaluate(&trainer.model.valid(), dataset, device);
+                    let eval_data = val_dataset.unwrap_or(dataset);
+                    let eval_metrics = evaluator.evaluate(&trainer.model.valid(), eval_data, device);
                     println!(
                         "  📊 Eval Step {} | {}",
                         step, eval_metrics
@@ -396,8 +398,33 @@ pub fn execute(
     let mut trainer: Trainer<TrainBackend> =
         Trainer::new(&model_config, train_config, device.clone());
 
-    // Bug #7 fix: Reserve 10% of data for validation
-    dataset.reserve_validation(0.1);
+    // Load validation dataset: use --val-data if provided, else split 10%
+    let val_dataset = if let Some(val_path) = val_data {
+        let val_path_resolved = if val_path.extension().map(|e| e == "bin").unwrap_or(false) {
+            val_path.clone()
+        } else if val_path.join("val.bin").exists() {
+            val_path.join("val.bin")
+        } else {
+            val_path.clone()
+        };
+        
+        println!("  📊 Validation dataset: {:?}", val_path_resolved);
+        match MmapDataset::from_file(&val_path_resolved, safe_seq_len) {
+            Ok(vd) => {
+                println!("  Val tokens: {}", format_number(vd.num_tokens()));
+                Some(vd)
+            }
+            Err(e) => {
+                eprintln!("  ⚠️ Erro carregando val dataset: {}, usando 10% do train", e);
+                dataset.reserve_validation(0.1);
+                None
+            }
+        }
+    } else {
+        println!("  📊 Sem --val-data, usando 10% do train como validação");
+        dataset.reserve_validation(0.1);
+        None
+    };
 
     println!("═══════════════════════════════════════════════════════════");
     println!("  Iniciando loop de treino...");
@@ -407,6 +434,7 @@ pub fn execute(
     run_training_loop(
         &mut trainer,
         &mut dataset,
+        val_dataset.as_ref(),
         &tokenizer,
         max_steps,
         save_every,

@@ -95,12 +95,34 @@ pub fn execute(
     println!("  Continuando do step {}...", trainer.step());
     println!();
 
-    // Bug #7 fix: Reserve 10% of data for validation
-    dataset.reserve_validation(0.1);
+    // Load validation dataset: use --val-data if provided, else split 10%
+    let val_dataset = if let Some(val_path) = val_data {
+        let val_path_resolved = if val_path.extension().map(|e| e == "bin").unwrap_or(false) {
+            val_path.clone()
+        } else if val_path.join("val.bin").exists() {
+            val_path.join("val.bin")
+        } else {
+            val_path.clone()
+        };
+        
+        println!("  📊 Validation dataset: {:?}", val_path_resolved);
+        match MmapDataset::from_file(&val_path_resolved, safe_seq_len) {
+            Ok(vd) => Some(vd),
+            Err(e) => {
+                eprintln!("  ⚠️ Erro carregando val dataset: {}, usando 10% do train", e);
+                dataset.reserve_validation(0.1);
+                None
+            }
+        }
+    } else {
+        dataset.reserve_validation(0.1);
+        None
+    };
 
     run_training_loop(
         &mut trainer,
         &mut dataset,
+        val_dataset.as_ref(),
         &tokenizer,
         additional_steps,
         save_every,
