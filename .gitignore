@@ -36,4 +36,13 @@ Thumbs.db/corpus.txt
 
 # Debug files
 *.txt
-!requirements.txt
+*.tsv
+ASSET_BUILD_LOG.md
+FINAL_INTEGRATION_REPORT.md
+SCALE_UP_1B.md
+projeto_dump.txt
+
+
+# Scripts & Automation (Local only)
+scripts/
+

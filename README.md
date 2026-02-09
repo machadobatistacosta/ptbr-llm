@@ -29,166 +29,100 @@
 
 | Size | Parameters | VRAM (Train) | VRAM (Inference) | Status |
 |------|------------|--------------|------------------|--------|
-| **85M** | 85 million | ~2GB | ~200MB | ⚙️ Ready |
-| **170M** | 170 million | ~4GB | ~400MB | ⚙️ Ready |
+| **140M** | 140 million | ~3GB | ~300MB | ⚙️ Ready |
 | **400M** | 418 million | ~7GB | ~1GB | 🔄 Training |
+| **800M** | 800 million | ~12GB | ~1.8GB | ⚙️ Ready |
 | **1B** | 1 billion | ~16GB | ~2GB | ⚙️ Ready |
 | **1.5B** | 1.5 billion | ~24GB | ~3GB | ⚙️ Ready |
 
-> **Note:** RWKV inference memory is dramatically lower than training. 1B+ models require A100 or multi-GPU setup.
+> **Note:** RWKV inference memory is dramatically lower than training.
 
 ---
 
-## 📚 Dataset (V17)
+## 📚 Dataset (V17 "Balanced Soberania")
 
 | Metric | Value |
 |--------|-------|
-| **Total Tokens** | 378M |
+| **Total Tokens** | ~545M |
 | **Vocabulary** | 32,000 (BPE) |
-| **Documents** | 2.4M |
-| **Sources** | Wikipedia, Wikisource, Wikibooks, Brazilian Laws |
-| **Cleaning** | V14 pipeline (code removal, dedup, encoding fixes) |
+| **Documents** | ~2.4M |
+| **Sources** | Wikipedia, Wikisource, Wikibooks, Brazilian Laws, Literature |
+| **Cleaning** | Custom V14 pipeline (dedup, encoding fixes, quality filters) |
 | **License** | CC BY-SA / Public Domain |
 
 ---
 
-## 🛠️ Full Pipeline
+## 🛠️ Usage
 
 ### Prerequisites
 
 ```bash
 # Install Rust
 curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh
-
-# For GPU training (optional)
-# Ensure CUDA toolkit is installed
 ```
 
 ### 1. Train Tokenizer
 
 ```bash
 cargo run --release -- train-tokenizer \
-  --corpus data/tokenizer_full_input_cleaned \
+  --corpus data/corpus_clean \
   --output data/tokenizer \
   --vocab-size 32000
 ```
 
-### 2. Build Dataset
+### 2. Build Binary Dataset
 
 ```bash
 cargo run --release -- build-dataset \
   --tokenizer data/tokenizer/tokenizer.json \
   --output data/tokenizer/train.bin \
-  --source data/tokenizer_full_input_cleaned \
+  --source data/corpus_clean \
   --clean
 ```
 
 ### 3. Train Model
 
-**Local (85M):**
+**Local (CPU/CUDA):**
 
 ```bash
-cargo run --release -- train \
-  --data data/tokenizer \
+cargo run --release --features cuda -- train \
+  --data data/tokenizer/train.bin \
+  --val-data data/tokenizer/val.bin \
   --tokenizer data/tokenizer/tokenizer.json \
   --output checkpoints \
-  --model-size 85m \
-  --max-steps 10000 \
-  --batch-size 2 \
-  --grad-accum 8 \
+  --model-size 400m \
+  --max-steps 50000 \
+  --batch-size 4 \
+  --grad-accum 4 \
   --seq-len 256
 ```
 
-**Kaggle GPU (400M):**
+### 4. Inference
 
 ```bash
-./target/release/ptbr-llm train \
-  --data /kaggle/input/dataset/tokenizer/train.bin \
-  --tokenizer /kaggle/input/dataset/tokenizer.json \
-  --output /kaggle/working/checkpoints \
-  --model-size 400m \
-  --max-steps 5000 \
-  --batch-size 4 \
-  --grad-accum 4 \
-  --seq-len 256 \
-  --eval-every 99999
-```
-
-### 4. Generate Text
-
-```bash
-cargo run --release -- generate \
-  --model checkpoints/step_5000.mpk \
+cargo run --release --features cuda -- generate \
+  --model checkpoints/step_50000 \
   --tokenizer data/tokenizer/tokenizer.json \
-  --prompt "O Brasil é um país" \
-  --max-tokens 50 \
+  --prompt "O futuro da inteligência artificial no Brasil é" \
+  --max-tokens 100 \
   --temperature 0.7 \
   --model-size 400m
 ```
 
 ---
 
-## 🚀 Kaggle Quick Start
+## 🚀 Technical Details
 
-```python
-# Install Rust
-!curl --proto '=https' --tlsv1.2 -sSf https://sh.rustup.rs | sh -s -- -y
-import os
-os.environ['PATH'] += ":/root/.cargo/bin"
+### Architecture
+- **RWKV-v6** (Receptance Weighted Key Value)
+- **Token Shift**: Time-mixing token shift mechanism
+- **Channel Mixing**: Position-wise feed-forward network
+- **Head**: Standard linear projection (optional weight tying)
 
-# Clone & Build
-%cd /kaggle/working/
-!git clone https://github.com/machadobatistacosta/ptbr-llm.git
-%cd ptbr-llm
-!/root/.cargo/bin/cargo build --release --features cuda
-```
-
----
-
-## 🗺️ Roadmap
-
-- [x] RWKV-v6 implementation in Burn
-- [x] BPE tokenizer (32K vocab)
-- [x] Dataset pipeline (378M tokens)
-- [ ] Train 400M model to convergence
-- [ ] Publish trained weights
-- [ ] Instruction fine-tuning (Chat)
-- [ ] 4-bit quantization
-- [ ] ONNX export
-- [ ] WASM inference (browser)
-
----
-
-## 🏗️ Project Structure
-
-```
-ptbr-llm/
-├── src/
-│   ├── main.rs              # CLI
-│   ├── model/               # RWKV implementation
-│   ├── data/                # Dataset & DataLoader
-│   └── tokenizer/           # BPE Tokenizer
-├── scripts/                 # Data processing
-│   └── clean_tokenizer_input.py
-└── data/
-    ├── tokenizer/           # tokenizer.json & train.bin
-    └── tokenizer_full_input_cleaned/
-```
-
----
-
-## ⚙️ Training Parameters
-
-| Parameter | Description | Default |
-|-----------|-------------|---------|
-| `--model-size` | 85m, 170m, 400m | 85m |
-| `--max-steps` | Training steps | 50000 |
-| `--batch-size` | Batch size | 4 |
-| `--grad-accum` | Gradient accumulation | 4 |
-| `--learning-rate` | Learning rate | 2e-4 |
-| `--warmup-steps` | Warmup steps | 300 |
-| `--seq-len` | Sequence length | 256 |
-| `--save-every` | Checkpoint interval | 1000 |
+### Optimization
+- **WKV Kernel**: Custom optimized parallel scan for WKV computation
+- **Mixed Precision**: FP16 training support (via Burn backend)
+- **Gradient Accumulation**: Support for large effective batch sizes on limited hardware
 
 ---
 
@@ -210,10 +144,3 @@ ptbr-llm/
     <img src="https://img.shields.io/badge/GitHub-111111?style=for-the-badge&logo=github&logoColor=white" height="24" />
   </a>
 </p>
-
----
-
-## 🔗 References
-
-- [Burn Framework](https://burn.dev/)
-- [RWKV: Reinventing RNNs for the Transformer Era](https://arxiv.org/abs/2305.13048)
