@@ -1,13 +1,9 @@
-//! WKV v4 — Max-Tracking Implementation (SAFE API VERSION)
+//! WKV v4 - Implementação CORRETA per-channel
 //!
-//! Uses only tensor ops that are PROVEN to work in Burn 0.14 CudaJit:
-//! - Tensor::zeros, Tensor::ones (not Tensor::full)
-//! - relu for element-wise max (not max_pair)
-//! - clamp(min, max) (not clamp_min)
-//!
-//! Algorithm: RWKV-4 CUDA kernel with max-tracking for numerical stability.
+//! Baseado na implementação oficial do RWKV-4
+//! Cada canal tem seu próprio decay rate
 
-use burn::tensor::{activation, backend::Backend, Tensor};
+use burn::tensor::{backend::Backend, Tensor};
 
 #[derive(Debug, Clone)]
 pub struct WKVConfig {
@@ -24,25 +20,19 @@ impl WKVConfig {
     pub fn for_t4() -> Self { Self::default() }
 }
 
-/// Element-wise maximum of two tensors: max(a, b) = b + relu(a - b)
-/// Uses relu which is guaranteed to work in all Burn backends.
-#[inline]
-fn tensor_max_2d<B: Backend>(a: Tensor<B, 2>, b: Tensor<B, 2>) -> Tensor<B, 2> {
-    let diff = a - b.clone();
-    b + activation::relu(diff)
-}
-
-/// WKV v4 — Forward for training (max-tracking, numerically stable)
+/// WKV v4 - Forward para treinamento
 ///
-/// Implements the exact algorithm from the RWKV-4 CUDA kernel:
-/// ```text
-/// p=0, q=0, o=MIN_VALUE
-/// for t in 0..T:
-///     no = max(o, u+k[t]);  A = exp(o-no);  B = exp(u+k[t]-no)
-///     y[t] = (A*p + B*v[t]) / (A*q + B)
-///     no = max(w+o, k[t]);  A = exp(w+o-no);  B = exp(k[t]-no)
-///     p = A*p + B*v[t];  q = A*q + B;  o = no
-/// ```
+/// Implementação sequencial por posição, mas paralela por batch/channel.
+/// Não é a mais rápida, mas é CORRETA.
+///
+/// Args:
+///   k: [batch, seq_len, channels] - key
+///   v: [batch, seq_len, channels] - value
+///   w: [channels] - decay rate (NEGATIVO, per-channel)
+///   u: [channels] - bonus para token atual (per-channel)
+///
+/// Returns:
+///   [batch, seq_len, channels] - weighted values
 pub fn wkv_linear<B: Backend>(
     k: Tensor<B, 3>,
     v: Tensor<B, 3>,
@@ -53,63 +43,58 @@ pub fn wkv_linear<B: Backend>(
     let [batch_size, seq_len, channels] = k.dims();
     let device = k.device();
 
-    // Broadcast shapes for [batch, channels] operations
-    let w_bc = w.reshape([1, channels]); // [1, C]
-    let u_bc = u.reshape([1, channels]); // [1, C]
+    // Garante que w é negativo (decay)
+    let w = w.clamp(-5.0, -0.01);
+    // u pode ser positivo ou negativo
+    let u = u.clamp(-3.0, 3.0);
 
-    // State: p, q are running sums divided by exp(o)
-    // o is the max exponent seen so far
-    let mut p = Tensor::<B, 2>::zeros([batch_size, channels], &device);
-    let mut q = Tensor::<B, 2>::zeros([batch_size, channels], &device);
-    // SAFE: Use ones * scalar instead of Tensor::full
-    let mut o = Tensor::<B, 2>::ones([batch_size, channels], &device) * (-1e38_f32);
+    // exp(w) per-channel: [channels] -> [1, 1, channels]
+    // Como w é negativo, exp(w) está em (0, 1) = decay factor
+    let w_exp = w.exp().reshape([1, 1, channels]);
 
+    // Inicializa acumuladores: [batch, channels]
+    let mut state_num = Tensor::<B, 2>::zeros([batch_size, channels], &device);
+    let mut state_den = Tensor::<B, 2>::zeros([batch_size, channels], &device);
+
+    // u expandido: [1, channels]
+    let u_broad = u.reshape([1, channels]);
+
+    // Coleta outputs por posição
     let mut outputs: Vec<Tensor<B, 2>> = Vec::with_capacity(seq_len);
 
     for t in 0..seq_len {
-        // Extract k[t], v[t]: [batch, channels]
+        // Extrai k[t], v[t]: [batch, channels]
         let kt = k.clone().slice([0..batch_size, t..t + 1, 0..channels])
             .reshape([batch_size, channels]);
         let vt = v.clone().slice([0..batch_size, t..t + 1, 0..channels])
             .reshape([batch_size, channels]);
 
-        // === Output computation ===
-        // no = max(o, u + k[t])
-        let u_plus_kt = u_bc.clone() + kt.clone();
-        let no = tensor_max_2d(o.clone(), u_plus_kt.clone());
+        // Token atual: exp(u + k_t) per-channel
+        let uk = u_broad.clone() + kt.clone();
+        let uk_exp = uk.clamp(-15.0, 15.0).exp();
 
-        // A = exp(o - no), B = exp(u + k[t] - no)
-        let a = (o.clone() - no.clone()).exp();
-        let b = (u_plus_kt - no).exp();
+        // Numerador: state_num + exp(u+k_t) * v_t
+        let num = state_num.clone() + uk_exp.clone() * vt.clone();
+        // Denominador: state_den + exp(u+k_t)
+        let den = state_den.clone() + uk_exp + 1e-6;
 
-        // y[t] = (A*p + B*v[t]) / max(A*q + B, 1e-6)
-        let numerator = a.clone() * p.clone() + b.clone() * vt.clone();
-        let denominator = (a * q.clone() + b).clamp(1e-6, 1e30);
-        let out_t = (numerator / denominator).clamp(-20.0, 20.0);
-        outputs.push(out_t);
+        // Output para posição t
+        let out_t = num / den;
+        outputs.push(out_t.clamp(-20.0, 20.0));
 
-        // === State update ===
-        // no2 = max(w + o, k[t])
-        let w_plus_o = w_bc.clone() + o.clone();
-        let no2 = tensor_max_2d(w_plus_o.clone(), kt.clone());
+        // Atualiza estado: decay * state + exp(k_t) * v_t
+        let kt_exp = kt.clamp(-15.0, 15.0).exp();
+        let w_exp_2d = w_exp.clone().reshape([1, channels]);
 
-        // A2 = exp(w + o - no2), B2 = exp(k[t] - no2)
-        let a2 = (w_plus_o - no2.clone()).exp();
-        let b2 = (kt - no2.clone()).exp();
-
-        // p = A2*p + B2*v[t];  q = A2*q + B2;  o = no2
-        p = a2.clone() * p + b2.clone() * vt;
-        q = a2 * q + b2;
-        o = no2;
+        state_num = state_num * w_exp_2d.clone() + kt_exp.clone() * vt;
+        state_den = state_den * w_exp_2d + kt_exp;
     }
 
     // Stack: [batch, seq_len, channels]
     Tensor::stack(outputs, 1)
 }
 
-/// WKV v4 — Forward step for inference (one token, max-tracking)
-///
-/// State tuple: (p, q, o) where p,q are running sums divided by exp(o)
+/// WKV v4 - Forward step para inferência (um token por vez)
 pub fn wkv_step<B: Backend>(
     k: Tensor<B, 2>,      // [batch, channels]
     v: Tensor<B, 2>,      // [batch, channels]
@@ -118,32 +103,26 @@ pub fn wkv_step<B: Backend>(
     state: &mut (Tensor<B, 2>, Tensor<B, 2>, Tensor<B, 2>),
 ) -> Tensor<B, 2> {
     let [_batch, channels] = k.dims();
-    let (ref mut p, ref mut q, ref mut o) = state;
+    let (ref mut state_num, ref mut state_den, ref mut _last_k) = state;
 
-    let w_bc = w.reshape([1, channels]);
-    let u_bc = u.reshape([1, channels]);
+    let w = w.clamp(-5.0, -0.01);
+    let u = u.clamp(-3.0, 3.0);
 
-    // === Output ===
-    let u_plus_k = u_bc + k.clone();
-    let no = tensor_max_2d(o.clone(), u_plus_k.clone());
+    let w_exp = w.exp().reshape([1, channels]);
+    let u_broad = u.reshape([1, channels]);
 
-    let a = (o.clone() - no.clone()).exp();
-    let b = (u_plus_k - no).exp();
+    // Token atual
+    let uk = u_broad + k.clone();
+    let uk_exp = uk.clamp(-15.0, 15.0).exp();
 
-    let numerator = a.clone() * p.clone() + b.clone() * v.clone();
-    let denominator = (a * q.clone() + b).clamp(1e-6, 1e30);
-    let output = (numerator / denominator).clamp(-20.0, 20.0);
+    let num = state_num.clone() + uk_exp.clone() * v.clone();
+    let den = state_den.clone() + uk_exp + 1e-6;
+    let output = (num / den).clamp(-20.0, 20.0);
 
-    // === State update ===
-    let w_plus_o = w_bc + o.clone();
-    let no2 = tensor_max_2d(w_plus_o.clone(), k.clone());
-
-    let a2 = (w_plus_o - no2.clone()).exp();
-    let b2 = (k - no2.clone()).exp();
-
-    *p = a2.clone() * p.clone() + b2.clone() * v;
-    *q = a2 * q.clone() + b2;
-    *o = no2;
+    // Atualiza estado
+    let kt_exp = k.clamp(-15.0, 15.0).exp();
+    *state_num = state_num.clone() * w_exp.clone() + kt_exp.clone() * v;
+    *state_den = state_den.clone() * w_exp + kt_exp;
 
     output
 }
@@ -157,12 +136,11 @@ pub fn init_state<B: Backend>(
     (
         Tensor::zeros([batch_size, channels], device),
         Tensor::zeros([batch_size, channels], device),
-        // o = -1e38 so exp(o) ≈ 0 (no prior state)
-        Tensor::ones([batch_size, channels], device) * (-1e38_f32),
+        Tensor::zeros([batch_size, channels], device),
     )
 }
 
-// Backwards compatibility alias
+// Mantém compatibilidade
 pub fn wkv_parallel_scan<B: Backend>(
     k: Tensor<B, 3>,
     v: Tensor<B, 3>,
