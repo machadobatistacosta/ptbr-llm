@@ -37,7 +37,7 @@ impl<B: Backend> RWKVState<B> {
                     Tensor::zeros([batch_size, d_model], device),
                     Tensor::zeros([batch_size, d_model], device),
                     // Max-tracking 'o' starts at -1e38 so exp(o) ≈ 0
-                    Tensor::full([batch_size, d_model], -1e38_f32, device),
+                    Tensor::ones([batch_size, d_model], device) * (-1e38_f32),
                 ))
                 .collect(),
             channel_state: (0..n_layers)
@@ -59,7 +59,7 @@ impl<B: Backend> RWKVState<B> {
             self.time_state[i] = (
                 Tensor::zeros([batch_size, d_model], device),
                 Tensor::zeros([batch_size, d_model], device),
-                Tensor::full([batch_size, d_model], -1e38_f32, device),
+                Tensor::ones([batch_size, d_model], device) * (-1e38_f32),
             );
             self.channel_state[i] = Tensor::zeros([batch_size, d_model], device);
             self.prev_time_input[i] = Tensor::zeros([batch_size, d_model], device);
