@@ -46,6 +46,9 @@ rand_chacha = "0.3"
 # Bug #17: Proper LRU cache
 lru = "0.12"
 
+# CUDA FFI - dynamic library loading
+libloading = "0.8"
+
 # CLI
 clap = { version = "4.5", features = ["derive"] }
 
