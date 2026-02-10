@@ -36,7 +36,8 @@ impl<B: Backend> RWKVState<B> {
                 .map(|_| (
                     Tensor::zeros([batch_size, d_model], device),
                     Tensor::zeros([batch_size, d_model], device),
-                    Tensor::zeros([batch_size, d_model], device),
+                    // Max-tracking 'o' starts at -1e38 so exp(o) ≈ 0
+                    Tensor::full([batch_size, d_model], -1e38_f32, device),
                 ))
                 .collect(),
             channel_state: (0..n_layers)
@@ -58,7 +59,7 @@ impl<B: Backend> RWKVState<B> {
             self.time_state[i] = (
                 Tensor::zeros([batch_size, d_model], device),
                 Tensor::zeros([batch_size, d_model], device),
-                Tensor::zeros([batch_size, d_model], device),
+                Tensor::full([batch_size, d_model], -1e38_f32, device),
             );
             self.channel_state[i] = Tensor::zeros([batch_size, d_model], device);
             self.prev_time_input[i] = Tensor::zeros([batch_size, d_model], device);
@@ -137,15 +138,13 @@ impl<B: Backend> RWKV<B> {
 
         x = self.ln_out.forward(x);
 
-        // ✅ FIX: Add scaling for weight tying to normalize logit variance
+        // ✅ AUDIT FIX: NO scaling — RWKV-4 reference uses raw logits
         let logits = if self.use_weight_tying {
             let [b, t, d] = x.dims();
             let emb_weight = self.embedding.weight.val();
             let x_flat = x.reshape([b * t, d]);
             let logits_flat = x_flat.matmul(emb_weight.transpose());
-            // Scale by 1/sqrt(d_model) to normalize variance
-            let scale = 1.0 / (d as f64).sqrt();
-            logits_flat.mul_scalar(scale as f32).reshape([b, t, self.vocab_size])
+            logits_flat.reshape([b, t, self.vocab_size])
         } else {
             self.head.as_ref().unwrap().forward(x)
         };
@@ -185,14 +184,11 @@ impl<B: Backend> RWKV<B> {
         let x = x.reshape([b, 1, self.d_model]);
         let x = self.ln_out.forward(x);
 
-        // ✅ FIX: Add scaling for weight tying (same as forward)
+        // ✅ AUDIT FIX: NO scaling — RWKV-4 reference uses raw logits
         let logits = if self.use_weight_tying {
             let x_flat = x.reshape([b, self.d_model]);
             let emb_weight = self.embedding.weight.val();
-            let logits = x_flat.matmul(emb_weight.transpose());
-            // Scale by 1/sqrt(d_model) to normalize variance
-            let scale = 1.0 / (self.d_model as f64).sqrt();
-            logits.mul_scalar(scale as f32)
+            x_flat.matmul(emb_weight.transpose())
         } else {
             self.head.as_ref().unwrap().forward(x).reshape([b, self.vocab_size])
         };

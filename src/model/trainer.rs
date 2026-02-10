@@ -201,12 +201,11 @@ impl<B: AutodiffBackend> Trainer<B> {
         None
     }
 
-    /// Compute L2 norm of gradients for observability
-    /// This enables detection of vanishing/exploding gradients during training
+    /// Approximate gradient norm for observability (HEURISTIC, not exact L2 norm)
+    /// Real gradient clipping is handled by Burn's GradientClippingConfig::Norm
     fn compute_grad_norm_from_grads(&self, _grads: &GradientsParams) -> f32 {
         // Approximate grad norm using the change in loss * learning_rate ratio
-        // This is a heuristic that works when we can't directly iterate grads in Burn
-        // More accurate would require accessing individual parameter gradients
+        // This is a heuristic — the real gradient clipping is done by the optimizer
         
         // For now, estimate based on loss trajectory:
         // If loss is stable, grads are healthy (~1-10)
