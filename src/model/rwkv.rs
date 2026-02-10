@@ -137,13 +137,15 @@ impl<B: Backend> RWKV<B> {
 
         x = self.ln_out.forward(x);
 
-        // ✅ AUDIT FIX: NO scaling — RWKV-4 reference uses raw logits
+        // Scale by 1/sqrt(d_model) — compensates for Burn's larger embedding init
+        // (RWKV-4 ref uses Uniform(-1e-4, 1e-4) for emb, Burn uses ~N(0, 0.11))
         let logits = if self.use_weight_tying {
             let [b, t, d] = x.dims();
             let emb_weight = self.embedding.weight.val();
             let x_flat = x.reshape([b * t, d]);
             let logits_flat = x_flat.matmul(emb_weight.transpose());
-            logits_flat.reshape([b, t, self.vocab_size])
+            let scale = 1.0 / (d as f64).sqrt();
+            logits_flat.mul_scalar(scale as f32).reshape([b, t, self.vocab_size])
         } else {
             self.head.as_ref().unwrap().forward(x)
         };
@@ -183,11 +185,13 @@ impl<B: Backend> RWKV<B> {
         let x = x.reshape([b, 1, self.d_model]);
         let x = self.ln_out.forward(x);
 
-        // ✅ AUDIT FIX: NO scaling — RWKV-4 reference uses raw logits
+        // Scale by 1/sqrt(d_model) — same as forward()
         let logits = if self.use_weight_tying {
             let x_flat = x.reshape([b, self.d_model]);
             let emb_weight = self.embedding.weight.val();
-            x_flat.matmul(emb_weight.transpose())
+            let logits = x_flat.matmul(emb_weight.transpose());
+            let scale = 1.0 / (self.d_model as f64).sqrt();
+            logits.mul_scalar(scale as f32)
         } else {
             self.head.as_ref().unwrap().forward(x).reshape([b, self.vocab_size])
         };
