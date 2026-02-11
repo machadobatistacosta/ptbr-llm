@@ -72,7 +72,7 @@ impl<B: Backend> RWKVState<B> {
 pub struct RWKV<B: Backend> {
     embedding: Embedding<B>,
     ln_pre: LayerNorm<B>,
-    blocks: Vec<RWKVBlock<B>>,
+    pub blocks: Vec<RWKVBlock<B>>,
     ln_out: LayerNorm<B>,
     head: Option<Linear<B>>,
 
@@ -208,7 +208,7 @@ impl<B: Backend> RWKV<B> {
 #[derive(Module, Debug)]
 pub struct RWKVBlock<B: Backend> {
     ln1: LayerNorm<B>,
-    time_mixing: TimeMixing<B>,
+    pub time_mixing: TimeMixing<B>,
     ln2: LayerNorm<B>,
     channel_mixing: ChannelMixing<B>,
     dropout: Dropout,
@@ -278,7 +278,7 @@ pub struct TimeMixing<B: Backend> {
     key: Linear<B>,
     value: Linear<B>,
     output: Linear<B>,
-    time_decay: Param<Tensor<B, 1>>,
+    pub time_decay: Param<Tensor<B, 1>>,
     time_first: Param<Tensor<B, 1>>,
     time_mix_k: Param<Tensor<B, 1>>,
     time_mix_v: Param<Tensor<B, 1>>,

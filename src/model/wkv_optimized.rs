@@ -38,25 +38,9 @@ pub fn wkv_linear<B: Backend>(
     u: Tensor<B, 1>,
     _config: &WKVConfig,
 ) -> Tensor<B, 3> {
-    // Always run Burn loop (builds autodiff graph, ~correct values)
-    let y_burn = wkv_linear_burn(
-        k.clone(), v.clone(), w.clone(), u.clone(),
-    );
-
-    // If CUDA kernel available, correct the values via STE trick
-    if let Some(kernel) = wkv_cuda_ffi::get_cuda_kernel() {
-        let y_cuda = wkv_cuda_forward(k, v, w, u, kernel);
-        
-        // STE trick: y_burn + (y_cuda - y_burn).detach()
-        // → Forward: values = y_cuda (numerically correct max-tracking)
-        // → Backward: gradients flow through y_burn (autodiff graph intact)
-        let correction = y_cuda - y_burn.clone();
-        // .inner() strips autodiff, .from_inner() wraps as leaf (detached)
-        // For non-Autodiff backends, this is a no-op
-        return y_burn + correction.detach();
-    }
-    
-    y_burn
+    // Burn loop builds autodiff graph -> gradients are consistent with values
+    // CUDA kernel remains available for inference via wkv_cuda_forward()
+    wkv_linear_burn(k, v, w, u)
 }
 
 /// CUDA kernel forward — extracts data, runs kernel, returns Burn tensor (leaf, no grad)
@@ -126,7 +110,7 @@ fn wkv_linear_burn<B: Backend>(
         let uk_exp = uk.clamp(-15.0, 15.0).exp();
 
         let num = state_num.clone() + uk_exp.clone() * vt.clone();
-        let den = state_den.clone() + uk_exp + 1e-6;
+        let den = state_den.clone() + uk_exp.clone();
 
         let out_t = num / den;
         outputs.push(out_t.clamp(-20.0, 20.0));

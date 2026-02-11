@@ -181,26 +181,15 @@ pub(crate) fn run_training_loop(
                     println!();
                 }
 
-                // Save checkpoint in its own scope to drop temporaries
                 if step % save_every == 0 && step > 0 {
-                    {
-                        // Debug: Check Param IDs
-                        println!("\n🔍 [DEBUG] Pre-Save Check:");
-                        for (name, param) in trainer.model.named_parameters().into_iter().take(3) {
-                             println!("  PARAM: {} ID: {:?}", name, param.id());
-                        }
-
-                        let ckpt_path = output.join(format!("checkpoint_{}", step));
-                        match trainer.save_checkpoint(ckpt_path.to_str().unwrap()) {
-                            Ok(_) => println!("  💾 Checkpoint salvo: {:?}", ckpt_path),
-                            Err(e) => println!("  ⚠️ Erro salvando: {}", e),
-                        }
-
-                        println!("🔍 [DEBUG] Post-Save Check:");
-                        for (name, param) in trainer.model.named_parameters().into_iter().take(3) {
-                             println!("  PARAM: {} ID: {:?}", name, param.id());
-                        }
+                    let ckpt_path = output.join(format!("checkpoint_{}", step));
+                    match trainer.save_checkpoint(ckpt_path.to_str().unwrap()) {
+                        Ok(_) => println!("  💾 Checkpoint salvo: {:?}", ckpt_path),
+                        Err(e) => println!("  ⚠️ Erro salvando: {}", e),
                     }
+
+
+
                     // Tenta liberar memória do sistema operacional
                     // Não temos clear_cache explícito no backend padrão, mas isso dropa vars locais
                 }

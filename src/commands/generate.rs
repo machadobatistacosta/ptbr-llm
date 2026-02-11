@@ -55,7 +55,7 @@ pub fn execute(
                 &CompactRecorder::new(),
                 &device,
             )
-            .map_err(|e| PtbrLlmError::CheckpointLoad(e.to_string()))?
+            .map_err(|e: burn::record::RecorderError| PtbrLlmError::CheckpointLoad(e.to_string()))?
     } else {
         model_raw
     };

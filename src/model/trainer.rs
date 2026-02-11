@@ -151,20 +151,34 @@ impl<B: AutodiffBackend> Trainer<B> {
             // Pega gradientes acumulados
             let final_grads = self.accumulator.grads();
             
-            // ✅ P0 FIX: Compute REAL gradient norm for observability
-            // This enables detection of vanishing/exploding gradients
-            let grad_norm = self.compute_grad_norm_from_grads(&final_grads);
-            let was_clipped = grad_norm > self.config.gradient_clip as f32;
-            
-            // Log warnings for gradient issues
-            if grad_norm < 1e-7 && self.step > 0 {
-                eprintln!("  ⚠️  VANISHING GRADIENTS: norm={:.2e}", grad_norm);
-            } else if grad_norm > 100.0 {
-                eprintln!("  ⚠️  GRADIENT EXPLOSION (pre-clip): norm={:.2e}", grad_norm);
-            }
-            
-            // Apply updates (Burn's optimizer handles clipping internally)
+            // ✅ FIX: Snapshot of a representative parameter BEFORE the step
+            let decay_before: Vec<f32> = self.model.blocks[0]
+                .time_mixing.time_decay.val()
+                .into_data().iter::<f32>().collect();
+
+            // Apply optimizer step (Burn handles gradient clipping internally)
             self.model = self.optimizer.step(current_lr, self.model.clone(), final_grads);
+
+            // ✅ FIX: Compute REAL update magnitude
+            let decay_after: Vec<f32> = self.model.blocks[0]
+                .time_mixing.time_decay.val()
+                .into_data().iter::<f32>().collect();
+
+            let update_sq_sum: f32 = decay_before.iter()
+                .zip(decay_after.iter())
+                .map(|(a, b): (&f32, &f32)| (a - b).powi(2))
+                .sum();
+            let grad_norm = update_sq_sum.sqrt();
+            
+            // Real clipping is done internally by Burn
+            let was_clipped = false; 
+            
+            // Log warnings for update issues  
+            if grad_norm < 1e-10 && self.step > 10 {
+                eprintln!("  ⚠️  VANISHING UPDATES: ||Δw||={:.2e}", grad_norm);
+            } else if grad_norm > 1.0 {
+                eprintln!("  ⚠️  LARGE UPDATES: ||Δw||={:.2e}", grad_norm);
+            }
             
             // Update metrics
             self.prev_loss = self.ema_loss;
@@ -201,35 +215,7 @@ impl<B: AutodiffBackend> Trainer<B> {
         None
     }
 
-    /// Approximate gradient norm for observability (HEURISTIC, not exact L2 norm)
-    /// Real gradient clipping is handled by Burn's GradientClippingConfig::Norm
-    fn compute_grad_norm_from_grads(&self, _grads: &GradientsParams) -> f32 {
-        // Approximate grad norm using the change in loss * learning_rate ratio
-        // This is a heuristic — the real gradient clipping is done by the optimizer
-        
-        // For now, estimate based on loss trajectory:
-        // If loss is stable, grads are healthy (~1-10)
-        // If loss is dropping fast, grads may be large
-        // If loss is stuck, grads may be vanishing
-        
-        let loss_change = (self.prev_loss - self.ema_loss).abs();
-        let lr = self.get_learning_rate() as f32;
-        
-        if lr < 1e-10 {
-            return 0.0;
-        }
-        
-        // Heuristic: grad_norm ≈ loss_change / lr (very rough)
-        // Clamp to reasonable range for display purposes
-        let estimated_norm = (loss_change / lr).min(100.0).max(0.0);
-        
-        // If this is step 0 or early warming up, return a reasonable default
-        if self.step < 10 || self.ema_loss.is_nan() {
-            return 1.0; // Assume healthy until we have data
-        }
-        
-        estimated_norm
-    }
+
 
     fn cross_entropy_safe(
         &self,

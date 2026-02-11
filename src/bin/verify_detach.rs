@@ -1,14 +1,37 @@
-use burn::backend::{Autodiff, NdArray};
+use burn::backend::Autodiff;
 use burn::tensor::Tensor;
 
-// NdArray is always available — no feature flags needed
-type TestBackend = Autodiff<NdArray<f32>>;
+#[cfg(feature = "cuda")]
+type MyBackend = burn::backend::cuda_jit::Cuda;
+
+#[cfg(feature = "gpu")]
+type MyBackend = burn::backend::wgpu::Wgpu<f32, i32>;
+
+#[cfg(not(any(feature = "cuda", feature = "gpu")))]
+type MyBackend = burn::backend::ndarray::NdArray<f32>;
+
+type TestBackend = Autodiff<MyBackend>;
+
+#[cfg(feature = "cuda")]
+fn get_device() -> burn::backend::cuda_jit::CudaDevice {
+    burn::backend::cuda_jit::CudaDevice::new(0)
+}
+
+#[cfg(feature = "gpu")]
+fn get_device() -> burn::backend::wgpu::WgpuDevice {
+    burn::backend::wgpu::WgpuDevice::BestAvailable
+}
+
+#[cfg(not(any(feature = "cuda", feature = "gpu")))]
+fn get_device() -> burn::backend::ndarray::NdArrayDevice {
+    burn::backend::ndarray::NdArrayDevice::Cpu
+}
 
 fn main() {
     println!("🔍 Testing .detach() behavior for STE trick...");
     println!();
 
-    let device = Default::default();
+    let device = get_device();
 
     // x = 2.0
     let x = Tensor::<TestBackend, 1>::from_data([2.0f32], &device).require_grad();

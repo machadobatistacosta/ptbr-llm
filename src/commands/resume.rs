@@ -64,7 +64,7 @@ pub fn execute(
         Trainer::new(&model_config, train_config, device.clone());
     trainer
         .load_checkpoint(checkpoint.to_str().unwrap())
-        .map_err(|e| PtbrLlmError::CheckpointLoad(e.to_string()))?;
+        .map_err(|e: std::io::Error| PtbrLlmError::CheckpointLoad(e.to_string()))?;
 
     let dataset_path = if data.join("train.bin").exists() {
         data.join("train.bin")
