@@ -101,3 +101,7 @@ required-features = []
 name = "vocab_pilot"
 path = "src/utils/vocab_pilot.rs"
 required-features = []
+
+# Patch burn-autodiff to expose internals for custom WKV backward op
+[patch.crates-io]
+burn-autodiff = { path = "local-patches/burn-autodiff" }

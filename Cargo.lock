@@ -2148,6 +2148,7 @@ dependencies = [
  "bzip2",
  "clap",
  "crossbeam-channel",
+ "libloading",
  "lru",
  "memmap2",
  "once_cell",
