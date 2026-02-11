@@ -53,7 +53,7 @@ pub fn wkv_linear<B: Backend>(
         let correction = y_cuda - y_burn.clone();
         // .inner() strips autodiff, .from_inner() wraps as leaf (detached)
         // For non-Autodiff backends, this is a no-op
-        return y_burn + correction;
+        return y_burn + correction.detach();
     }
     
     y_burn

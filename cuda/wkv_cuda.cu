@@ -47,15 +47,38 @@ __global__ void kernel_forward(const int B, const int T, const int C,
     for (int i = 0; i < T; i++) {
         const int ii = i * C;
 
-        F no = max(o, u + k[ii]);
-        F A = exp(o - no);
-        F B = exp(u + k[ii] - no);
-        y[ii] = (A * p + B * v[ii]) / (A * q + B);
+        // FIX: Clamp inputs to match Rust implementation
+        F kk = k[ii];
+        F vv = v[ii];
+        
+        // Clamp u+k to avoidance exp explosion
+        F uk = u + kk;
+        if (uk > 15.0f) uk = 15.0f;
+        if (uk < -15.0f) uk = -15.0f;
 
-        no = max(w + o, k[ii]);
+        F no = max(o, uk);
+        F A = exp(o - no);
+        F B = exp(uk - no);
+        
+        F num = A * p + B * vv;
+        F den = A * q + B;
+        
+        // FIX: Clamp output
+        F out = num / den;
+        if (out > 20.0f) out = 20.0f;
+        if (out < -20.0f) out = -20.0f;
+        y[ii] = out;
+
+        // Update state
+        // Clamp k for state update
+        F kk_clamped = kk;
+        if (kk_clamped > 15.0f) kk_clamped = 15.0f;
+        if (kk_clamped < -15.0f) kk_clamped = -15.0f;
+
+        no = max(w + o, kk_clamped);
         A = exp(w + o - no);
-        B = exp(k[ii] - no);
-        p = A * p + B * v[ii];
+        B = exp(kk_clamped - no);
+        p = A * p + B * vv;
         q = A * q + B;
         o = no;
     }
