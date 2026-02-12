@@ -6,7 +6,7 @@ use std::io::{BufRead, BufReader, Read};
 use std::path::PathBuf;
 
 use crate::data::{TokenizedDatasetWriter, WikiCleaner};
-use crate::error::{PtbrLlmError, Result};
+use crate::error::{PtbrError, Result};
 use crate::tokenizer::{BPETokenizer, PTBRNormalizer};
 use crate::utils::format_number;
 
@@ -114,7 +114,7 @@ pub fn execute(
     println!();
 
     let tokenizer = BPETokenizer::from_file(tokenizer_path.to_str().unwrap())
-        .map_err(|e| PtbrLlmError::TokenizerLoad(e.to_string()))?;
+        .map_err(|e| PtbrError::TokenizerLoad(e.to_string()))?;
     let bos = tokenizer.bos_id();
     let eos = tokenizer.eos_id();
 
@@ -130,7 +130,7 @@ pub fn execute(
         std::fs::create_dir_all(parent)?;
     }
     let mut writer = TokenizedDatasetWriter::new(output_bin.as_path())
-        .map_err(|e| PtbrLlmError::DatasetCorrupted(format!("Erro criando train.bin: {}", e)))?;
+        .map_err(|e| PtbrError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("Erro criando train.bin: {}", e))))?;
 
     let mut parsed: Vec<(PathBuf, usize)> = Vec::new();
     for s in sources {
@@ -252,7 +252,7 @@ pub fn execute(
     }
 
     let written = writer.finish()
-        .map_err(|e| PtbrLlmError::DatasetCorrupted(format!("Erro finalizando writer: {}", e)))?;
+        .map_err(|e| PtbrError::Io(std::io::Error::new(std::io::ErrorKind::Other, format!("Erro finalizando writer: {}", e))))?;
 
     println!();
     println!("═══════════════════════════════════════════════════════════");

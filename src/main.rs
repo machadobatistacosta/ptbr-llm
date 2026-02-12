@@ -65,73 +65,8 @@ enum Commands {
         tokenizer: PathBuf,
     },
 
-    /// Treina modelo RWKV
-    Train {
-        #[arg(short, long)]
-        data: PathBuf,
-        /// Dataset de validação separado (opcional)
-        #[arg(long)]
-        val_data: Option<PathBuf>,
-        #[arg(short, long)]
-        tokenizer: PathBuf,
-        #[arg(short, long)]
-        output: PathBuf,
-        #[arg(long, default_value = "85m")]
-        model_size: String,
-        #[arg(long, default_value = "50000")]
-        max_steps: usize,
-        #[arg(long, default_value = "1000")]
-        save_every: usize,
-        #[arg(long, default_value = "1")]
-        batch_size: usize,
-        #[arg(long, default_value = "16")]
-        grad_accum: usize,
-        #[arg(long, default_value = "3e-4")]
-        learning_rate: f64,
-        #[arg(long, default_value = "500")]
-        warmup_steps: usize,
-        #[arg(long, default_value = "1.0")]
-        gradient_clip: f64,
-        #[arg(long, default_value = "1024")]
-        seq_len: usize,
-        #[arg(long, default_value = "500")]
-        eval_every: usize,
-        #[arg(long, default_value = "100")]
-        eval_samples: usize,
-    },
-
-    /// Retoma treino de checkpoint
-    Resume {
-        #[arg(short, long)]
-        checkpoint: PathBuf,
-        #[arg(short, long)]
-        data: PathBuf,
-        /// Dataset de validação separado (opcional)
-        #[arg(long)]
-        val_data: Option<PathBuf>,
-        #[arg(short, long)]
-        output: PathBuf,
-        #[arg(long, default_value = "85m")]
-        model_size: String,
-        #[arg(long, default_value = "50000")]
-        additional_steps: usize,
-        #[arg(long, default_value = "1000")]
-        save_every: usize,
-        #[arg(long, default_value = "1")]
-        batch_size: usize,
-        #[arg(long, default_value = "16")]
-        grad_accum: usize,
-        #[arg(long, default_value = "1e-4")]
-        learning_rate: f64,
-        #[arg(long, default_value = "1024")]
-        seq_len: usize,
-        #[arg(long, default_value = "500")]
-        eval_every: usize,
-        #[arg(long, default_value = "100")]
-        eval_samples: usize,
-        #[arg(long, default_value = "1.0")]
-        gradient_clip: f64,
-    },
+    /// Treina modelo RWKV (inicia do zero ou retoma)
+    Train(commands::train::TrainArgs),
 
     /// Testa modelo com prompts
     TestModel {
@@ -249,107 +184,45 @@ fn main() {
 
     let cli = Cli::parse();
 
-    match cli.command {
+    let result: Result<(), Box<dyn std::error::Error>> = match cli.command {
         Commands::ProcessWiki {
             input,
             output,
             min_chars,
-        } => commands::process_wiki::execute(&input, &output, min_chars),
+        } => {
+            commands::process_wiki::execute(&input, &output, min_chars);
+            Ok(())
+        },
 
         Commands::TrainTokenizer {
             corpus,
             output,
             vocab_size,
             special_tokens,
-        } => commands::train_tokenizer::execute(&corpus, &output, vocab_size, special_tokens),
+        } => {
+            commands::train_tokenizer::execute(&corpus, &output, vocab_size, special_tokens);
+            Ok(())
+        },
 
         Commands::Tokenize {
             input,
             output,
             tokenizer,
-        } => commands::tokenize::execute(&input, &output, &tokenizer),
-
-        Commands::Train {
-            data,
-            val_data,
-            tokenizer,
-            output,
-            model_size,
-            max_steps,
-            save_every,
-            batch_size,
-            grad_accum,
-            learning_rate,
-            warmup_steps,
-            gradient_clip,
-            seq_len,
-            eval_every,
-            eval_samples,
         } => {
-            if let Err(e) = commands::train::execute(
-                &data,
-                val_data.as_ref(),
-                &tokenizer,
-                &output,
-                &model_size,
-                max_steps,
-                save_every,
-                batch_size,
-                grad_accum,
-                learning_rate,
-                warmup_steps,
-                gradient_clip,
-                seq_len,
-                eval_every,
-                eval_samples,
-            ) {
-                eprintln!("❌ Erro: {}", e);
-                std::process::exit(1);
-            }
-        }
+            commands::tokenize::execute(&input, &output, &tokenizer);
+            Ok(())
+        },
 
-        Commands::Resume {
-            checkpoint,
-            data,
-            val_data,
-            output,
-            model_size,
-            additional_steps,
-            save_every,
-            batch_size,
-            grad_accum,
-            learning_rate,
-            seq_len,
-            eval_every,
-            eval_samples,
-            gradient_clip,
-        } => {
-            if let Err(e) = commands::resume::execute(
-                &checkpoint,
-                &data,
-                val_data.as_ref(),
-                &output,
-                &model_size,
-                additional_steps,
-                save_every,
-                batch_size,
-                grad_accum,
-                learning_rate,
-                seq_len,
-                eval_every,
-                eval_samples,
-                gradient_clip,
-            ) {
-                eprintln!("❌ Erro: {}", e);
-                std::process::exit(1);
-            }
-        }
+        Commands::Train(args) => commands::train::execute(args).map_err(Into::into),
 
         Commands::TestModel {
             model,
             tokenizer,
             model_size,
-        } => commands::test_model::execute(&model, &tokenizer, &model_size),
+        } => {
+            commands::test_model::execute(&model, &tokenizer, &model_size);
+            Ok(())
+        },
 
         Commands::Generate {
             model,
@@ -361,7 +234,7 @@ fn main() {
             top_k,
             json,
         } => {
-            if let Err(e) = commands::generate::execute(
+            commands::generate::execute(
                 &model,
                 &tokenizer,
                 &prompt,
@@ -370,21 +243,27 @@ fn main() {
                 temperature,
                 top_k,
                 json,
-            ) {
-                eprintln!("❌ Erro: {}", e);
-                std::process::exit(1);
-            }
-        }
+            ).map_err(Into::into)
+        },
 
-        Commands::AuditCorpus { input, output } => commands::audit::execute(&input, &output),
+        Commands::AuditCorpus { input, output } => {
+            commands::audit::execute(&input, &output);
+            Ok(())
+        },
 
         Commands::CleanCorpus {
             input,
             output,
             verbose,
-        } => commands::clean_corpus::execute(&input, &output, verbose),
+        } => {
+            commands::clean_corpus::execute(&input, &output, verbose);
+            Ok(())
+        },
 
-        Commands::Info { model_size } => commands::info::execute(&model_size),
+        Commands::Info { model_size } => {
+            commands::info::execute(&model_size);
+            Ok(())
+        },
 
         Commands::BuildDataset {
             tokenizer,
@@ -395,25 +274,38 @@ fn main() {
             clean,
             seed,
         } => {
-            if let Err(e) = commands::build_dataset::execute(&tokenizer, &output, &source, min_chars, blocks, clean, seed) {
-                eprintln!("❌ Erro: {}", e);
-                std::process::exit(1);
-            }
-        }
+            commands::build_dataset::execute(
+                &tokenizer, &output, &source, min_chars, blocks, clean, seed
+            ).map_err(Into::into)
+        },
 
-        Commands::TestGpu { model_size, seq_len } => commands::test_gpu::execute(&model_size, seq_len),
+        Commands::TestGpu { model_size, seq_len } => {
+            commands::test_gpu::execute(&model_size, seq_len);
+            Ok(())
+        },
 
         Commands::FindLr {
             data,
             tokenizer,
             model_size,
             num_steps,
-        } => commands::find_lr::execute(&data, &tokenizer, &model_size, num_steps),
+        } => {
+            commands::find_lr::execute(&data, &tokenizer, &model_size, num_steps);
+            Ok(())
+        },
 
         Commands::Benchmark {
             model_size,
             seq_len,
             num_iterations,
-        } => commands::benchmark::execute(&model_size, seq_len, num_iterations),
+        } => {
+            commands::benchmark::execute(&model_size, seq_len, num_iterations);
+            Ok(())
+        },
+    };
+
+    if let Err(e) = result {
+        eprintln!("❌ Erro: {}", e);
+        std::process::exit(1);
     }
 }

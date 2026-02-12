@@ -21,4 +21,3 @@ pub use trainer::{Trainer, TrainStats};
 pub use validation::{Validator, ValidationMetrics, EarlyStopping};
 pub use precision::{Precision, GradScaler};
 pub use wkv_optimized::{WKVConfig, wkv_linear, wkv_parallel_scan};
-pub use wkv_cuda_ffi::{cuda_kernel_available, get_cuda_kernel};

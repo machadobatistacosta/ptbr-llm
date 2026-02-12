@@ -2,9 +2,11 @@
 
 pub mod data;
 pub mod error;
+pub use error::{PtbrError, Result};
 pub mod model;
 pub mod tokenizer;
-pub mod logger;
+pub mod helpers;
+mod logger;
 pub mod utils;
 
 // Re-exports principais
@@ -14,28 +16,21 @@ pub use tokenizer::{BPETokenizer, BPETrainer, PTBRNormalizer, BPEVocab};
 
 /// Retorna nome do backend ativo
 pub fn backend_name() -> &'static str {
-    #[cfg(all(feature = "cuda", not(feature = "cpu"), not(feature = "gpu")))]
-    {
-        return "CUDA";
-    }
-    
-    #[cfg(all(feature = "gpu", not(feature = "cuda"), not(feature = "cpu")))]
-    {
-        return "WGPU";
-    }
-    
-    #[cfg(all(feature = "cpu", not(feature = "cuda"), not(feature = "gpu")))]
-    {
-        return "CPU (NdArray)";
-    }
-    
-    // Fallback
-    #[cfg(not(any(
-        all(feature = "cuda", not(feature = "cpu"), not(feature = "gpu")),
-        all(feature = "gpu", not(feature = "cuda"), not(feature = "cpu")),
-        all(feature = "cpu", not(feature = "cuda"), not(feature = "gpu"))
-    )))]
-    {
-        return "CPU (NdArray) [fallback]";
-    }
+    #[cfg(feature = "cuda")]
+    { "CUDA" }
+
+    #[cfg(all(feature = "gpu", not(feature = "cuda")))]
+    { "WGPU" }
+
+    #[cfg(not(any(feature = "cuda", feature = "gpu")))]
+    { "CPU (NdArray)" }
 }
+
+#[cfg(all(feature = "cuda", feature = "cpu"))]
+compile_error!("Features 'cuda' and 'cpu' are mutually exclusive. Pick one.");
+
+#[cfg(all(feature = "cuda", feature = "gpu"))]
+compile_error!("Features 'cuda' and 'gpu' are mutually exclusive. Pick one.");
+
+#[cfg(all(feature = "cpu", feature = "gpu"))]
+compile_error!("Features 'cpu' and 'gpu' are mutually exclusive. Pick one.");

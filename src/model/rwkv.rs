@@ -25,8 +25,6 @@ pub struct RWKVState<B: Backend> {
     pub channel_state: Vec<Tensor<B, 2>>,
     /// Bug #4: Post-LN1 output from previous timestep (for token_shift in TimeMixing)
     pub prev_time_input: Vec<Tensor<B, 2>>,
-    /// Bug #4: Post-LN2 output from previous timestep (for token_shift in ChannelMixing)
-    pub prev_channel_input: Vec<Tensor<B, 2>>,
 }
 
 impl<B: Backend> RWKVState<B> {
@@ -36,16 +34,13 @@ impl<B: Backend> RWKVState<B> {
                 .map(|_| (
                     Tensor::zeros([batch_size, d_model], device),
                     Tensor::zeros([batch_size, d_model], device),
-                    Tensor::zeros([batch_size, d_model], device),
+                    Tensor::zeros([batch_size, d_model], device).add_scalar(-1e30),
                 ))
                 .collect(),
             channel_state: (0..n_layers)
                 .map(|_| Tensor::zeros([batch_size, d_model], device))
                 .collect(),
             prev_time_input: (0..n_layers)
-                .map(|_| Tensor::zeros([batch_size, d_model], device))
-                .collect(),
-            prev_channel_input: (0..n_layers)
                 .map(|_| Tensor::zeros([batch_size, d_model], device))
                 .collect(),
         }
@@ -58,11 +53,10 @@ impl<B: Backend> RWKVState<B> {
             self.time_state[i] = (
                 Tensor::zeros([batch_size, d_model], device),
                 Tensor::zeros([batch_size, d_model], device),
-                Tensor::zeros([batch_size, d_model], device),
+                Tensor::zeros([batch_size, d_model], device).add_scalar(-1e30),
             );
             self.channel_state[i] = Tensor::zeros([batch_size, d_model], device);
             self.prev_time_input[i] = Tensor::zeros([batch_size, d_model], device);
-            self.prev_channel_input[i] = Tensor::zeros([batch_size, d_model], device);
         }
     }
 }
@@ -178,7 +172,6 @@ impl<B: Backend> RWKV<B> {
                 &mut state.time_state[layer_idx],
                 &mut state.channel_state[layer_idx],
                 &mut state.prev_time_input[layer_idx],
-                &mut state.prev_channel_input[layer_idx],
             );
         }
 
@@ -250,7 +243,6 @@ impl<B: Backend> RWKVBlock<B> {
         time_state: &mut (Tensor<B, 2>, Tensor<B, 2>, Tensor<B, 2>),
         channel_state: &mut Tensor<B, 2>,
         prev_time_input: &mut Tensor<B, 2>,
-        prev_channel_input: &mut Tensor<B, 2>,
     ) -> Tensor<B, 2> {
         let [b, c] = x.dims();
 
@@ -265,7 +257,6 @@ impl<B: Backend> RWKVBlock<B> {
         // ChannelMixing with post-LN2 token shift
         let ln2_out = self.ln2.forward(x.clone().reshape([b, 1, c])).reshape([b, c]);
         let cm = self.channel_mixing.forward_step(ln2_out.clone(), channel_state);
-        *prev_channel_input = ln2_out;  // Bug #4: Save POST-LN2 for next timestep
         
         x + cm
     }

@@ -11,7 +11,7 @@ use rand::distributions::WeightedIndex;
 use rand::prelude::*;
 
 use crate::backend::{MyBackend, get_device};
-use crate::error::{PtbrLlmError, Result};
+use crate::error::{PtbrError, Result};
 use crate::helpers::get_model_config;
 use crate::model::{RWKV, RWKVState};
 use crate::tokenizer::BPETokenizer;
@@ -42,7 +42,7 @@ pub fn execute(
     let device = get_device();
 
     let tokenizer = BPETokenizer::from_file(tokenizer_path.to_str().unwrap())
-        .map_err(|e| PtbrLlmError::TokenizerLoad(e.to_string()))?;
+        .map_err(|e| PtbrError::TokenizerLoad(e.to_string()))?;
 
     let mut config = get_model_config(model_size);
     config.dropout = 0.0;
@@ -55,7 +55,7 @@ pub fn execute(
                 &CompactRecorder::new(),
                 &device,
             )
-            .map_err(|e: burn::record::RecorderError| PtbrLlmError::CheckpointLoad(e.to_string()))?
+            .map_err(|e: burn::record::RecorderError| PtbrError::CheckpointLoad(e.to_string()))?
     } else {
         model_raw
     };

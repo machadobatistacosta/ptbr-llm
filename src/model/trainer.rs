@@ -10,23 +10,35 @@
 //! - Tracking de métricas para debug
 //! - Sanity check para validar dados de entrada
 
-use super::config::{RWKVConfig, TrainingConfig};
-use super::rwkv::RWKV;
+use std::io::Write;
+use std::path::{Path, PathBuf};
+use std::time::Instant;
+
 use burn::{
     grad_clipping::GradientClippingConfig,
     module::Module,
+    module::AutodiffModule,
     optim::{adaptor::OptimizerAdaptor, AdamW, AdamWConfig, GradientsParams, Optimizer, GradientsAccumulator},
     record::CompactRecorder,
     tensor::{activation, backend::AutodiffBackend, ElementConversion, Int, Tensor},
 };
 
+use crate::data::{DataLoader, MmapDataset};
+use crate::error::{PtbrError, Result};
+use crate::helpers::create_batch_tensor;
+use crate::model::Evaluator;
+use crate::tokenizer::BPETokenizer;
+use crate::utils::{format_duration, format_number};
+
+use super::config::{RWKVConfig, TrainingConfig};
+use super::rwkv::RWKV;
+
 /// Estatísticas de um step de treino
 #[derive(Debug, Clone, Default)]
 pub struct TrainStats {
     pub loss: f32,
-    pub grad_norm: f32,
+    pub update_norm: f32,
     pub lr: f64,
-    pub clipped: bool,
 }
 
 /// Trainer para o modelo RWKV
@@ -46,14 +58,10 @@ pub struct Trainer<B: AutodiffBackend> {
     accumulator: GradientsAccumulator<RWKV<B>>,
     
     // Métricas
-    last_grad_norm: f32,
+    last_update_norm: f32,
     ema_loss: f32,
     best_loss: f32,
     prev_loss: f32,
-    
-    // Tracking de clips
-    clips_this_epoch: usize,
-    total_clips: usize,
     
     device: B::Device,
     #[allow(dead_code)]
@@ -88,17 +96,219 @@ impl<B: AutodiffBackend> Trainer<B> {
             step: 0,
             micro_step: 0,
             accumulated_loss: 0.0,
+
             accumulator,
-            last_grad_norm: 0.0,
+            last_update_norm: 0.0,
             ema_loss: f32::NAN,  // Bug #15 fix: Use NaN to detect first value
             best_loss: f32::MAX,
             prev_loss: 10.0,
-            clips_this_epoch: 0,
-            total_clips: 0,
             device,
             steps_since_cleanup: 0,
             consecutive_nan_count: 0,
         }
+    }
+
+    pub fn from_checkpoint(
+        checkpoint_path: &Path,
+        model_config: &RWKVConfig,
+        train_config: TrainingConfig,
+        device: B::Device
+    ) -> Result<Self> {
+        let mut trainer = Self::new(model_config, train_config, device);
+        trainer.load_checkpoint(checkpoint_path.to_str().unwrap())?;
+        Ok(trainer)
+    }
+
+    pub fn fit(
+        &mut self,
+        dataset: &mut MmapDataset,
+        val_dataset: Option<&MmapDataset>,
+        tokenizer: &BPETokenizer,
+        output: &PathBuf,
+        eval_samples: usize,
+        eval_every: usize,
+    ) -> Result<()> {
+        let start = Instant::now();
+        let initial_step = self.step;
+        let max_steps = self.config.max_steps;
+        let batch_size = self.config.batch_size;
+        let save_every = self.config.save_every;
+
+        let mut last_log = Instant::now();
+        let mut tokens_since_log = 0usize;
+        let mut epoch = 0;
+
+        let sample_prompts = ["O Brasil é", "A Constituição Federal", "Em 2024"];
+        
+        // Cria evaluator para métricas de validação
+        let evaluator = Evaluator::new(eval_samples);
+
+        std::fs::create_dir_all(output)?;
+        let mut metrics_file = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(output.join("metrics.csv"))
+            .map_err(|e| PtbrError::Io(e))?;
+
+        if self.step == 0 {
+             writeln!(
+                metrics_file,
+                "step,loss,ppl,lr,update_norm,tokens_per_sec,eval_loss,eval_ppl"
+            ).map_err(|e| PtbrError::Io(e))?;
+        }
+
+        'training: loop {
+            dataset.shuffle(42 + epoch);
+            let loader = DataLoader::new(dataset, batch_size);
+            let total_batches = loader.total_batches();
+
+            if epoch == 0 && self.step == 0 {
+                println!("  📦 Processando {} batches no primeiro epoch...", total_batches);
+                std::io::stdout().flush().map_err(|e| PtbrError::Io(e))?;
+            }
+
+            let mut loader_iter = loader.into_iter();
+
+            while let Some((inputs, targets)) = loader_iter.next() {
+                
+                // Validação do batch
+                if inputs.is_empty() || targets.is_empty() {
+                    continue;
+                }
+                
+                let seq_len = inputs[0].len();
+                if seq_len == 0 {
+                    continue;
+                }
+                
+                // Valida que todas as sequências têm o mesmo tamanho
+                if !inputs.iter().all(|x| x.len() == seq_len) || !targets.iter().all(|x| x.len() == seq_len) {
+                    continue;
+                }
+                
+                // Cria tensores
+                let input_tensor = create_batch_tensor::<B>(&inputs, &self.device);
+                let target_tensor = create_batch_tensor::<B>(&targets, &self.device);
+
+                // Train step
+                if let Some(stats) = self.train_step(input_tensor, target_tensor) {
+                    let step = self.step;
+                    let steps_done = step - initial_step;
+                    tokens_since_log +=
+                        batch_size * seq_len * self.config.gradient_accumulation_steps;
+
+                    // Log imediato no primeiro step
+                    if step == 1 {
+                        println!("  ✅ Primeiro step completo! Loss inicial: {:.4}", stats.loss);
+                        std::io::stdout().flush().map_err(|e| PtbrError::Io(e))?;
+                    }
+
+                    // Log periódico
+                    if last_log.elapsed().as_secs() >= 5 || step == 1 {
+                        let elapsed = start.elapsed().as_secs_f64();
+                        let steps_per_sec = steps_done as f64 / elapsed;
+                        let tokens_per_sec = tokens_since_log as f64 / last_log.elapsed().as_secs_f64();
+                        let remaining = max_steps.saturating_sub(steps_done);
+                        let eta_secs = remaining as f64 / steps_per_sec.max(0.01);
+                        let ppl = (stats.loss as f64).exp();
+
+                        println!(
+                            "  Step {:>6} | Loss: {:.4} | PPL: {:>7.2} | LR: {:.2e} | Upd: {:.3} | {:.1}K tok/s | ETA: {}",
+                            step,
+                            stats.loss,
+                            ppl,
+                            stats.lr,
+                            stats.update_norm,
+                            tokens_per_sec / 1000.0,
+                            format_duration(eta_secs as u64)
+                        );
+
+                        writeln!(
+                            metrics_file,
+                            "{},{:.6},{:.2},{:.2e},{:.4},{:.1},,",
+                            step, stats.loss, ppl, stats.lr, stats.update_norm, tokens_per_sec
+                        )
+                        .ok();
+
+                        last_log = Instant::now();
+                        tokens_since_log = 0;
+                    }
+
+                    // Evaluation - use val_dataset if available
+                    if step % eval_every == 0 && step > 0 {
+                        let eval_data = val_dataset.unwrap_or(dataset);
+                        let eval_metrics = evaluator.evaluate(&self.model.valid(), eval_data, &self.device);
+                        println!(
+                            "  📊 Eval Step {} | {}",
+                            step, eval_metrics
+                        );
+
+                        writeln!(
+                            metrics_file, 
+                            "{},,,,,,{:.6},{:.2}",
+                            step, eval_metrics.loss, eval_metrics.perplexity
+                        ).ok();
+
+                        // Gera samples
+                        if tokenizer.vocab_size() > 256 {
+                            println!("  📝 Samples:");
+                            for prompt in &sample_prompts {
+                                let sample = self.generate_sample(tokenizer, prompt, 30);
+                                println!("     \"{}\" → {}", prompt, sample.trim());
+                            }
+                        }
+                        println!();
+                    }
+
+                    if step % save_every == 0 && step > 0 {
+                        let ckpt_path = output.join(format!("checkpoint_{}", step));
+                        match self.save_checkpoint(ckpt_path.to_str().unwrap()) {
+                            Ok(_) => println!("  💾 Checkpoint salvo: {:?}", ckpt_path),
+                            Err(e) => println!("  ⚠️ Erro salvando: {}", e),
+                        }
+                    }
+
+                    // Check completion
+                    if self.step >= max_steps {
+                        break 'training;
+                    }
+                }
+                // Se train_step retornou None, verifica se precisa pular batches (muitos NaN)
+                let skip_count = self.should_skip_batches();
+                if skip_count > 0 {
+                    eprintln!(
+                        "  ⏭️ Skipping {} batches after {} consecutive NaN",
+                        skip_count, 5
+                    );
+                    for _ in 0..skip_count {
+                        if loader_iter.next().is_none() {
+                            break;
+                        }
+                    }
+                }
+            }
+
+            epoch += 1;
+            dataset.next_epoch();
+            println!("  📚 Epoch {} completa", epoch);
+        }
+
+        // Salva modelo final
+        let final_path = output.join(format!("model_final_step_{}", self.step));
+        self.save_checkpoint(final_path.to_str().unwrap())
+            .expect("Erro salvando modelo final");
+
+        let elapsed = start.elapsed();
+        println!();
+        println!("═══════════════════════════════════════════════════════════");
+        println!("  ✅ Treinamento concluído!");
+        println!("  Steps: {}", self.step);
+        println!("  Tempo: {}", format_duration(elapsed.as_secs()));
+        println!("  EMA Loss: {:.4}", self.ema_loss());
+        println!("  Modelo: {:?}", final_path);
+        println!("═══════════════════════════════════════════════════════════");
+        
+        Ok(())
     }
 
     /// Executa um step de treinamento com gradient accumulation REAL
@@ -168,26 +378,21 @@ impl<B: AutodiffBackend> Trainer<B> {
                 .zip(decay_after.iter())
                 .map(|(a, b): (&f32, &f32)| (a - b).powi(2))
                 .sum();
-            let grad_norm = update_sq_sum.sqrt();
+            let update_norm = update_sq_sum.sqrt();
             
             // Real clipping is done internally by Burn
-            let was_clipped = false; 
             
             // Log warnings for update issues  
-            if grad_norm < 1e-10 && self.step > 10 {
-                eprintln!("  ⚠️  VANISHING UPDATES: ||Δw||={:.2e}", grad_norm);
-            } else if grad_norm > 1.0 {
-                eprintln!("  ⚠️  LARGE UPDATES: ||Δw||={:.2e}", grad_norm);
+            if update_norm < 1e-10 && self.step > 10 {
+                eprintln!("  ⚠️  VANISHING UPDATES: ||Δw||={:.2e}", update_norm);
+            } else if update_norm > 1.0 {
+                eprintln!("  ⚠️  LARGE UPDATES: ||Δw||={:.2e}", update_norm);
             }
             
             // Update metrics
             self.prev_loss = self.ema_loss;
             self.step += 1;
-            self.last_grad_norm = grad_norm;
-            if was_clipped {
-                self.clips_this_epoch += 1;
-                self.total_clips += 1;
-            }
+            self.last_update_norm = update_norm;
             
             // Bug #15 fix: Use is_nan() instead of < 0.0
             if self.ema_loss.is_nan() {
@@ -206,9 +411,8 @@ impl<B: AutodiffBackend> Trainer<B> {
             
             return Some(TrainStats {
                 loss: avg_loss,
-                grad_norm,
+                update_norm,
                 lr: current_lr,
-                clipped: was_clipped,
             });
         }
         
@@ -303,33 +507,32 @@ impl<B: AutodiffBackend> Trainer<B> {
         }
     }
 
-    pub fn save_checkpoint(&self, path: &str) -> std::io::Result<()> {
+    pub fn save_checkpoint(&self, path: &str) -> Result<()> {
         let path = path.trim_end_matches(".mpk").trim_end_matches(".bin");
         if let Some(parent) = std::path::Path::new(path).parent() {
-            std::fs::create_dir_all(parent)?;
+            std::fs::create_dir_all(parent).map_err(|e| PtbrError::Io(e))?;
         }
         
         let recorder = CompactRecorder::new();
         self.model
             .clone()
             .save_file(path, &recorder)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| PtbrError::FileWrite { path: PathBuf::from(path), source: std::io::Error::new(std::io::ErrorKind::Other, e.to_string()) })?;
         
         let meta = format!(
-            "step={}\nlr={:.6e}\nema_loss={:.6}\nbest_loss={:.6}\nlast_grad_norm={:.6}\ntotal_clips={}\n",
+            "step={}\nlr={:.6e}\nema_loss={:.6}\nbest_loss={:.6}\nlast_update_norm={:.6}\n",
             self.step,
             self.get_learning_rate(),
             self.ema_loss,
             self.best_loss,
-            self.last_grad_norm,
-            self.total_clips,
+            self.last_update_norm,
         );
-        std::fs::write(format!("{}.meta", path), meta)?;
+        std::fs::write(format!("{}.meta", path), meta).map_err(|e| PtbrError::Io(e))?;
         
         Ok(())
     }
 
-    pub fn load_checkpoint(&mut self, path: &str) -> std::io::Result<()> {
+    pub fn load_checkpoint(&mut self, path: &str) -> Result<()> {
         let path = path.trim_end_matches(".mpk").trim_end_matches(".bin");
         let recorder = CompactRecorder::new();
         
@@ -337,7 +540,7 @@ impl<B: AutodiffBackend> Trainer<B> {
             .model
             .clone()
             .load_file(path, &recorder, &self.device)
-            .map_err(|e| std::io::Error::new(std::io::ErrorKind::Other, e.to_string()))?;
+            .map_err(|e| PtbrError::CheckpointLoad(e.to_string()))?;
         
         if let Ok(meta) = std::fs::read_to_string(format!("{}.meta", path)) {
             for line in meta.lines() {
@@ -351,7 +554,7 @@ impl<B: AutodiffBackend> Trainer<B> {
                     self.best_loss = val.parse().unwrap_or(f32::MAX);
                 }
                 if let Some(val) = line.strip_prefix("total_clips=") {
-                    self.total_clips = val.parse().unwrap_or(0);
+                    // Backwards compatibility: ignore or log
                 }
             }
         }
@@ -370,14 +573,6 @@ impl<B: AutodiffBackend> Trainer<B> {
     pub fn ema_loss(&self) -> f32 { self.ema_loss }
     pub fn best_loss(&self) -> f32 { self.best_loss }
     
-    pub fn clip_stats(&self) -> (usize, usize) {
-        (self.clips_this_epoch, self.total_clips)
-    }
-    
-    pub fn reset_epoch_clips(&mut self) {
-        self.clips_this_epoch = 0;
-    }
-    
     pub fn consecutive_nan_count(&self) -> usize {
         self.consecutive_nan_count
     }
@@ -390,5 +585,48 @@ impl<B: AutodiffBackend> Trainer<B> {
         } else {
             0
         }
+    }
+    
+    pub fn generate_sample(
+        &self,
+        tokenizer: &BPETokenizer,
+        prompt: &str,
+        max_tokens: usize,
+    ) -> String {
+        let inference_model = self.model.valid();
+        let mut tokens = tokenizer.encode(prompt);
+    
+        for _ in 0..max_tokens {
+            if tokens.len() > 512 {
+                tokens = tokens[tokens.len() - 512..].to_vec();
+            }
+    
+            let input_vec: Vec<i32> = tokens.iter().map(|&t| t as i32).collect();
+            let seq_len = input_vec.len();
+    
+            // Use B::InnerBackend for inference model (autodiff stripped)
+            let input: Tensor<B::InnerBackend, 1, Int> = Tensor::from_ints(input_vec.as_slice(), &self.device);
+            let input = input.reshape([1, seq_len]);
+    
+            let logits = inference_model.forward(input);
+            let [_, s, v] = logits.dims();
+            let last_logits = logits.slice([0..1, s - 1..s, 0..v]).reshape([v]);
+    
+            let logits_data: Vec<f32> = last_logits.into_data().iter::<f32>().collect();
+            let next_token = logits_data
+                .iter()
+                .enumerate()
+                .max_by(|a, b| a.1.partial_cmp(b.1).unwrap())
+                .map(|(i, _)| i as u16)
+                .unwrap_or(0);
+    
+            if next_token == tokenizer.eos_id() {
+                break;
+            }
+    
+            tokens.push(next_token);
+        }
+    
+        tokenizer.decode(&tokens)
     }
 }
