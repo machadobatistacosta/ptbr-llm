@@ -49,7 +49,7 @@ pub fn execute(
         batch_size: safe_batch,
         gradient_accumulation_steps: safe_grad_accum,
         // Bug #3 fix: Force warmup=200 after resume (optimizer state is not persisted)
-        warmup_steps: 200,
+        warmup_steps: 0,
         max_steps: additional_steps,
         // Bug #10: Use default 0.001 instead of hardcoded 0.01
         gradient_clip,
