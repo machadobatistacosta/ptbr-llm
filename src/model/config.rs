@@ -1,9 +1,7 @@
-//! Configurações otimizadas - CORRIGIDO
-//! 
-//! Fixes:
-//! 1. d_ffn = 4 * d_model (padrão RWKV, era 3.5x)
-//! 2. max_seq_len consistente
-//! 3. Removido dropout default (não ajuda com poucos dados)
+//! Configurações otimizadas — suporta RWKV v4 e v7
+//!
+//! v4: WKV com decay fixo (4 projeções)
+//! v7: WKV com decay dinâmico + LoRA-like state (7 projeções)
 
 use burn::config::Config;
 
@@ -32,77 +30,162 @@ pub struct RWKVConfig {
 
     #[config(default = "true")]
     pub weight_tying: bool,
+
+    // === RWKV-7 specific fields ===
+
+    /// RWKV version: 4 or 7
+    #[config(default = "4")]
+    pub rwkv_version: usize,
+
+    /// Head size (v7 only). n_head = d_model / head_size
+    #[config(default = "64")]
+    pub head_size: usize,
+
+    /// Low-rank dimension for w, a, g, v projections (v7)
+    /// Default = d_model / 16. Set to 0 to auto-compute.
+    #[config(default = "0")]
+    pub low_rank_dim: usize,
 }
 
 impl RWKVConfig {
-    /// Bug #11 fix: Renamed from ptbr_85m - actual params ~140M not 85M
-    /// ~140M params: d_model=768, n_layers=12, d_ffn=3072 (with weight tying)
+    /// Effective low_rank dimension (auto-compute if 0)
+    pub fn effective_low_rank(&self) -> usize {
+        if self.low_rank_dim > 0 {
+            self.low_rank_dim
+        } else {
+            (self.d_model / 16).max(32)
+        }
+    }
+
+    /// Number of attention heads (v7) = d_model / head_size
+    pub fn n_head(&self) -> usize {
+        self.d_model / self.head_size
+    }
+
+    // ================================
+    // RWKV-4 Presets
+    // ================================
+
+    /// ~140M params RWKV-4: d_model=768, n_layers=12
     pub fn ptbr_140m() -> Self {
         Self {
             vocab_size: 32_000,
             d_model: 768,
             n_layers: 12,
-            d_ffn: 3072,       // ✅ FIX: 4 * 768 (era 2688 = 3.5x)
+            d_ffn: 3072,
             max_seq_len: 512,
             dropout: 0.0,
             layer_norm_eps: 1e-5,
             weight_tying: true,
+            rwkv_version: 4,
+            head_size: 64,
+            low_rank_dim: 0,
         }
     }
 
-    /// 400M - OTIMIZADO para T4 16GB
+    /// 400M RWKV-4
     pub fn ptbr_400m() -> Self {
         Self {
             vocab_size: 32_000,
             d_model: 1024,
             n_layers: 24,
-            d_ffn: 4096,       // ✅ FIX: 4 * 1024 (era 3584 = 3.5x)
-            max_seq_len: 512,  // ✅ FIX: era 256, agora 512 (cabe na T4)
-            dropout: 0.0,      // ✅ FIX: sem dropout (poucos dados)
+            d_ffn: 4096,
+            max_seq_len: 512,
+            dropout: 0.0,
             layer_norm_eps: 1e-5,
             weight_tying: true,
+            rwkv_version: 4,
+            head_size: 64,
+            low_rank_dim: 0,
         }
     }
 
-    /// 800M - Para T4 com seq_len reduzido
+    /// 800M RWKV-4
     pub fn ptbr_800m() -> Self {
         Self {
             vocab_size: 32_000,
             d_model: 1536,
             n_layers: 24,
-            d_ffn: 6144,       // ✅ FIX: 4 * 1536
+            d_ffn: 6144,
             max_seq_len: 256,
             dropout: 0.0,
             layer_norm_eps: 1e-5,
             weight_tying: true,
+            rwkv_version: 4,
+            head_size: 64,
+            low_rank_dim: 0,
         }
     }
 
-    /// 1B - Limite T4
+    /// 1B RWKV-4
     pub fn ptbr_1b() -> Self {
         Self {
             vocab_size: 32_000,
             d_model: 2048,
             n_layers: 24,
-            d_ffn: 8192,       // ✅ FIX: 4 * 2048
+            d_ffn: 8192,
             max_seq_len: 128,
             dropout: 0.0,
             layer_norm_eps: 1e-5,
             weight_tying: true,
+            rwkv_version: 4,
+            head_size: 64,
+            low_rank_dim: 0,
         }
     }
 
-    /// 1.5B - Apenas inferência na T4
+    /// 1.5B RWKV-4
     pub fn ptbr_1_5b() -> Self {
         Self {
             vocab_size: 32_000,
             d_model: 2304,
             n_layers: 28,
-            d_ffn: 9216,       // ✅ FIX: 4 * 2304
+            d_ffn: 9216,
             max_seq_len: 64,
             dropout: 0.0,
             layer_norm_eps: 1e-5,
             weight_tying: true,
+            rwkv_version: 4,
+            head_size: 64,
+            low_rank_dim: 0,
+        }
+    }
+
+    // ================================
+    // RWKV-7 Presets
+    // ================================
+
+    /// ~140M RWKV-7: d_model=768, 12 layers, head_size=64
+    pub fn ptbr_140m_v7() -> Self {
+        Self {
+            vocab_size: 32_000,
+            d_model: 768,
+            n_layers: 12,
+            d_ffn: 3072,
+            max_seq_len: 512,
+            dropout: 0.0,
+            layer_norm_eps: 1e-5,
+            weight_tying: true,
+            rwkv_version: 7,
+            head_size: 64,
+            low_rank_dim: 0,  // auto: 768/16 = 48
+        }
+    }
+
+    /// ~400M RWKV-7: d_model=1024, 24 layers, head_size=64
+    pub fn ptbr_400m_v7() -> Self {
+        Self {
+            vocab_size: 32_000,
+            d_model: 1024,
+            n_layers: 24,
+            d_ffn: 4096,
+            max_seq_len: 512,
+            dropout: 0.0,
+            layer_norm_eps: 1e-5,
+            weight_tying: true,
+            rwkv_version: 7,
+            head_size: 64,
+            low_rank_dim: 0,  // auto: 1024/16 = 64
         }
     }
 

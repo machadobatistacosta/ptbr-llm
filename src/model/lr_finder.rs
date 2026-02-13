@@ -3,6 +3,8 @@
 
 use crate::data::{DataLoader, MmapDataset};
 use crate::model::{RWKVConfig, Trainer, TrainingConfig};
+use super::traits::RWKVModel;
+use burn::module::AutodiffModule;
 use burn::tensor::{backend::AutodiffBackend, Int, Tensor};
 
 pub struct LRFinderResult {
@@ -12,14 +14,20 @@ pub struct LRFinderResult {
 }
 
 /// Encontra learning rate ótimo usando range test
-pub fn find_lr<B: AutodiffBackend>(
+pub fn find_lr<B, M>(
+    model: M,
     model_config: &RWKVConfig,
     dataset: &MmapDataset,
     device: &B::Device,
     start_lr: f64,
     end_lr: f64,
     num_steps: usize,
-) -> LRFinderResult {
+) -> LRFinderResult
+where
+    B: AutodiffBackend,
+    M: RWKVModel<B> + AutodiffModule<B>,
+    <M as AutodiffModule<B>>::InnerModule: RWKVModel<B::InnerBackend>,
+{
     let lr_mult = (end_lr / start_lr).powf(1.0 / num_steps as f64);
     let mut current_lr = start_lr;
 
@@ -40,7 +48,7 @@ pub fn find_lr<B: AutodiffBackend>(
         ..Default::default()
     };
 
-    let mut trainer: Trainer<B> = Trainer::new(model_config, train_config, device.clone());
+    let mut trainer = Trainer::new(model, model_config, train_config, device.clone());
     let loader = DataLoader::new(dataset, 1);
 
     for (i, (inputs, targets)) in loader.into_iter().enumerate() {

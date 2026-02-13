@@ -8,13 +8,15 @@ use crate::model::RWKVConfig;
 /// Returns model configuration based on size string
 pub fn get_model_config(model_size: &str) -> RWKVConfig {
     match model_size {
-        // Bug #11 fix: Renamed 85m to 140m (actual param count)
-        // Keep "85m" as alias for backwards compatibility
+        // RWKV-4
         "140m" | "140M" | "85m" | "85M" => RWKVConfig::ptbr_140m(),
         "400m" | "400M" => RWKVConfig::ptbr_400m(),
         "800m" | "800M" => RWKVConfig::ptbr_800m(),
         "1b" | "1B" => RWKVConfig::ptbr_1b(),
         "1.5b" | "1.5B" => RWKVConfig::ptbr_1_5b(),
+        // RWKV-7
+        "140m-v7" | "140M-v7" => RWKVConfig::ptbr_140m_v7(),
+        "400m-v7" | "400M-v7" => RWKVConfig::ptbr_400m_v7(),
         _ => {
             println!("  ⚠️ Tamanho '{}' não reconhecido, usando 140m", model_size);
             RWKVConfig::ptbr_140m()

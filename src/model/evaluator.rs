@@ -2,7 +2,7 @@
 //! Avaliador OTIMIZADO - Batch evaluation sem fragmentação de VRAM
 
 use burn::tensor::{backend::Backend, activation, ElementConversion, Int, Tensor};
-use crate::model::RWKV;
+use super::traits::RWKVModel;
 use crate::data::MmapDataset;
 
 #[derive(Debug, Clone, Default)]
@@ -41,10 +41,10 @@ impl Evaluator {
         self
     }
 
-    /// ✨ Avaliação em batch (muito mais eficiente)
-    pub fn evaluate<B: Backend>(
+    /// ✨ Avaliação em batch (genérica sobre M: RWKVModel)
+    pub fn evaluate<B: Backend, M: RWKVModel<B>>(
         &self,
-        model: &RWKV<B>,
+        model: &M,
         dataset: &MmapDataset,
         device: &B::Device,
     ) -> EvalMetrics {
@@ -92,8 +92,8 @@ impl Evaluator {
                 t.reshape([valid_count, seq_len])
             };
 
-            // Forward
-            let logits = model.forward(input_tensor);
+            // Forward (uses trait method)
+            let logits = model.forward_train(input_tensor);
             let loss = self.cross_entropy::<B>(logits, target_tensor);
 
             total_loss += loss as f64 * (valid_count * seq_len) as f64;

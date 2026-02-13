@@ -7,7 +7,7 @@ use std::path::PathBuf;
 use crate::backend::{TrainBackend, get_device};
 use crate::data::MmapDataset;
 use crate::helpers::get_model_config;
-use crate::model::{find_lr as find_lr_fn, LRFinderResult};
+use crate::model::{find_lr as find_lr_fn, LRFinderResult, RWKV, RWKV_V7};
 use crate::utils::format_number;
 
 pub fn execute(data: &PathBuf, _tokenizer_path: &PathBuf, model_size: &str, num_steps: usize) {
@@ -39,15 +39,21 @@ pub fn execute(data: &PathBuf, _tokenizer_path: &PathBuf, model_size: &str, num_
     println!("  LR Range: {:.2e} → {:.2e}", start_lr, end_lr);
     println!();
 
-    // Usa função do módulo lr_finder
-    let result: LRFinderResult = find_lr_fn::<TrainBackend>(
-        &config,
-        &dataset,
-        &device,
-        start_lr,
-        end_lr,
-        num_steps,
-    );
+    // Dispatch based on version
+    let result: LRFinderResult = match config.rwkv_version {
+        7 => {
+            let model = RWKV_V7::new(&config, &device);
+            find_lr_fn::<TrainBackend, _>(
+                model, &config, &dataset, &device, start_lr, end_lr, num_steps,
+            )
+        }
+        _ => {
+            let model = RWKV::new(&config, &device);
+            find_lr_fn::<TrainBackend, _>(
+                model, &config, &dataset, &device, start_lr, end_lr, num_steps,
+            )
+        }
+    };
 
     // Log durante execução
     for (i, (lr, loss)) in result.lrs.iter().zip(result.losses.iter()).enumerate() {
@@ -66,3 +72,4 @@ pub fn execute(data: &PathBuf, _tokenizer_path: &PathBuf, model_size: &str, num_
     println!("  (Use ~10x menor para estabilidade: {:.2e})", result.suggested_lr / 10.0);
     println!("═══════════════════════════════════════════════════════════");
 }
+

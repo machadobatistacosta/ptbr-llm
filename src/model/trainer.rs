@@ -31,7 +31,7 @@ use crate::tokenizer::BPETokenizer;
 use crate::utils::{format_duration, format_number};
 
 use super::config::{RWKVConfig, TrainingConfig};
-use super::rwkv::RWKV;
+use super::traits::RWKVModel;
 
 /// Estatísticas de um step de treino
 #[derive(Debug, Clone, Default)]
@@ -41,10 +41,10 @@ pub struct TrainStats {
     pub lr: f64,
 }
 
-/// Trainer para o modelo RWKV
-pub struct Trainer<B: AutodiffBackend> {
-    pub model: RWKV<B>,
-    optimizer: OptimizerAdaptor<AdamW<B::InnerBackend>, RWKV<B>, B>,
+/// Trainer genérico para modelos RWKV (v4/v7)
+pub struct Trainer<B: AutodiffBackend, M: RWKVModel<B> + AutodiffModule<B>> {
+    pub model: M,
+    optimizer: OptimizerAdaptor<AdamW<B::InnerBackend>, M, B>,
     config: TrainingConfig,
     #[allow(dead_code)]
     model_config: RWKVConfig,
@@ -55,7 +55,7 @@ pub struct Trainer<B: AutodiffBackend> {
     
     // Acumulação de gradientes
     accumulated_loss: f32,
-    accumulator: GradientsAccumulator<RWKV<B>>,
+    accumulator: GradientsAccumulator<M>,
     
     // Métricas
     last_update_norm: f32,
@@ -71,9 +71,13 @@ pub struct Trainer<B: AutodiffBackend> {
     consecutive_nan_count: usize,
 }
 
-impl<B: AutodiffBackend> Trainer<B> {
-    pub fn new(model_config: &RWKVConfig, train_config: TrainingConfig, device: B::Device) -> Self {
-        let model = RWKV::new(model_config, &device);
+impl<B, M> Trainer<B, M>
+where
+    B: AutodiffBackend,
+    M: RWKVModel<B> + AutodiffModule<B>,
+    <M as AutodiffModule<B>>::InnerModule: RWKVModel<B::InnerBackend>,
+{
+    pub fn new(model: M, model_config: &RWKVConfig, train_config: TrainingConfig, device: B::Device) -> Self {
         
         // Bug #10 fix: weight_decay default reduced to 0.001 in TrainingConfig
         // Bug #1 fix: Real gradient clipping via Burn's GradientClippingConfig
@@ -110,11 +114,12 @@ impl<B: AutodiffBackend> Trainer<B> {
 
     pub fn from_checkpoint(
         checkpoint_path: &Path,
+        model: M,
         model_config: &RWKVConfig,
         train_config: TrainingConfig,
         device: B::Device
     ) -> Result<Self> {
-        let mut trainer = Self::new(model_config, train_config, device);
+        let mut trainer = Self::new(model, model_config, train_config, device);
         trainer.load_checkpoint(checkpoint_path.to_str().unwrap())?;
         Ok(trainer)
     }
@@ -322,7 +327,7 @@ impl<B: AutodiffBackend> Trainer<B> {
         // ... (Sanity Check Code Skipped - Unchanged) ...
 
         // Forward pass
-        let logits = self.model.forward(input_ids);
+        let logits = self.model.forward_train(input_ids);
         
         // Compute loss
         let loss = self.cross_entropy_safe(logits, target_ids);
@@ -337,7 +342,7 @@ impl<B: AutodiffBackend> Trainer<B> {
             // Reset accumulation
             self.accumulated_loss = 0.0;
             self.micro_step = 0;
-            self.accumulator = GradientsAccumulator::new(); // Hard reset
+            self.accumulator = GradientsAccumulator::<M>::new(); // Hard reset
             return None;
         }
         self.consecutive_nan_count = 0;
@@ -362,20 +367,16 @@ impl<B: AutodiffBackend> Trainer<B> {
             let final_grads = self.accumulator.grads();
             
             // ✅ FIX: Snapshot of a representative parameter BEFORE the step
-            let decay_before: Vec<f32> = self.model.blocks[0]
-                .time_mixing.time_decay.val()
-                .into_data().iter::<f32>().collect();
+            let param_before = self.model.representative_param_snapshot();
 
             // Apply optimizer step (Burn handles gradient clipping internally)
             self.model = self.optimizer.step(current_lr, self.model.clone(), final_grads);
 
             // ✅ FIX: Compute REAL update magnitude
-            let decay_after: Vec<f32> = self.model.blocks[0]
-                .time_mixing.time_decay.val()
-                .into_data().iter::<f32>().collect();
+            let param_after = self.model.representative_param_snapshot();
 
-            let update_sq_sum: f32 = decay_before.iter()
-                .zip(decay_after.iter())
+            let update_sq_sum: f32 = param_before.iter()
+                .zip(param_after.iter())
                 .map(|(a, b): (&f32, &f32)| (a - b).powi(2))
                 .sum();
             let update_norm = update_sq_sum.sqrt();
@@ -608,7 +609,7 @@ impl<B: AutodiffBackend> Trainer<B> {
             let input: Tensor<B::InnerBackend, 1, Int> = Tensor::from_ints(input_vec.as_slice(), &self.device);
             let input = input.reshape([1, seq_len]);
     
-            let logits = inference_model.forward(input);
+            let logits = inference_model.forward_train(input);
             let [_, s, v] = logits.dims();
             let last_logits = logits.slice([0..1, s - 1..s, 0..v]).reshape([v]);
     

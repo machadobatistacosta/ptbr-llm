@@ -131,21 +131,18 @@ impl<B: Backend> RWKV<B> {
 
         x = self.ln_out.forward(x);
 
-        // Scale by 1/sqrt(d_model) — compensates for Burn's larger embedding init
-        // (RWKV-4 ref uses Uniform(-1e-4, 1e-4) for emb, Burn uses ~N(0, 0.11))
+        // ✅ FIX: Sem scaling — RWKV-4 não usa 1/√d (isso é de dot-product attention)
         let logits = if self.use_weight_tying {
             let [b, t, d] = x.dims();
             let emb_weight = self.embedding.weight.val();
             let x_flat = x.reshape([b * t, d]);
-            let logits_flat = x_flat.matmul(emb_weight.transpose());
-            let scale = 1.0 / (d as f64).sqrt();
-            logits_flat.mul_scalar(scale as f32).reshape([b, t, self.vocab_size])
+            x_flat.matmul(emb_weight.transpose()).reshape([b, t, self.vocab_size])
         } else {
             self.head.as_ref().unwrap().forward(x)
         };
 
-        // Clamp suave para segurança numérica
-        logits.clamp(-30.0, 30.0)
+        // Clamp para segurança numérica
+        logits.clamp(-65.0, 65.0)
     }
 
     pub fn forward_inference(&self, input_ids: Tensor<B, 2, Int>) -> Tensor<B, 2> {
@@ -178,18 +175,16 @@ impl<B: Backend> RWKV<B> {
         let x = x.reshape([b, 1, self.d_model]);
         let x = self.ln_out.forward(x);
 
-        // Scale by 1/sqrt(d_model) — same as forward()
+        // ✅ FIX: Sem scaling — consistente com forward()
         let logits = if self.use_weight_tying {
             let x_flat = x.reshape([b, self.d_model]);
             let emb_weight = self.embedding.weight.val();
-            let logits = x_flat.matmul(emb_weight.transpose());
-            let scale = 1.0 / (self.d_model as f64).sqrt();
-            logits.mul_scalar(scale as f32)
+            x_flat.matmul(emb_weight.transpose())
         } else {
             self.head.as_ref().unwrap().forward(x).reshape([b, self.vocab_size])
         };
 
-        logits.clamp(-30.0, 30.0)
+        logits.clamp(-65.0, 65.0)
     }
 
     pub fn vocab_size(&self) -> usize { self.vocab_size }
@@ -548,5 +543,35 @@ impl<B: Backend> ChannelMixing<B> {
         let zeros = Tensor::zeros([b, 1, c], &x.device());
         let shifted = x.clone().slice([0..b, 0..t - 1, 0..c]);
         Tensor::cat(vec![zeros, shifted], 1)
+    }
+}
+
+// ============================================================================
+// RWKVModel trait implementation
+// ============================================================================
+
+use super::traits::RWKVModel;
+
+impl<B: Backend> RWKVModel<B> for RWKV<B> {
+    fn forward_train(&self, input_ids: Tensor<B, 2, Int>) -> Tensor<B, 3> {
+        self.forward(input_ids)
+    }
+
+    fn num_parameters(&self) -> usize {
+        self.num_params()
+    }
+
+    fn vocab_size(&self) -> usize {
+        self.vocab_size
+    }
+
+    fn d_model(&self) -> usize {
+        self.d_model
+    }
+
+    fn representative_param_snapshot(&self) -> Vec<f32> {
+        self.blocks[0]
+            .time_mixing.time_decay.val()
+            .into_data().iter::<f32>().collect()
     }
 }

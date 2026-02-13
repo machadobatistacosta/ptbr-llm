@@ -5,9 +5,12 @@ use crate::backend::{TrainBackend, get_device};
 use crate::data::MmapDataset;
 use crate::helpers::get_model_config;
 use crate::error::{PtbrError, Result};
-use crate::model::{TrainingConfig, Trainer};
+use crate::model::{RWKVConfig, TrainingConfig, Trainer, RWKVModel, RWKV, RWKV_V7};
 use crate::tokenizer::BPETokenizer;
 use crate::utils::{format_bytes, format_params};
+
+use burn::module::AutodiffModule;
+use burn::tensor::backend::AutodiffBackend;
 
 #[derive(Args, Debug, Clone)]
 pub struct TrainArgs {
@@ -23,7 +26,7 @@ pub struct TrainArgs {
     #[arg(long, help = "Diretório de saída para checkpoints e metrics")]
     pub output: PathBuf,
 
-    #[arg(long, default_value = "400m", help = "Tamanho do modelo (400m, 800m, 1b, 1.5b)")]
+    #[arg(long, default_value = "400m", help = "Tamanho do modelo (400m, 800m, 1b, 1.5b, 140m-v7, 400m-v7)")]
     pub model_size: String,
 
     #[arg(long, default_value_t = 100000, help = "Número máximo de steps")]
@@ -38,10 +41,10 @@ pub struct TrainArgs {
     #[arg(long, default_value_t = 4, help = "Gradient accumulation steps")]
     pub grad_accum: usize,
 
-    #[arg(long, default_value_t = 1e-4, help = "Learning rate inicial")]
+    #[arg(long, default_value_t = 6e-5, help = "Learning rate inicial")]
     pub learning_rate: f64,
 
-    #[arg(long, default_value_t = 1000, help = "Steps de warmup")]
+    #[arg(long, default_value_t = 2000, help = "Steps de warmup")]
     pub warmup_steps: usize,
 
     #[arg(long, default_value_t = 1.0, help = "Gradient clipping (norma L2)")]
@@ -93,6 +96,51 @@ fn get_safe_config(
     }
 }
 
+/// Generic training runner — works with any RWKV model variant
+fn run_training<B, M>(
+    model: M,
+    model_config: &RWKVConfig,
+    train_config: TrainingConfig,
+    device: B::Device,
+    resume_from: Option<&PathBuf>,
+    dataset: &mut MmapDataset,
+    val_dataset: Option<&MmapDataset>,
+    tokenizer: &BPETokenizer,
+    output: &PathBuf,
+    eval_samples: usize,
+    eval_every: usize,
+) -> Result<()>
+where
+    B: AutodiffBackend,
+    M: RWKVModel<B> + AutodiffModule<B>,
+    <M as AutodiffModule<B>>::InnerModule: RWKVModel<B::InnerBackend>,
+{
+    let mut trainer = if let Some(checkpoint_path) = resume_from {
+        println!("  📥 Carregando checkpoint...");
+        Trainer::from_checkpoint(
+            checkpoint_path,
+            model,
+            model_config,
+            train_config,
+            device,
+        )?
+    } else {
+        println!("  🆕 Iniciando modelo do zero...");
+        Trainer::new(model, model_config, train_config, device)
+    };
+
+    trainer.fit(
+        dataset,
+        val_dataset,
+        tokenizer,
+        output,
+        eval_samples,
+        eval_every,
+    )?;
+
+    Ok(())
+}
+
 pub fn execute(args: TrainArgs) -> Result<()> {
     std::env::set_var("CUDA_VISIBLE_DEVICES", "0");
 
@@ -121,7 +169,6 @@ pub fn execute(args: TrainArgs) -> Result<()> {
     let device = get_device();
     let mut model_config = get_model_config(&args.model_size);
     model_config.max_seq_len = safe_seq_len;
-    model_config.dropout = 0.05;
 
     let tokenizer = BPETokenizer::from_file(args.tokenizer.to_str().unwrap())
         .map_err(|e| PtbrError::TokenizerLoad(e.to_string()))?;
@@ -161,29 +208,12 @@ pub fn execute(args: TrainArgs) -> Result<()> {
         save_every: args.save_every,
         log_every: 1,
         min_lr_ratio: 0.1,
-        weight_decay: 0.001, // Ensuring default is set
+        weight_decay: 0.001,
         ..Default::default()
     };
 
-    // Initialize Trainer
-    let mut trainer = match &args.resume_from {
-        Some(checkpoint_path) => {
-            println!("  📥 Carregando checkpoint...");
-            Trainer::<TrainBackend>::from_checkpoint(
-                checkpoint_path,
-                &model_config,
-                train_config,
-                device.clone()
-            )?
-        },
-        None => {
-            println!("  🆕 Iniciando modelo do zero...");
-            Trainer::<TrainBackend>::new(&model_config, train_config, device.clone())
-        }
-    };
-
     // Load validation dataset
-    let val_dataset = if let Some(val_path) = args.val_data {
+    let val_dataset = if let Some(val_path) = args.val_data.clone() {
         let val_path_resolved = if val_path.extension().map(|e| e == "bin").unwrap_or(false) {
             val_path.clone()
         } else if val_path.join("val.bin").exists() {
@@ -205,8 +235,10 @@ pub fn execute(args: TrainArgs) -> Result<()> {
         Some(dataset.split_validation(0.1))
     };
 
+    let version_label = if model_config.rwkv_version == 7 { "RWKV-7" } else { "RWKV-4" };
     println!(
-        "  Modelo: {} ({} params)",
+        "  Modelo: {} {} ({} params)",
+        version_label,
         args.model_size,
         format_params(model_config.num_parameters())
     );
@@ -215,14 +247,44 @@ pub fn execute(args: TrainArgs) -> Result<()> {
         format_bytes(model_config.estimated_vram(safe_batch, safe_seq_len))
     );
 
-    trainer.fit(
-        &mut dataset,
-        val_dataset.as_ref(),
-        &tokenizer,
-        &args.output,
-        args.eval_samples,
-        args.eval_every,
-    )?;
+    // === Dispatch: create model based on version, then run training ===
+    match model_config.rwkv_version {
+        7 => {
+            println!("  🏗️ Construindo RWKV-7 (Goose)...");
+            let model = RWKV_V7::new(&model_config, &device);
+            run_training::<TrainBackend, _>(
+                model,
+                &model_config,
+                train_config,
+                device,
+                args.resume_from.as_ref(),
+                &mut dataset,
+                val_dataset.as_ref(),
+                &tokenizer,
+                &args.output,
+                args.eval_samples,
+                args.eval_every,
+            )?;
+        }
+        _ => {
+            println!("  🏗️ Construindo RWKV-4...");
+            let model = RWKV::new(&model_config, &device);
+            run_training::<TrainBackend, _>(
+                model,
+                &model_config,
+                train_config,
+                device,
+                args.resume_from.as_ref(),
+                &mut dataset,
+                val_dataset.as_ref(),
+                &tokenizer,
+                &args.output,
+                args.eval_samples,
+                args.eval_every,
+            )?;
+        }
+    }
 
     Ok(())
 }
+
