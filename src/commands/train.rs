@@ -246,6 +246,9 @@ pub fn execute(args: TrainArgs) -> Result<()> {
         "  VRAM estimada: {}",
         format_bytes(model_config.estimated_vram(safe_batch, safe_seq_len))
     );
+    println!("  📊 Tokenizer vocab: {}", tokenizer.vocab_size());
+    println!("  📊 Model vocab_size: {}", model_config.vocab_size);
+    println!("  📊 Loss esperada (step 1): ln({}) = {:.4}", model_config.vocab_size, (model_config.vocab_size as f64).ln());
 
     // === Dispatch: create model based on version, then run training ===
     match model_config.rwkv_version {

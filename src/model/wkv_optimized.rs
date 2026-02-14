@@ -1,16 +1,9 @@
-//! WKV v4 - Per-channel with CUDA-accelerated forward + Burn autodiff backward
+//! WKV v4 - Per-channel pure Burn implementation (autodiff-compatible)
 //!
-//! Strategy: STE (Straight-Through Estimator) trick
-//!   Forward VALUES come from CUDA kernel (numerically superior max-tracking)
-//!   Forward GRAPH comes from Burn loop (autodiff-compatible)
-//!   y_final = y_burn + (y_cuda - y_burn).detach()
-//!   → Values of y_cuda, gradients from y_burn
-//!
-//! If CUDA kernel not found (feature "cuda" disabled), pure Burn loop.
+//! All computation goes through the Burn tensor loop, which builds
+//! the autodiff graph correctly. No external CUDA FFI.
 
 use burn::tensor::{backend::Backend, Tensor};
-
-use super::wkv_cuda_ffi;
 
 #[derive(Debug, Clone)]
 pub struct WKVConfig {
@@ -27,10 +20,7 @@ impl WKVConfig {
     pub fn for_t4() -> Self { Self::default() }
 }
 
-/// WKV v4 - Forward with CUDA + autodiff support
-///
-/// If CUDA kernel available: uses STE trick for correct values + correct gradients
-/// Otherwise: pure Burn loop
+/// WKV v4 - Forward with autodiff support (pure Burn loop)
 pub fn wkv_linear<B: Backend>(
     k: Tensor<B, 3>,
     v: Tensor<B, 3>,
@@ -38,72 +28,7 @@ pub fn wkv_linear<B: Backend>(
     u: Tensor<B, 1>,
     _config: &WKVConfig,
 ) -> Tensor<B, 3> {
-    // Burn loop builds autodiff graph -> gradients are consistent with values
-    let y_burn = wkv_linear_burn(k.clone(), v.clone(), w.clone(), u.clone());
-    
-    // If CUDA feature is enabled, use the kernel for better precision/performance on forward pass
-    #[cfg(feature = "cuda")]
-    {
-        // Try to run CUDA kernel
-        match wkv_cuda_forward(k, v, w, u) {
-            Ok(y_cuda) => {
-                // STE Trick: y = y_burn + (y_cuda - y_burn).detach()
-                // Value is y_cuda, Gradient is y_burn's gradient
-                y_burn.clone() + (y_cuda - y_burn).detach()
-            }
-            Err(e) => {
-                eprintln!("⚠️ CUDA WKV kernel failed, using Burn fallback: {}", e);
-                y_burn
-            }
-        }
-    }
-    
-    #[cfg(not(feature = "cuda"))]
-    {
-        y_burn
-    }
-}
-
-/// CUDA kernel forward — extracts data, runs kernel, returns Burn tensor (leaf, no grad)
-#[cfg(feature = "cuda")]
-fn wkv_cuda_forward<B: Backend>(
-    k: Tensor<B, 3>,
-    v: Tensor<B, 3>,
-    w: Tensor<B, 1>,
-    u: Tensor<B, 1>,
-) -> crate::error::Result<Tensor<B, 3>> {
-    let [batch_size, seq_len, channels] = k.dims();
-    let device = k.device();
-    
-    // Clamp to match Burn loop behavior
-    let w_clamped = w.clamp(-5.0, -0.01);
-    let u_clamped = u.clamp(-3.0, 3.0);
-
-    // Extract CPU data
-    let w_data: Vec<f32> = w_clamped.into_data().iter::<f32>().collect();
-    let u_data: Vec<f32> = u_clamped.into_data().iter::<f32>().collect();
-    let k_data: Vec<f32> = k.into_data().iter::<f32>().collect();
-    let v_data: Vec<f32> = v.into_data().iter::<f32>().collect();
-
-    // Prepare output buffer
-    let mut y_data = vec![0.0; batch_size * seq_len * channels];
-    let mut state = wkv_cuda_ffi::WKVState::new(batch_size, channels);
-
-    // Run CUDA kernel via safe FFI
-    wkv_cuda_ffi::wkv_forward(
-        &w_data, &u_data, &k_data, &v_data,
-        &mut y_data,
-        &mut state,
-        batch_size, seq_len, channels
-    )?;
-
-    // Create result tensor
-    let y_tensor = Tensor::<B, 1>::from_data(
-        burn::tensor::TensorData::new(y_data, [batch_size * seq_len * channels]),
-        &device,
-    );
-    
-    Ok(y_tensor.reshape([batch_size, seq_len, channels]).clamp(-20.0, 20.0))
+    wkv_linear_burn(k, v, w, u)
 }
 
 /// Burn tensor loop — EMA-style WKV (autodiff-compatible, builds graph)
