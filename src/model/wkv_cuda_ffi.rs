@@ -2,7 +2,7 @@ use crate::error::{PtbrError, Result};
 
 // --- Raw bindings (never called directly outside this file) ---
 mod ffi {
-    #[link(name = "wkv_cuda")]
+    // #[link(name = "wkv_cuda")]
     extern "C" {
         pub fn wkv_forward_fp32(
             B: i32, T: i32, C: i32,
